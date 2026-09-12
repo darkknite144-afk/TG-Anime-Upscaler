@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-Smart Anime Upscaler v4 - AI TURBO
-4-core optimal + RAM max use + adaptive per-frame AI optimizer
-Engine: webhook wipe + in_memory + app.run() (UNCHANGED, WORKING)
+Smart Anime/Game Upscaler v5 — AI-Turbo + RAM/CPU Governor + Model Switch
+- 🎌 Anime / 🎮 Game(Fast) / 🎮 Game(HQ) models
+- 🤖 AI frame-parallel optimizer + 🛡 RAM/CPU governor (safe-mode)
+- 📚 Private Telegram channel = permanent memory (archive.py)
+- Engine: webhook wipe + HTTP ping + in_memory session + app.run()
 """
 import asyncio
 import gc
@@ -17,44 +19,62 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Dict, List, Any, Optional
+from typing import Any, Dict, Optional
 
 import numpy as np
 import requests
 import torch
 from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from realesrgan import RealESRGANer
 from realesrgan.archs.srvgg_arch import SRVGGNetCompact
+from realesrgan.archs.rrdbnet_arch import RRDBNet
 
-# ================= CONFIG (UNCHANGED) =================
+try:
+    from archive import ChannelArchive
+except Exception:
+    ChannelArchive = None
+
+# ================= CONFIG =================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("anime-upscaler")
 
 API_ID = int(os.getenv("API_ID", "0") or 0)
-API_HASH = (os.getenv("API_HASH", "")).strip()
-BOT_TOKEN = (os.getenv("BOT_TOKEN", "")).strip()
-OWNER_CHAT_ID = (os.getenv("OWNER_CHAT_ID", "") or "").strip().strip("'").strip('"')
+API_HASH = (os.getenv("API_HASH", "") or "").strip()
+BOT_TOKEN = (os.getenv("BOT_TOKEN", "") or "").strip()
+OWNER_CHAT_ID = (os.getenv("OWNER_CHAT_ID", "") or "").strip()
 
 if not API_ID or not API_HASH or not BOT_TOKEN or not OWNER_CHAT_ID:
-    raise RuntimeError("Missing GitHub Secrets.")
+    raise RuntimeError("Missing GitHub Secrets: API_ID, API_HASH, BOT_TOKEN, OWNER_CHAT_ID")
 
+MODEL_DIR = Path("weights")
 WORK_DIR = Path("work"); OUTPUT_DIR = Path("output")
-MODEL_PATH = Path("weights/realesr-animevideov3.pth")
 WORK_DIR.mkdir(exist_ok=True); OUTPUT_DIR.mkdir(exist_ok=True)
 
 MAX_FRAMES = 3600
 MAX_GIF_FRAMES = 240
 MAX_OUT_PIXELS = 3840 * 2160
 MAX_SEND_MB = 1900
-MAX_JOBS = 3
-MAX_QUEUE = 12
-CLIP_SECONDS = 2.0
+GIF_MIN_SEC = 2.0
 CPU_THREADS = os.cpu_count() or 4
+POOL = ThreadPoolExecutor(max_workers=4)
 os.environ["OMP_NUM_THREADS"] = str(CPU_THREADS)
 
-# ================= RAM / MATH =================
-def mem_free_gb() -> float:
+MODELS = {
+    "anime":  {"file": "realesr-animevideov3.pth",  "arch": "srvgg", "label": "🎌 Anime"},
+    "game":   {"file": "realesr-general-x4v3.pth",  "arch": "srvgg", "label": "🎮 Game (Fast)"},
+    "gamehq": {"file": "RealESRGAN_x4plus.pth",     "arch": "rrdb",  "label": "🎮 Game (HQ, slow)"},
+}
+PRESETS = {"fast": {"crf": "23", "preset": "veryfast"},
+           "balanced": {"crf": "19", "preset": "veryfast"},
+           "best": {"crf": "16", "preset": "slow"}}
+
+settings = {"scale": 2.0, "preset": "balanced", "audio": "keep", "model": "anime"}
+job_state = {"active": False}
+cancel_event: Optional[threading.Event] = None
+
+# ================= SYSTEM MONITOR =================
+def mem_avail_gb() -> float:
     try:
         with open("/proc/meminfo") as f:
             for line in f:
@@ -64,274 +84,305 @@ def mem_free_gb() -> float:
         pass
     return 8.0
 
-def footprint_bytes(out_px: int) -> int:
-    return out_px * 64 * 4 * 2
-
-def spf_single(out_px: int) -> float:
-    return 4.5e-7 * out_px + 0.06
-
-# ================= AI FRAME OPTIMIZER =================
-CONFIGS = [(1, 4), (2, 2), (2, 3), (3, 1), (4, 1)]   # (workers, torch threads)
-PROBE_FRAMES = 6
-EXPLOIT_FRAMES = 12
-
-class FrameAI:
-    """Har frame ke time se seekh kar workers/threads live tune karta hai."""
-    def __init__(self, out_px: int):
-        free = mem_free_gb()
-        fp = footprint_bytes(out_px) / 1e9
-        self.cands = [c for c in CONFIGS if c[0] * fp <= max(1.0, free * 0.75)]
-        if not self.cands:
-            self.cands = [(1, 1)]
-        self.ema = {c: 0.0 for c in CONFIGS}
-        self.cnt = {c: 0 for c in CONFIGS}
-        self.current = (2, 2) if (2, 2) in self.cands else self.cands[0]
-        self.best = self.current
-        self.probe_left = PROBE_FRAMES
-        self.exploit_left = 0
-        self.lock = threading.Lock()
-        self.apply()
-        log.info("🤖 AI start: %s (free RAM %.1fGB, footprint %.2fGB)", self.current, free, fp)
-
-    def apply(self):
-        torch.set_num_threads(self.current[1])
-
-    def throughput(self, c) -> float:
-        e = self.ema.get(c, 0.0)
-        return (c[0] / e) if e else 0.0
-
-    def on_frame(self, cfg, dt: float):
-        with self.lock:
-            c = tuple(cfg)
-            if c not in self.ema:
-                return
-            self.ema[c] = dt if self.cnt[c] == 0 else self.ema[c] * 0.7 + dt * 0.3
-            self.cnt[c] += 1
-            # decision logic
-            if self.probe_left > 0:
-                self.probe_left -= 1
-                if self.probe_left == 0:
-                    self._pick_best()
-                    self.exploit_left = EXPLOIT_FRAMES
-                return
-            if self.exploit_left > 0:
-                self.exploit_left -= 1
-                if self.exploit_left == 0:
-                    self._next_probe()
-
-    def _pick_best(self):
-        tested = [c for c in self.cands if self.cnt[c] >= 3]
-        if not tested:
-            return
-        b = max(tested, key=self.throughput)
-        if b != self.best:
-            log.info("🤖 AI naya best: %sW×%sT (%.2f f/s)", b[0], b[1], self.throughput(b))
-        self.best = b
-        self.current = b
-        self.apply()
-
-    def _next_probe(self):
-        untested = [c for c in self.cands if self.cnt[c] < 3]
-        if untested:
-            target = untested[0]
-        else:
-            target = min(self.cands, key=lambda c: self.cnt[c])
-        if target != self.current:
-            self.current = target
-            self.apply()
-            log.info("🤖 AI probe: %sW×%sT", target[0], target[1])
-        self.probe_left = PROBE_FRAMES
-
-    def status(self, spf: float) -> str:
-        return (f"🤖 AI: {self.current[0]}W×{self.current[1]}T | {spf:.2f}s/fr | "
-                f"{self.throughput(self.current):.2f} f/s | best {self.best[0]}W×{self.best[1]}T "
-                f"({self.throughput(self.best):.2f} f/s)")
-
-# ================= PRE-FLIGHT (UNCHANGED) =================
-def clean_telegram_state():
-    log.info("🧹 Wiping webhooks...")
+def load1() -> float:
     try:
-        r = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=True", timeout=10)
-        log.info("Webhook: %s", r.text[:120])
-        time.sleep(3)
-        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                      json={"chat_id": OWNER_CHAT_ID,
-                            "text": "✅ Upscaler v4 AI-Turbo online!\n🎛 Panel buttons se sab control — /start karo."}, timeout=10)
-    except Exception as e:
-        log.error("Pre-flight: %s", e)
+        return os.getloadavg()[0]
+    except Exception:
+        return 0.0
 
-clean_telegram_state()
-
-app = Client("anime_upscaler_bot", api_id=API_ID, api_hash=API_HASH,
-             bot_token=BOT_TOKEN, in_memory=True)
-
-# ================= SESSION =================
-class Session:
-    def __init__(self):
-        self.scale = 2.0
-        self.preset = "balanced"
-        self.audio = "keep"
-        self.jobs: List[Dict[str, Any]] = []
-        self.history: List[str] = []
-        self.panel: Optional[Message] = None
-        self.refresher: Optional[asyncio.Task] = None
-
-SESSIONS: Dict[int, Session] = {}
-def get_sess(cid: int) -> Session:
-    if cid not in SESSIONS: SESSIONS[cid] = Session()
-    return SESSIONS[cid]
-
-def is_owner(m) -> bool:
-    cid = m.chat.id if hasattr(m, "chat") else m.from_user.id
-    return str(cid) == OWNER_CHAT_ID or cid == (int(OWNER_CHAT_ID) if OWNER_CHAT_ID.lstrip("-").isdigit() else 0)
-
-# ================= HELPERS =================
 def fmt_time(s: float) -> str:
     s = max(0, int(s)); h, r = divmod(s, 3600); m, sec = divmod(r, 60)
     return f"{h}h {m}m {sec}s" if h else (f"{m}m {sec}s" if m else f"{sec}s")
+
+def fmt_scale(s: float) -> str: return f"{s:g}"
 
 def bar(pct: float, n: int = 8) -> str:
     f = int(n * min(100, max(0, pct)) / 100)
     return "▰" * f + "▱" * (n - f)
 
-STAGE_EMO = {"queued": "⏳", "dl": "⬇️", "probe": "🔍", "up": "🎨", "enc": "📦", "upload": "⬆️", "done": "✅", "fail": "❌"}
-PRESETS = {"fast": {"crf": "23", "preset": "veryfast"},
-           "balanced": {"crf": "19", "preset": "veryfast"},
-           "best": {"crf": "16", "preset": "slow"}}
+# ================= AI + RAM/CPU GOVERNOR =================
+CONFIGS = [(1, 4), (2, 2), (2, 3), (3, 1), (4, 1)]
+DOWNGRADE = {(4, 1): (3, 1), (3, 1): (2, 2), (2, 3): (2, 2), (2, 2): (1, 2),
+             (1, 4): (1, 2), (1, 2): (1, 1), (1, 1): (1, 1)}
+PROBE, EXPLOIT = 6, 12
 
-_ups = None
-def get_ups() -> RealESRGANer:
-    global _ups
-    if _ups is None:
-        log.info("Loading AnimeVideo-v3 (tile=0 => RAM max, no tiling bugs)")
+class Governor:
+    """Frame-time se seekhta hai + RAM/CPU pressure par turant react karta hai."""
+    def __init__(self, out_px: int):
+        self.fp = out_px * 512 / 1e9          # GB per in-flight frame
+        self.ema = {c: 0.0 for c in CONFIGS}
+        self.cnt = {c: 0 for c in CONFIGS}
+        self.current = (2, 2)
+        self.probe_left, self.exploit = PROBE, 0
+        self.safe = False
+        self.lock = threading.Lock()
+        self.apply()
+        log.info(" Governor start: %s | footprint %.2fGB/frame | RAM %.1fGB",
+                 self.current, self.fp, mem_avail_gb())
+
+    def apply(self):
+        torch.set_num_threads(self.current[1])
+
+    def thr(self, c) -> float:
+        return c[0] / self.ema[c] if self.ema[c] else 0.0
+
+    def ram_ok(self, workers: int) -> bool:
+        return workers * self.fp <= max(1.0, mem_avail_gb() * 0.7)
+
+    def on_frame(self, cfg, dt: float, done: int):
+        with self.lock:
+            c = tuple(cfg)
+            if c in self.ema:
+                self.ema[c] = dt if self.cnt[c] == 0 else self.ema[c] * 0.7 + dt * 0.3
+                self.cnt[c] += 1
+            if done % 25 == 0:
+                if mem_avail_gb() < 1.5:
+                    gc.collect()
+            self._decide()
+
+    def _decide(self):
+        free, load = mem_avail_gb(), load1()
+        if free < 1.2 or load > CPU_THREADS * 1.6:
+            self.safe = True
+            nxt = DOWNGRADE.get(self.current, self.current)
+            if nxt != self.current:
+                self.current = nxt; self.apply()
+                log.warning("🛡 Governor DOWNGRADE -> %s (RAM %.1fGB, load %.1f)", nxt, free, load)
+            return
+        if self.safe and free > 3.0 and load < CPU_THREADS * 0.9:
+            self.safe = False
+            log.info("🛡 Governor safe-mode OFF (RAM %.1fGB)", free)
+        if self.safe:
+            return
+        if self.probe_left > 0:
+            self.probe_left -= 1
+            if self.probe_left == 0:
+                self._pick_best(); self.exploit = EXPLOIT
+            return
+        if self.exploit > 0:
+            self.exploit -= 1
+            if self.exploit == 0:
+                self._next_probe()
+            return
+        self._next_probe()
+
+    def _pick_best(self):
+        tested = [c for c in CONFIGS if self.cnt[c] >= 3 and self.ram_ok(c[0])]
+        if not tested: return
+        b = max(tested, key=self.thr)
+        if b != self.current:
+            self.current = b; self.apply()
+            log.info("🤖 AI best -> %s (%.2f f/s)", b, self.thr(b))
+
+    def _next_probe(self):
+        cand = [c for c in CONFIGS if self.cnt[c] < 3 and self.ram_ok(c[0])]
+        if not cand:
+            cand = [c for c in CONFIGS if self.ram_ok(c[0])]
+        if not cand: return
+        t = cand[0]
+        if t != self.current:
+            self.current = t; self.apply()
+            log.info("🤖 AI probe -> %s", t)
+        self.probe_left = PROBE
+
+    def status(self, spf: float) -> str:
+        return (f"🤖 {self.current[0]}W×{self.current[1]}T | {spf:.2f}s/fr | "
+                f"{self.thr(self.current):.2f} f/s | 🛡 {mem_avail_gb():.1f}GB | "
+                f"load {load1():.1f}" + (" | SAFE" if self.safe else ""))
+
+# ================= MODELS =================
+_ups_cache: Dict[Any, RealESRGANer] = {}
+
+def choose_tile(model_key: str, out_px: int) -> int:
+    if MODELS[model_key]["arch"] == "rrdb":
+        return 256                                   # RRDB RAM-bhaari → hamesha tile
+    return 0 if out_px <= 2_600_000 else 320         # SRVGG → RAM max use (fast)
+
+def get_ups(model_key: str, tile: int) -> RealESRGANer:
+    k = (model_key, tile)
+    if k in _ups_cache: return _ups_cache[k]
+    m = MODELS[model_key]
+    path = MODEL_DIR / m["file"]
+    if not path.exists():
+        raise FileNotFoundError(f"Model missing: {path} (workflow me download hota hai)")
+    log.info("Loading model %s (tile=%s)...", m["file"], tile)
+    if m["arch"] == "rrdb":
+        model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
+    else:
         model = SRVGGNetCompact(num_in_ch=3, num_out_ch=3, num_feat=64, num_conv=16, upscale=4, act_type="prelu")
-        _ups = RealESRGANer(scale=4, model_path=str(MODEL_PATH), model=model,
-                            tile=0, tile_pad=0, pre_pad=0, half=False, device=torch.device("cpu"))
-    return _ups
+    ups = RealESRGANer(scale=4, model_path=str(path), model=model, tile=tile,
+                       tile_pad=10, pre_pad=0, half=False, device=torch.device("cpu"))
+    _ups_cache[k] = ups
+    return ups
+
+# ================= ARCHIVE (channel memory) =================
+archive = ChannelArchive(app=None, channel_id="") if False else None
+app = Client("anime_upscaler_bot", api_id=API_ID, api_hash=API_HASH,
+             bot_token=BOT_TOKEN, in_memory=True)
+if ChannelArchive:
+    archive = ChannelArchive(app, (os.getenv("ARCHIVE_CHANNEL_ID", "") or "").strip())
 
 # ================= PANEL =================
-def panel_kb(s: Session) -> InlineKeyboardMarkup:
+def panel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"🎯 {s.scale:g}×", callback_data="b:qmenu"),
-         InlineKeyboardButton(f"⚡ {s.preset.title()}", callback_data="b:pmenu"),
-         InlineKeyboardButton(f"🔊 {s.audio.title()}", callback_data="b:amenu")],
-        [InlineKeyboardButton("⛔ Stop All", callback_data="b:stop"),
+        [InlineKeyboardButton(MODELS[settings["model"]]["label"], callback_data="b:mmenu"),
+         InlineKeyboardButton(f"🎯 {fmt_scale(settings['scale'])}×", callback_data="b:qmenu"),
+         InlineKeyboardButton(f"⚡ {settings['preset'].title()}", callback_data="b:pmenu"),
+         InlineKeyboardButton(f"🔊 {settings['audio'].title()}", callback_data="b:amenu")],
+        [InlineKeyboardButton("⛔ Stop", callback_data="b:stop"),
          InlineKeyboardButton("🧹 Clean", callback_data="b:clean")],
     ])
 
-def quality_kb(): return InlineKeyboardMarkup([
-    [InlineKeyboardButton("1.5×", callback_data="b:q:1.5"), InlineKeyboardButton("2×", callback_data="b:q:2"),
-     InlineKeyboardButton("3×", callback_data="b:q:3"), InlineKeyboardButton("4×", callback_data="b:q:4")],
-    [InlineKeyboardButton("🔙", callback_data="b:back")]])
+def model_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎌 Anime (fast)", callback_data="b:m:anime")],
+        [InlineKeyboardButton("🎮 Game Fast (Free Fire/PUBG)", callback_data="b:m:game")],
+        [InlineKeyboardButton("🎮 Game HQ (best, slow)", callback_data="b:m:gamehq")],
+        [InlineKeyboardButton("🔙 Panel", callback_data="b:back")],
+    ])
 
-def preset_kb(): return InlineKeyboardMarkup([
-    [InlineKeyboardButton("⚡ Fast", callback_data="b:p:fast"),
-     InlineKeyboardButton("⚖️ Balanced", callback_data="b:p:balanced"),
-     InlineKeyboardButton("💎 Best", callback_data="b:p:best")],
-    [InlineKeyboardButton("🔙", callback_data="b:back")]])
+def q_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("1.5×", callback_data="b:q:1.5"), InlineKeyboardButton("2×", callback_data="b:q:2"),
+         InlineKeyboardButton("3×", callback_data="b:q:3"), InlineKeyboardButton("4×", callback_data="b:q:4")],
+        [InlineKeyboardButton("🔙 Panel", callback_data="b:back")]])
 
-def audio_kb(): return InlineKeyboardMarkup([
-    [InlineKeyboardButton("🔊 Keep", callback_data="b:a:keep"),
-     InlineKeyboardButton("🗜 Compress", callback_data="b:a:compress"),
-     InlineKeyboardButton("🔇 Remove", callback_data="b:a:remove")],
-    [InlineKeyboardButton("🔙", callback_data="b:back")]])
+def p_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚡ Fast", callback_data="b:p:fast"),
+         InlineKeyboardButton("⚖️ Balanced", callback_data="b:p:balanced"),
+         InlineKeyboardButton("💎 Best", callback_data="b:p:best")],
+        [InlineKeyboardButton("🔙 Panel", callback_data="b:back")]])
 
-def panel_text(s: Session) -> str:
-    lines = [f"🎛 **Upscaler v4 AI-Turbo** • 🧠 {CPU_THREADS} cores • 💾 {mem_free_gb():.1f}GB free", ""]
-    for j in [j for j in s.jobs if j["status"] not in ("done", "fail")]:
-        st = j["status"]
-        head = f"{STAGE_EMO[st]} **{j['filename'][:22]}**"
-        if st == "dl":
-            lines += [head + " — ⬇️ Download", f"   {j.get('dl_done',0)/1048576:.1f}/{j.get('dl_total',0)/1048576:.1f} MB"]
-        elif st == "probe":
-            lines += [head + " — 🔍 Analyzing..."]
-        elif st == "up":
-            pct = j["done"] * 100 / j["total"] if j["total"] else 0
-            eta = (j["total"] - j["done"]) * j["spf"] / max(1, j.get("conc", 1)) if j["spf"] else 0
-            lines += [head + f" — 🎨 {bar(pct)} {pct:.0f}%",
-                      f"   {j['done']}/{j['total']} fr • ⚡ {j['spf']:.2f}s/fr • ⏱ ETA {fmt_time(eta)}",
-                      "   " + j.get("ai", "🤖 AI: warmup...")]
-        elif st == "enc":
-            lines += [head + " — 📦 Encoding..."]
-        elif st == "upload":
-            lines += [head + " — ⬆️ Upload", f"   {j.get('ul_done',0)/1048576:.1f}/{j.get('ul_total',0)/1048576:.1f} MB"]
-    q = [j for j in s.jobs if j["status"] == "queued"]
-    if q: lines += ["", "⏳ Queue: " + ", ".join(j["filename"][:14] for j in q[:4])]
-    if s.history: lines += ["", "📜 " + " | ".join(s.history[-3:])]
-    if not q and not [j for j in s.jobs if j["status"] not in ("done", "fail")]:
-        lines += ["😴 Idle — video/GIF bhejo; AI har frame ke saath khud fast hota jayega."]
+def a_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔊 Keep", callback_data="b:a:keep"),
+         InlineKeyboardButton("🗜 Compress", callback_data="b:a:compress"),
+         InlineKeyboardButton("🔇 Remove", callback_data="b:a:remove")],
+        [InlineKeyboardButton("🔙 Panel", callback_data="b:back")]])
+
+def panel_text() -> str:
+    lines = [f"🎛 **Upscaler v5** • 🧠 {CPU_THREADS} cores • 🛡 {mem_avail_gb():.1f}GB free",
+             f"Model: {MODELS[settings['model']]['label']} • {fmt_scale(settings['scale'])}× • "
+             f"{settings['preset'].title()} • 🔊 {settings['audio'].title()}", ""]
+    j = job_state
+    if j.get("active") and j.get("total"):
+        pct = j["done"] * 100 / j["total"] if j["total"] else 0
+        lines += [f"{j.get('stage', '🎨')} **{j['filename'][:22]}** — {bar(pct)} {pct:.0f}%",
+                  f"   {j['done']}/{j['total']} fr • ⏱ ETA {fmt_time(j.get('eta', 0))}",
+                  "   " + j.get("ai", "")]
+    elif j.get("active"):
+        lines += [f"{j.get('stage', '📥')} **{j.get('filename', '')[:22]}**"]
+    else:
+        lines += ["😴 Idle — video/GIF bhejo. Model button se 🎌/🎮 mode chuno."]
     return "\n".join(lines)
 
 async def ensure_panel(cid: int) -> Message:
-    s = get_sess(cid)
-    if s.panel is None:
-        s.panel = await app.send_message(cid, panel_text(s), reply_markup=panel_kb(s))
-    return s.panel
+    global _panel
+    if _panel is None:
+        _panel = await app.send_message(cid, panel_text(), reply_markup=panel_kb())
+    return _panel
+_panel: Optional[Message] = None
 
-async def refresh_panel(cid: int):
-    s = get_sess(cid)
+async def refresh_panel():
+    global _panel
     try:
-        if s.panel: await s.panel.edit_text(panel_text(s), reply_markup=panel_kb(s))
-    except Exception: pass
+        if _panel:
+            await _panel.edit_text(panel_text(), reply_markup=panel_kb())
+    except Exception:
+        pass
 
-async def refresher_loop(cid: int):
-    s = get_sess(cid)
-    while any(j["status"] not in ("done", "fail") for j in s.jobs):
-        await refresh_panel(cid); await asyncio.sleep(2.5)
-    await refresh_panel(cid); s.refresher = None
+# ================= CALLBACKS =================
+@app.on_callback_query(filters.regex(r"^b:"))
+async def btn(client, cq):
+    if str(cq.message.chat.id) != OWNER_CHAT_ID:
+        await cq.answer("Private bot!", show_alert=True); return
+    parts = cq.data[2:].split(":"); a = parts[0]; v = parts[1] if len(parts) > 1 else ""
+    kb = panel_kb()
+    if a == "mmenu": kb = model_kb()
+    elif a == "qmenu": kb = q_kb()
+    elif a == "pmenu": kb = p_kb()
+    elif a == "amenu": kb = a_kb()
+    elif a == "m":
+        settings["model"] = v
+        if archive: archive.state["model"] = v
+        await cq.answer(f"Model: {MODELS[v]['label']}")
+    elif a == "q":
+        settings["scale"] = float(v)
+        if archive: archive.state["scale"] = float(v)
+        await cq.answer(f"Scale {v}×")
+    elif a == "p":
+        settings["preset"] = v
+        if archive: archive.state["preset"] = v
+        await cq.answer(f"Preset {v}")
+    elif a == "a":
+        settings["audio"] = v
+        if archive: archive.state["audio"] = v
+        await cq.answer(f"Audio {v}")
+    elif a == "stop":
+        if cancel_event: cancel_event.set()
+        await cq.answer("⛔ Stop request")
+    elif a == "clean":
+        global _panel
+        try:
+            if _panel: await _panel.delete()
+        except Exception: pass
+        _panel = None
+        await ensure_panel(cq.message.chat.id)
+        await cq.answer("🧹 Clean")
+        return
+    else:
+        await cq.answer(); return
+    if archive:
+        asyncio.create_task(archive.save_state())
+    try:
+        if _panel and cq.message.id == _panel.id:
+            await _panel.edit_text(panel_text(), reply_markup=kb)
+        else:
+            await cq.message.edit_text(panel_text(), reply_markup=kb)
+            _panel = cq.message
+    except Exception:
+        pass
+    await cq.answer()
 
-def kick_refresher(cid: int):
-    s = get_sess(cid)
-    if s.refresher is None or s.refresher.done():
-        s.refresher = asyncio.create_task(refresher_loop(cid))
+# ================= PROBE =================
+def probe_video(path: Path) -> Dict:
+    r = subprocess.run(["ffprobe", "-v", "error", "-print_format", "json",
+                        "-show_streams", "-show_format", str(path)],
+                       capture_output=True, text=True, check=True)
+    data = json.loads(r.stdout)
+    vid = next(s for s in data["streams"] if s.get("codec_type") == "video")
+    fs = vid.get("avg_frame_rate") or vid.get("r_frame_rate") or "30/1"
+    n, d = fs.split("/"); fps = float(n) / float(d) if float(d) else 30.0
+    dur = float(vid.get("duration") or data.get("format", {}).get("duration") or 0)
+    frames = int(float(vid.get("nb_frames") or max(1, dur * fps)))
+    return {"width": int(vid["width"]), "height": int(vid["height"]), "fps": fps,
+            "duration": dur, "frames": frames,
+            "has_audio": any(s.get("codec_type") == "audio" for s in data["streams"])}
 
-# ================= SCHEDULER =================
-POOL = ThreadPoolExecutor(max_workers=4)
-
-def pump(cid: int):
-    s = get_sess(cid)
-    running = [j for j in s.jobs if j["status"] not in ("done", "fail", "queued")]
-    running_long = [j for j in running if not j["clip"]]
-    for j in s.jobs:
-        if j["status"] != "queued": continue
-        if len(running) >= MAX_JOBS: break
-        if not j["clip"] and running_long: continue
-        if not j["clip"]: running_long.append(j)
-        running.append(j); j["status"] = "dl"
-        asyncio.create_task(run_job(cid, j))
-    kick_refresher(cid)
-
-# ================= PIPELINE (AI-TURBO) =================
-def run_sync_job(job, in_path: Path, out_path: Path, info: Dict, s: Session):
+# ================= PIPELINE =================
+def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Governor,
+                 cancel: threading.Event, is_gif: bool):
     w, h, fps = info["width"], info["height"], info["fps"]
-    scale = s.scale
-    ow, oh = int(w * scale + (int(w * scale) % 2)), int(h * scale + (int(h * scale) % 2))
-    while scale > 1.0 and ow * oh > MAX_OUT_PIXELS:
-        scale = max(1.0, scale - 0.5)
-        ow, oh = int(w * scale + (int(w * scale) % 2)), int(h * scale + (int(h * scale) % 2))
-    job["ow"], job["oh"] = ow, oh
-    out_px = ow * oh
-    ai = FrameAI(out_px)
-    job["conc"] = ai.current[0]
-    ups = get_ups()
-    ff = PRESETS.get(s.preset, PRESETS["balanced"])
-    is_gif = job["is_gif"]
+    ow, oh = job["ow"], job["oh"]
+    ff = PRESETS[settings["preset"]]
+    enc_threads = max(1, CPU_THREADS - gov.current[0] * gov.current[1] + 1)
     fps_g = fps if fps > 0 else 10.0
-    total = min(info["frames"] or max(1, int(info["duration"] * fps)), MAX_GIF_FRAMES if is_gif else 10**9)
+    total = min(info["frames"] or max(1, int(info["duration"] * fps)),
+                MAX_GIF_FRAMES if is_gif else 10 ** 9)
     job["total"] = total
-    cancel: threading.Event = job["cancel"]
-    in_q: queue.Queue = queue.Queue(maxsize=6)      # RAM-max prefetch
-    futs: List = []
-    futs_cond = threading.Condition()
     stats = {"done": 0, "sum": 0.0}
-    stats_lock = threading.Lock()
-    enc_threads = max(1, CPU_THREADS - ai.current[0] * ai.current[1] + 1)
+    dec = enc = None
+    in_q: queue.Queue = queue.Queue(maxsize=6)
+    futs = []
+    futs_cond = threading.Condition()
 
     def reader():
         fb = w * h * 3
         try:
             dec = subprocess.Popen(["ffmpeg", "-v", "error", "-i", str(in_path), "-vsync", "0",
-                                    "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"], stdout=subprocess.PIPE)
+                                    "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"],
+                                   stdout=subprocess.PIPE)
             n = 0
             while not cancel.is_set():
                 raw = dec.stdout.read(fb)
@@ -344,19 +395,19 @@ def run_sync_job(job, in_path: Path, out_path: Path, info: Dict, s: Session):
 
     def upscale_one(img, cfg):
         t0 = time.time()
-        out, _ = ups.enhance(img, outscale=scale)
+        out, _ = ups.enhance(img, outscale=settings["scale"])
         dt = time.time() - t0
-        ai.on_frame(cfg, dt)                       # 🤖 AI seekhta hai
         with stats_lock:
             stats["done"] += 1; stats["sum"] += dt
             job["done"] = stats["done"]
-            job["spf"] = ai.ema.get(tuple(cfg), dt)
-            job["ai"] = ai.status(job["spf"])
-            job["conc"] = ai.current[0]
+            job["spf"] = stats["sum"] / stats["done"]
+            job["eta"] = (total - job["done"]) * job["spf"] / max(1, gov.current[0])
+            job["ai"] = gov.status(job["spf"])
+        gov.on_frame(cfg, dt, stats["done"])
         del img
         return out
+    stats_lock = threading.Lock()
 
-    enc = None
     def encoder():
         nonlocal enc
         cmd = ["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "bgr24",
@@ -364,11 +415,12 @@ def run_sync_job(job, in_path: Path, out_path: Path, info: Dict, s: Session):
         if not is_gif:
             cmd += ["-i", str(in_path), "-map", "0:v:0"]
             if info["has_audio"]:
-                if s.audio == "keep": cmd += ["-map", "1:a?", "-c:a", "copy"]
-                elif s.audio == "compress": cmd += ["-map", "1:a?", "-c:a", "aac", "-b:a", "128k"]
+                if settings["audio"] == "keep": cmd += ["-map", "1:a?", "-c:a", "copy"]
+                elif settings["audio"] == "compress": cmd += ["-map", "1:a?", "-c:a", "aac", "-b:a", "128k"]
         cmd += ["-c:v", "libx264", "-preset", ff["preset"], "-crf", ff["crf"],
                 "-threads", str(enc_threads), "-pix_fmt", "yuv420p"]
-        if not is_gif and info["has_audio"] and s.audio != "remove": cmd += ["-shortest"]
+        if not is_gif and info["has_audio"] and settings["audio"] != "remove":
+            cmd += ["-shortest"]
         cmd += ["-movflags", "+faststart", str(out_path)]
         enc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
         i = 0
@@ -384,170 +436,212 @@ def run_sync_job(job, in_path: Path, out_path: Path, info: Dict, s: Session):
         enc.stdin.close(); enc.wait()
 
     th_read = threading.Thread(target=reader, daemon=True); th_read.start()
-
-    if is_gif:
-        i = 0
-        while True:
-            if cancel.is_set(): raise RuntimeError("Cancelled")
-            img = in_q.get()
-            if img is None: break
-            cfg = tuple(ai.current)
-            f = POOL.submit(upscale_one, img, cfg)
-            with futs_cond: futs.append(f); futs_cond.notify_all()
-            i += 1
-        th_read.join()
-        outs = [f.result() for f in futs]
-        job["done"] = len(outs); job["total"] = len(outs)
-        loops = min(max(1, math.ceil(CLIP_SECONDS / (len(outs) / fps_g))), max(1, 600 // max(1, len(outs))))
-        job["loops"] = loops
-        job["status"] = "enc"
-        enc = subprocess.Popen(["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "bgr24",
-                                "-s", f"{ow}x{oh}", "-r", f"{fps_g:.6f}", "-i", "pipe:0",
-                                "-c:v", "libx264", "-preset", ff["preset"], "-crf", ff["crf"],
-                                "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(out_path)], stdin=subprocess.PIPE)
-        for _ in range(loops):
-            for arr in outs: enc.stdin.write(arr.tobytes())
-        enc.stdin.close(); enc.wait()
-    else:
-        th_enc = threading.Thread(target=encoder, daemon=True); th_enc.start()
-        i = 0
-        while True:
-            if cancel.is_set():
-                with futs_cond: futs.append(None); futs_cond.notify_all()
-                raise RuntimeError("Cancelled")
-            img = in_q.get()
-            if img is None: break
-            while (i - stats["done"]) >= ai.current[0]:     # in-flight cap = AI workers
-                time.sleep(0.02)
+    try:
+        if is_gif:
+            frames_raw = []
+            while True:
+                img = in_q.get()
+                if img is None: break
+                frames_raw.append(img)
+            outs = []
+            for i, fr in enumerate(frames_raw):
+                if cancel.is_set(): raise RuntimeError("Cancelled")
+                outs.append(upscale_one(fr, gov.current))
+            loops = min(max(1, math.ceil(GIF_MIN_SEC / (len(outs) / fps_g))),
+                        max(1, 600 // max(1, len(outs))))
+            job["loops"] = loops
+            job["stage"] = "📦"
+            enc = subprocess.Popen(["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "bgr24",
+                                    "-s", f"{ow}x{oh}", "-r", f"{fps_g:.6f}", "-i", "pipe:0",
+                                    "-c:v", "libx264", "-preset", ff["preset"], "-crf", ff["crf"],
+                                    "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(out_path)],
+                                   stdin=subprocess.PIPE)
+            for _ in range(loops):
+                for arr in outs:
+                    enc.stdin.write(arr.tobytes())
+            enc.stdin.close(); enc.wait()
+        else:
+            th_enc = threading.Thread(target=encoder, daemon=True); th_enc.start()
+            job["stage"] = "🎨"
+            i = 0
+            while True:
                 if cancel.is_set():
                     with futs_cond: futs.append(None); futs_cond.notify_all()
                     raise RuntimeError("Cancelled")
-            cfg = tuple(ai.current)
-            f = POOL.submit(upscale_one, img, cfg)
-            with futs_cond: futs.append(f); futs_cond.notify_all()
-            i += 1
-        with futs_cond: futs.append(None); futs_cond.notify_all()
-        th_enc.join(timeout=7200); th_read.join()
-    if enc is not None and enc.returncode not in (0, None):
-        raise RuntimeError("FFmpeg encode failed")
-    job["frames_done"] = job["done"]
-    job["ai"] = ai.status(job.get("spf", 0))
-    log.info("🤖 AI final: best=%s thr=%.2f f/s", ai.best, ai.throughput(ai.best))
-
-async def run_job(cid: int, job):
-    s = get_sess(cid)
-    job_dir = None; out_path = None
-    try:
-        job_dir = WORK_DIR / f"job_{job['mid']}_{int(time.time())}"
-        job_dir.mkdir(parents=True, exist_ok=True)
-        in_path = job_dir / job["filename"]
-        def dl_cb(cur, tot, *a): job["dl_done"], job["dl_total"] = cur, tot
-        await app.download_media(job["msg"], file_name=str(in_path), progress=dl_cb)
-        job["status"] = "probe"; await refresh_panel(cid)
-        probe = subprocess.run(["ffprobe", "-v", "error", "-print_format", "json",
-                                "-show_streams", "-show_format", str(in_path)], capture_output=True, text=True)
-        data = json.loads(probe.stdout)
-        vid = next(x for x in data["streams"] if x.get("codec_type") == "video")
-        fs = vid.get("avg_frame_rate") or vid.get("r_frame_rate") or "30/1"
-        n, d = fs.split("/"); fps = float(n) / float(d) if float(d) else 30.0
-        dur = float(vid.get("duration") or data.get("format", {}).get("duration") or 0)
-        frames = int(float(vid.get("nb_frames") or max(1, dur * fps)))
-        info = {"width": int(vid["width"]), "height": int(vid["height"]), "fps": fps,
-                "duration": dur, "frames": frames,
-                "has_audio": any(x.get("codec_type") == "audio" for x in data["streams"])}
-        if not job["is_gif"] and frames > MAX_FRAMES:
-            raise RuntimeError(f"Video bahut lambi: {frames} frames (max {MAX_FRAMES})")
-        out_path = OUTPUT_DIR / f"{Path(job['filename']).stem}_up_{job['mid']}.mp4"
-        job["status"] = "up"; job["t0"] = time.time()
-        await asyncio.to_thread(run_sync_job, job, in_path, out_path, info, s)
-        size_mb = out_path.stat().st_size / 1048576
-        if size_mb > MAX_SEND_MB: raise RuntimeError(f"Output {size_mb:.0f}MB > 2GB")
-        job["status"] = "upload"
-        def ul_cb(cur, tot, *a): job["ul_done"], job["ul_total"] = cur, tot
-        cap = (f"✅ **{job['filename']}**\n🎯 {s.scale:g}× → {job['ow']}×{job['oh']} • "
-               f"⚡ {job.get('spf',0):.2f}s/fr\n{job.get('ai','')}\n"
-               f"🎞 {job.get('frames_done',0)} fr" + (f" (loop ×{job.get('loops',1)})" if job["is_gif"] else "") +
-               f" • 🕒 {fmt_time(time.time() - job['t0'])} • 📦 {size_mb:.1f}MB")
-        if job["is_gif"]: await app.send_animation(cid, str(out_path), caption=cap, progress=ul_cb)
-        else: await app.send_video(cid, str(out_path), caption=cap, supports_streaming=True, progress=ul_cb)
-        job["status"] = "done"; s.history.append(f"✅ {job['filename'][:12]}")
-    except Exception as e:
-        log.exception("Job fail %s", job["filename"])
-        job["status"] = "fail"; s.history.append(f"❌ {job['filename'][:12]}")
+                img = in_q.get()
+                if img is None: break
+                while (i - stats["done"]) >= gov.current[0]:
+                    time.sleep(0.02)
+                    if cancel.is_set():
+                        with futs_cond: futs.append(None); futs_cond.notify_all()
+                        raise RuntimeError("Cancelled")
+                cfg = tuple(gov.current)
+                f = POOL.submit(upscale_one, img, cfg)
+                with futs_cond: futs.append(f); futs_cond.notify_all()
+                i += 1
+            with futs_cond: futs.append(None); futs_cond.notify_all()
+            th_enc.join(timeout=7200)
+        th_read.join()
+        if enc is not None and enc.returncode not in (0, None):
+            raise RuntimeError("FFmpeg encode failed")
+        job["frames_done"] = job["done"]
     finally:
-        if job_dir: shutil.rmtree(job_dir, ignore_errors=True)
-        if out_path and out_path.exists():
-            try: out_path.unlink()
+        for p in (dec, enc):
+            try:
+                if p and p.poll() is None: p.kill()
             except Exception: pass
-        pump(cid); kick_refresher(cid)
 
-# ================= INTAKE =================
+# ================= JOB =================
+busy_lock = asyncio.Lock()
+
 @app.on_message((filters.video | filters.document | filters.animation) & filters.private)
 async def media_handler(client, message: Message):
-    if not is_owner(message): return
-    s = get_sess(message.chat.id)
-    media = message.video or message.document or message.animation
-    fn = getattr(media, "file_name", None) or f"video_{message.id}.mp4"
-    mime = getattr(media, "mime_type", "") or ""
-    is_gif = fn.lower().endswith(".gif") or mime == "image/gif"
-    if not fn.lower().endswith((".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".gif")):
-        await message.reply_text("❌ Sirf video/GIF bhejo."); return
-    dur = getattr(media, "duration", 0) or 0
-    clip = is_gif or (0 < dur < CLIP_SECONDS)
-    if len([j for j in s.jobs if j["status"] not in ("done", "fail")]) >= MAX_QUEUE:
-        await message.reply_text("⚠️ Queue full (12)."); return
-    s.jobs = [j for j in s.jobs if j["status"] not in ("done", "fail")][-9:] + [{
-        "mid": message.id, "msg": message, "filename": fn, "is_gif": is_gif, "clip": clip,
-        "status": "queued", "cancel": threading.Event(), "done": 0, "total": 0, "spf": 0.0,
-        "conc": 1, "ow": 0, "oh": 0, "dl_done": 0, "dl_total": 0, "ul_done": 0, "ul_total": 0}]
-    await ensure_panel(message.chat.id); pump(message.chat.id)
-
-# ================= BUTTONS =================
-@app.on_callback_query(filters.regex(r"^b:"))
-async def btn(client, cq: CallbackQuery):
-    if not is_owner(cq.message):
-        await cq.answer("Private bot!", show_alert=True); return
-    s = get_sess(cq.message.chat.id)
-    parts = cq.data[2:].split(":"); a = parts[0]; v = parts[1] if len(parts) > 1 else ""
-    kb = panel_kb(s)
-    if a == "qmenu": kb = quality_kb()
-    elif a == "pmenu": kb = preset_kb()
-    elif a == "amenu": kb = audio_kb()
-    elif a == "q": s.scale = float(v); await cq.answer(f"Scale {s.scale:g}×")
-    elif a == "p": s.preset = v; await cq.answer(f"Preset {v}")
-    elif a == "a": s.audio = v; await cq.answer(f"Audio {v}")
-    elif a == "stop":
-        n = sum(1 for j in s.jobs if j["status"] not in ("done", "fail", "queued") and not j["cancel"].is_set())
-        for j in s.jobs:
-            if j["status"] not in ("done", "fail", "queued"): j["cancel"].set()
-        await cq.answer(f"⛔ {n} jobs ruki")
-    elif a == "clean":
-        try:
-            if s.panel: await s.panel.delete()
-        except Exception: pass
-        s.panel = None; s.jobs = []; s.history = []
-        await ensure_panel(cq.message.chat.id); await cq.answer("🧹 Clean!"); return
-    else:
-        await cq.answer(); return
+    global cancel_event, _panel
+    if str(message.chat.id) != OWNER_CHAT_ID:
+        await message.reply_text("❌ Private bot."); return
+    async with busy_lock:
+        if job_state.get("active"):
+            await message.reply_text("⏳ Ek job chal rahi hai."); return
+        job_state.update({"active": True, "done": 0, "total": 0, "stage": "📥"})
+        cancel_event = threading.Event()
+    job_dir = None
+    refresher = asyncio.create_task(_refresh_loop())
     try:
-        if s.panel and cq.message.id == s.panel.id:
-            await s.panel.edit_text(panel_text(s), reply_markup=kb)
+        media = message.video or message.document or message.animation
+        filename = getattr(media, "file_name", None) or f"video_{message.id}.mp4"
+        mime = getattr(media, "mime_type", "") or ""
+        is_gif = filename.lower().endswith(".gif") or mime == "image/gif"
+        if not filename.lower().endswith((".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".gif")):
+            await message.reply_text("❌ Sirf video/GIF bhejo."); return
+        job_state["filename"] = filename
+        await ensure_panel(message.chat.id)
+        job_dir = WORK_DIR / f"job_{message.id}_{int(time.time())}"
+        job_dir.mkdir(parents=True, exist_ok=True)
+        in_path = job_dir / filename
+
+        def dl_cb(cur, tot, *a):
+            job_state["stage"] = f"📥 {cur/1048576:.0f}/{tot/1048576:.0f}MB"
+        await app.download_media(message, file_name=str(in_path), progress=dl_cb)
+
+        job_state["stage"] = "🔍"
+        info = await asyncio.to_thread(probe_video, in_path)
+        if not is_gif and info["frames"] > MAX_FRAMES:
+            await message.reply_text(f"❌ Video bahut lambi: {info['frames']} frames (max {MAX_FRAMES}).")
+            return
+        scale = settings["scale"]
+        ow, oh = int(w_ := info["width"] * scale) + (int(w_ := info["width"] * scale) % 2), 0
+        ow = int(info["width"] * scale); ow += ow % 2
+        oh = int(info["height"] * scale); oh += oh % 2
+        capped = False
+        while scale > 1.0 and ow * oh > MAX_OUT_PIXELS:
+            scale = max(1.0, scale - 0.5); capped = True
+            ow = int(info["width"] * scale); ow += ow % 2
+            oh = int(info["height"] * scale); oh += oh % 2
+        model_key = settings["model"]
+        tile = choose_tile(model_key, ow * oh)
+        ups = await asyncio.to_thread(get_ups, model_key, tile)
+        gov = Governor(ow * oh)
+        job = {"filename": filename, "ow": ow, "oh": oh, "done": 0, "total": 0,
+               "spf": 0.0, "eta": 0.0, "ai": gov.status(0.0), "stage": "🎨", "loops": 1}
+        job_state.update(job)
+        out_path = OUTPUT_DIR / f"{Path(filename).stem}_up_{message.id}.mp4"
+
+        await asyncio.to_thread(run_pipeline, job, in_path, out_path, info, ups, gov,
+                                cancel_event, is_gif)
+        job_state.update({"stage": "⬆️", "done": job["done"], "total": job["total"]})
+        size_mb = out_path.stat().st_size / 1048576
+        if size_mb > MAX_SEND_MB:
+            raise RuntimeError(f"Output {size_mb:.0f}MB > 2GB limit")
+
+        cap = (f"✅ **{filename}**\n{MODELS[model_key]['label']} • {fmt_scale(scale)}× → {ow}×{oh}\n"
+               f"🎞 {job.get('frames_done', job['done'])} fr"
+               + (f" (loop ×{job.get('loops', 1)})" if is_gif else "") +
+               f" • ⚡ {job['spf']:.2f}s/fr • 🕒 {fmt_time(time.time() - job_state.get('t0', time.time()))}\n"
+               f"📦 {size_mb:.1f}MB" + (" ⚠️ 4K-cap" if capped else ""))
+        def ul_cb(cur, tot, *a):
+            job_state["stage"] = f"⬆️ {cur/1048576:.0f}/{tot/1048576:.0f}MB"
+        if is_gif:
+            await app.send_animation(message.chat.id, str(out_path), caption=cap, progress=ul_cb)
         else:
-            await cq.message.edit_text(panel_text(s), reply_markup=kb); s.panel = cq.message
-    except Exception: pass
-    await cq.answer()
+            await app.send_video(message.chat.id, str(out_path), caption=cap,
+                                 supports_streaming=True, progress=ul_cb)
+        if archive:
+            await archive.archive_video(out_path, f"{filename} | {MODELS[model_key]['label']} | "
+                                                  f"{fmt_scale(scale)}× | {fmt_time(job['spf'] * job['done'])}")
+            archive.record_job(filename, scale, job["spf"] * job["done"], True,
+                               extra={"scale": settings["scale"], "preset": settings["preset"],
+                                      "audio": settings["audio"], "model": model_key})
+            await archive.save_state()
+        job_state["stage"] = "✅"
+    except Exception as e:
+        log.exception("Job failed")
+        try: await message.reply_text(f"❌ Failed: {str(e)[:250]}")
+        except Exception: pass
+        job_state["stage"] = "❌"
+    finally:
+        refresher.cancel()
+        if job_dir: shutil.rmtree(job_dir, ignore_errors=True)
+        if out_path.exists():
+            try: out_path.unlink()
+            except Exception: pass
+        job_state["active"] = False
+        cancel_event = None
+        await refresh_panel()
+
+async def _refresh_loop():
+    while True:
+        await refresh_panel()
+        await asyncio.sleep(2.5)
+
+# ================= TEXT =================
+@app.on_message(filters.text & filters.private & ~filters.command(["start"]))
+async def text_handler(client, message: Message):
+    if str(message.chat.id) != OWNER_CHAT_ID: return
+    t = (message.text or "").lower()
+    if any(k in t for k in ["game", "free fire", "pubg", "bgmi"]):
+        await message.reply_text("🎮 Game videos ke liye panel me **model button** dabao → "
+                                 "'Game (Fast)' ya 'Game (HQ)' chuno. HQ me RealESRGAN_x4plus "
+                                 "(RRDB) lagta hai — quality best, speed slow.")
+    elif any(k in t for k in ["ram", "cpu", "load"]):
+        await message.reply_text(f"🛡 RAM free: {mem_avail_gb():.1f}GB • load: {load1():.1f} • "
+                                 f"cores: {CPU_THREADS}\nGovernor khud workers adjust karta hai.")
+    else:
+        await message.reply_text("🤖 Panel se sab control hota hai: model 🎌/🎮, scale, preset, audio. "
+                                 "Video/GIF bhejo — baaki AI + Governor sambhal lega.")
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client, message: Message):
-    if not is_owner(message): return
-    s = get_sess(message.chat.id)
+    if str(message.chat.id) != OWNER_CHAT_ID:
+        await message.reply_text("❌ Private bot."); return
+    global _panel
     try:
-        if s.panel: await s.panel.delete()
+        if _panel: await _panel.delete()
     except Exception: pass
-    s.panel = None
-    await ensure_panel(message.chat.id); await refresh_panel(message.chat.id)
+    _panel = None
+    await ensure_panel(message.chat.id)
 
-# ================= ENGINE (UNCHANGED) =================
+# ================= BOOT =================
+def notify_owner_startup():
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                          json={"chat_id": OWNER_CHAT_ID,
+                                "text": "✅ Upscaler v5 online!\n🎌 Anime / 🎮 Game models + 🤖 AI + 🛡 RAM governor.\nPanel ke buttons se sab control karo."},
+                          timeout=15)
+        log.info("Startup ping: %s", r.status_code)
+    except Exception as e:
+        log.warning("Ping fail: %s", e)
+
+async def _boot():
+    notify_owner_startup()
+    if archive:
+        await archive.load()
+        st = archive.state
+        settings["scale"] = float(st.get("scale", settings["scale"]))
+        settings["preset"] = st.get("preset", settings["preset"])
+        settings["audio"] = st.get("audio", settings["audio"])
+        settings["model"] = st.get("model", settings["model"])
+        log.info("📚 Archive settings: %s", settings)
+    log.info("🚀 v5 ready (cores=%s)", CPU_THREADS)
+
 if __name__ == "__main__":
-    log.info("🚀 v4 AI-Turbo start (cores=%s)", CPU_THREADS)
-    app.run()
+    app.run(_boot())
