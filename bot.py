@@ -37,6 +37,7 @@ MAX_FRAMES = int(os.getenv("MAX_FRAMES", "3600"))
 MAX_GIF_FRAMES = 240
 MAX_OUT_PIXELS = 3840 * 2160
 GIF_MIN_SEC = 2.0
+MAX_SEND_MB = 1900          # Telegram MTProto: ~2GB tak send ho sakta hai
 CPU_THREADS = os.cpu_count() or 4
 torch.set_num_threads(CPU_THREADS)
 os.environ.setdefault("OMP_NUM_THREADS", str(CPU_THREADS))
@@ -56,9 +57,6 @@ if not API_ID or not API_HASH or not BOT_TOKEN or not OWNER_CHAT_ID:
         "Missing GitHub Secrets. Required: "
         "API_ID, API_HASH, BOT_TOKEN, OWNER_CHAT_ID"
     )
-
-log.info("OWNER_CHAT_ID configured: %r (numeric=%s)",
-         OWNER_CHAT_ID, OWNER_CHAT_ID.lstrip("-").isdigit())
 
 WORK_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -220,7 +218,7 @@ class JobCancelled(Exception):
 
 
 # ============================================================
-# PIPELINE (zero temp files)
+# PIPELINE (zero temp files, single-pass)
 # ============================================================
 def run_pipeline(input_path: Path, output_path: Path, info: dict,
                  scale: float, status: LiveStatus,
@@ -364,15 +362,6 @@ def run_pipeline(input_path: Path, output_path: Path, info: dict,
                 pass
 
 
-def reencode_smaller(path: Path, crf: int) -> Path:
-    tmp = path.with_name(path.stem + f"_c{crf}.mp4")
-    run_cmd(["ffmpeg", "-y", "-v", "error", "-i", str(path),
-             "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf),
-             "-pix_fmt", "yuv420p", "-c:a", "copy",
-             "-movflags", "+faststart", str(tmp)])
-    return tmp
-
-
 # ============================================================
 # SMART REPLIES
 # ============================================================
@@ -381,7 +370,7 @@ def smart_reply(text: str) -> str:
     s = fmt_scale(settings["scale"])
     if any(k in t for k in ["hi", "hello", "hey", "namaste", "hlo", "yo "]):
         return ("🙏 Namaste boss! Main tumhara Anime Video Upscaler hoon.\n\n"
-                "🎥 Video ya GIF bhejo — main upscale kar dunga.\n"
+                "🎥 Video ya GIF bhejo — main upscale kar dunga (2GB tak supported).\n"
                 f"🎯 Abhi quality: {s}× (badalne ke liye /quality)\n"
                 "⏱ Har job me live progress + per-frame time + ETA dikhta hai.")
     if "kaise ho" in t or "how are you" in t:
@@ -402,6 +391,9 @@ def smart_reply(text: str) -> str:
                 "Ye loop-wala rule sirf GIF par lagta hai, normal videos par nahi.")
     if "audio" in t or "sound" in t:
         return "🎧 Audio bilkul preserved rehta hai — original audio copy hoti hai, re-encode nahi."
+    if "limit" in t or "2gb" in t or "size" in t:
+        return ("📦 Koi chhoti limit nahi — Pyrogram MTProto use karta hai, isliye **2GB tak** file "
+                "send/receive ho sakti hai.\nAsli limit sirf **time** hai: GitHub run max 6 ghante.")
     if "model" in t or "kaunsa" in t:
         return ("🧠 Model: **Real-ESRGAN AnimeVideo-v3** (anime ke liye best).\n"
                 "CPU par optimized: adaptive tiling + single-pass pipe encoding.")
@@ -461,7 +453,7 @@ def mismatch_text(message: Message) -> str:
             f"🔧 DEBUG: tumhara chat ID = `{message.chat.id}`\n"
             f"Secret me OWNER_CHAT_ID = `{OWNER_CHAT_ID or '(empty)'}` set hai.\n\n"
             "Agar dono alag hain → GitHub secret OWNER_CHAT_ID ko upar wale number par set karo, "
-            "phir workflow **dobara run** karo (secrets sirf run ke start me load hote hain).")
+            "phir workflow **dobara run** karo.")
 
 
 # ---- DEBUG: har incoming message log hoga ----
@@ -494,7 +486,7 @@ async def start_handler(_, message: Message):
         "/settings — bot settings\n"
         "/cancel — job roko\n"
         "/help — sab kuch samjho\n\n"
-        "🎥 Video ya GIF bhejo:\n"
+        "🎥 Video ya GIF bhejo (2GB tak supported):\n"
         "• Frames detect hote hi **estimate time**\n"
         "• Live **per-frame time + ETA + progress**\n"
         "• Audio preserved | GIF → loop video (≥2s)\n\n"
@@ -563,6 +555,7 @@ async def settings_handler(_, message: Message):
         f"🧵 Threads: {CPU_THREADS}\n"
         f"🎞 Max frames: {MAX_FRAMES} (GIF: {MAX_GIF_FRAMES})\n"
         f"🖼 Max output: 4K (auto-cap)\n"
+        f"📦 File limit: ~2 GB (MTProto — koi 50MB limit nahi)\n"
         f"🔁 GIF loop video: ≥{GIF_MIN_SEC:g}s\n"
         "💾 Pipeline: zero temp files (pipe decode→upscale→encode)"
     )
@@ -669,14 +662,8 @@ async def video_handler(_, message: Message):
             raise RuntimeError("Output file nahi bani.")
 
         size_mb = output_path.stat().st_size / (1024 * 1024)
-        for crf in (23, 27):
-            if size_mb <= 48:
-                break
-            await status.edit(f"📦 Size {size_mb:.1f}MB zyada hai — compress kar raha hoon (crf {crf})...")
-            new_path = await asyncio.to_thread(reencode_smaller, output_path, crf)
-            output_path.unlink(missing_ok=True)
-            new_path = new_path.rename(output_path)
-            size_mb = output_path.stat().st_size / (1024 * 1024)
+        if size_mb > MAX_SEND_MB:
+            raise RuntimeError(f"Output {size_mb:.0f} MB — Telegram 2GB limit se upar.")
 
         caption = (
             "✅ Upscale complete!\n\n"
@@ -737,12 +724,16 @@ def quality_keyboard() -> InlineKeyboardMarkup:
 # ============================================================
 async def main():
     await app.start()
+    me = await app.get_me()
+    log.info("LOGGED IN AS: @%s (id=%s)", me.username, me.id)
+    log.info("OWNER_CHAT_ID configured: %r (numeric=%s)",
+             OWNER_CHAT_ID, OWNER_CHAT_ID.lstrip("-").isdigit())
     log.info("Bot started. Waiting for videos...")
     try:
         await app.send_message(
             OWNER_CHAT_ID,
             "✅ Anime Video Upscaler GitHub Action running!\n\n"
-            "🎥 Video/GIF bhejo\n"
+            "🎥 Video/GIF bhejo (2GB tak)\n"
             "/quality se scale chuno\n"
             "⏱ Estimate + live per-frame time + ETA\n"
             "🎞 GIF → loop video (≥2s)\n\n"
