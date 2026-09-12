@@ -21,7 +21,7 @@ from realesrgan import RealESRGANer
 from realesrgan.archs.srvgg_arch import SRVGGNetCompact
 
 # ============================================================
-# CONFIG  (env names EXACT - no trailing spaces!)
+# CONFIG (exact env names - no spaces!)
 # ============================================================
 API_ID = int(os.getenv("API_ID", "0") or 0)
 API_HASH = os.getenv("API_HASH", "") or ""
@@ -33,11 +33,10 @@ MODEL_PATH = Path("weights/realesr-animevideov3.pth")
 WORK_DIR = Path("work")
 OUTPUT_DIR = Path("output")
 
-# ---- Server-safety limits (GitHub runner ko overload nahi hone denge) ----
-MAX_FRAMES = int(os.getenv("MAX_FRAMES", "3600"))       # video frame cap
-MAX_GIF_FRAMES = 240                                    # gif frame cap
-MAX_OUT_PIXELS = 3840 * 2160                            # 4K output cap
-GIF_MIN_SEC = 2.0                                       # gif loop video min sec
+MAX_FRAMES = int(os.getenv("MAX_FRAMES", "3600"))
+MAX_GIF_FRAMES = 240
+MAX_OUT_PIXELS = 3840 * 2160
+GIF_MIN_SEC = 2.0
 CPU_THREADS = os.cpu_count() or 4
 torch.set_num_threads(CPU_THREADS)
 os.environ.setdefault("OMP_NUM_THREADS", str(CPU_THREADS))
@@ -57,6 +56,9 @@ if not API_ID or not API_HASH or not BOT_TOKEN or not OWNER_CHAT_ID:
         "Missing GitHub Secrets. Required: "
         "API_ID, API_HASH, BOT_TOKEN, OWNER_CHAT_ID"
     )
+
+log.info("OWNER_CHAT_ID configured: %r (numeric=%s)",
+         OWNER_CHAT_ID, OWNER_CHAT_ID.lstrip("-").isdigit())
 
 WORK_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -86,12 +88,11 @@ def even(x: int) -> int:
 
 
 def est_sec_per_frame(out_pixels: int) -> float:
-    """CPU heuristic estimate (pehle frames ke baad real speed se refine hota hai)."""
     return 4.5e-7 * out_pixels + 0.06
 
 
 # ============================================================
-# MODEL (tile adaptive -> speed + RAM safety)
+# MODEL
 # ============================================================
 _models = {}
 
@@ -125,7 +126,6 @@ def choose_tile(out_pixels: int) -> int:
 
 
 def compute_out(w: int, h: int, scale: float):
-    """4K se upar jane par scale auto-cap (server safety)."""
     capped = False
     while scale > 1.0 and even(w * scale) * even(h * scale) > MAX_OUT_PIXELS:
         scale = max(1.0, scale - 0.5)
@@ -134,7 +134,7 @@ def compute_out(w: int, h: int, scale: float):
 
 
 # ============================================================
-# FFPROBE / VIDEO INFO
+# FFPROBE
 # ============================================================
 def run_cmd(cmd):
     log.info("CMD: %s", " ".join(map(str, cmd)))
@@ -182,7 +182,7 @@ def safe_stem(name: str):
 
 
 # ============================================================
-# LIVE STATUS (flood-safe editing)
+# LIVE STATUS
 # ============================================================
 class LiveStatus:
     def __init__(self, msg, loop):
@@ -220,7 +220,7 @@ class JobCancelled(Exception):
 
 
 # ============================================================
-# PIPELINE: decode pipe -> upscale -> encode pipe (ZERO temp files)
+# PIPELINE (zero temp files)
 # ============================================================
 def run_pipeline(input_path: Path, output_path: Path, info: dict,
                  scale: float, status: LiveStatus,
@@ -289,8 +289,7 @@ def run_pipeline(input_path: Path, output_path: Path, info: dict,
                 enc.stdin.write(out.tobytes())
                 sum_t += time.time() - t0
                 done += 1
-                spf = sum_t / done
-                status.request(progress_text(done, total, spf))
+                status.request(progress_text(done, total, sum_t / done))
                 if done % 60 == 0:
                     gc.collect()
                 del img, out
@@ -301,7 +300,6 @@ def run_pipeline(input_path: Path, output_path: Path, info: dict,
                 raise RuntimeError("FFmpeg encode failed")
             stats.update(frames=done, avg_spf=(sum_t / done if done else 0.0))
         else:
-            # ---- GIF: frames collect karo, upscale, phir loop video ----
             fps_g = fps if fps > 0 else 10.0
             dec = subprocess.Popen(
                 ["ffmpeg", "-v", "error", "-i", str(input_path),
@@ -376,7 +374,7 @@ def reencode_smaller(path: Path, crf: int) -> Path:
 
 
 # ============================================================
-# SMART CHAT REPLIES (Hinglish + English)
+# SMART REPLIES
 # ============================================================
 def smart_reply(text: str) -> str:
     t = text.lower()
@@ -422,7 +420,6 @@ def smart_reply(text: str) -> str:
                 "Bas video/GIF bhejo, baaki main sambhal lunga 😎")
     if any(k in t for k in ["love", "pyar", "jaan"]):
         return "😄 Pyar milta rahe boss! Badle me main 4K tak upscale kar deta hoon ❤️"
-    # default smart answer
     variants = [
         (f"🤖 Haan boss, sun raha hoon! Main upscale bot hoon — baatein kam, kaam zyada 😄\n\n"
          f"🎯 Current quality: {s}×\n"
@@ -452,16 +449,30 @@ busy_lock = asyncio.Lock()
 
 
 def owner_only(message: Message) -> bool:
-    return str(message.chat.id) == OWNER_CHAT_ID
+    ok = str(message.chat.id) == OWNER_CHAT_ID
+    if not ok:
+        log.warning("OWNER MISMATCH | message chat=%s | secret OWNER_CHAT_ID=%r",
+                    message.chat.id, OWNER_CHAT_ID)
+    return ok
 
 
-def quality_keyboard() -> InlineKeyboardMarkup:
-    rows = []
-    for sc in SCALE_OPTIONS:
-        mark = "✅ " if abs(settings["scale"] - sc) < 0.01 else ""
-        rows.append([InlineKeyboardButton(
-            f"{mark}{fmt_scale(sc)}×", callback_data=f"scale:{sc}")])
-    return InlineKeyboardMarkup(rows)
+def mismatch_text(message: Message) -> str:
+    return ("❌ This bot is private.\n\n"
+            f"🔧 DEBUG: tumhara chat ID = `{message.chat.id}`\n"
+            f"Secret me OWNER_CHAT_ID = `{OWNER_CHAT_ID or '(empty)'}` set hai.\n\n"
+            "Agar dono alag hain → GitHub secret OWNER_CHAT_ID ko upar wale number par set karo, "
+            "phir workflow **dobara run** karo (secrets sirf run ke start me load hote hain).")
+
+
+# ---- DEBUG: har incoming message log hoga ----
+@app.on_message(filters.all & filters.private, group=-1)
+async def debug_logger(_, message: Message):
+    kind = ("text" if message.text else
+            "video" if message.video else
+            "animation" if message.animation else
+            "document" if message.document else "other")
+    log.info("INCOMING | chat_id=%s | kind=%s | text=%r",
+             message.chat.id, kind, (message.text or "")[:60])
 
 
 # ============================================================
@@ -469,8 +480,9 @@ def quality_keyboard() -> InlineKeyboardMarkup:
 # ============================================================
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(_, message: Message):
+    log.info("/start received from chat %s", message.chat.id)
     if not owner_only(message):
-        await message.reply_text("❌ This bot is private.")
+        await message.reply_text(mismatch_text(message))
         return
     await message.reply_text(
         "🎬 **Anime Video Upscaler Bot**\n\n"
@@ -494,7 +506,7 @@ async def start_handler(_, message: Message):
 @app.on_message(filters.command("help") & filters.private)
 async def help_handler(_, message: Message):
     if not owner_only(message):
-        await message.reply_text("❌ This bot is private.")
+        await message.reply_text(mismatch_text(message))
         return
     await message.reply_text(smart_reply("help"))
 
@@ -502,7 +514,7 @@ async def help_handler(_, message: Message):
 @app.on_message(filters.command("quality") & filters.private)
 async def quality_handler(_, message: Message):
     if not owner_only(message):
-        await message.reply_text("❌ This bot is private.")
+        await message.reply_text(mismatch_text(message))
         return
     await message.reply_text(
         "🎛 Upscale quality chuno:\n"
@@ -512,13 +524,14 @@ async def quality_handler(_, message: Message):
     )
 
 
-@app.on_callback_query(filters.create(lambda _, __, cq: cq.data.startswith("scale:")))
+@app.on_callback_query(filters.create(lambda _, __, cq: bool(cq.data) and cq.data.startswith("scale:")))
 async def scale_callback(_, cq):
     if str(cq.message.chat.id) != OWNER_CHAT_ID:
         await cq.answer("Private bot!", show_alert=True)
         return
     val = float(cq.data.split(":", 1)[1])
     settings["scale"] = val
+    log.info("Scale set to %s by chat %s", val, cq.message.chat.id)
     await cq.answer(f"Quality: {fmt_scale(val)}×")
     try:
         await cq.message.edit_text(
@@ -533,7 +546,7 @@ async def scale_callback(_, cq):
 @app.on_message(filters.command("status") & filters.private)
 async def status_handler(_, message: Message):
     if not owner_only(message):
-        await message.reply_text("❌ This bot is private.")
+        await message.reply_text(mismatch_text(message))
         return
     await message.reply_text(job_state["text"])
 
@@ -541,7 +554,7 @@ async def status_handler(_, message: Message):
 @app.on_message(filters.command("settings") & filters.private)
 async def settings_handler(_, message: Message):
     if not owner_only(message):
-        await message.reply_text("❌ This bot is private.")
+        await message.reply_text(mismatch_text(message))
         return
     await message.reply_text(
         "⚙️ Bot settings:\n\n"
@@ -558,7 +571,7 @@ async def settings_handler(_, message: Message):
 @app.on_message(filters.command("cancel") & filters.private)
 async def cancel_handler(_, message: Message):
     if not owner_only(message):
-        await message.reply_text("❌ This bot is private.")
+        await message.reply_text(mismatch_text(message))
         return
     if job_state["active"] and cancel_event is not None:
         cancel_event.set()
@@ -574,7 +587,7 @@ async def cancel_handler(_, message: Message):
     ["start", "help", "quality", "status", "settings", "cancel"]))
 async def text_handler(_, message: Message):
     if not owner_only(message):
-        await message.reply_text("❌ This bot is private.")
+        await message.reply_text(mismatch_text(message))
         return
     txt = message.text or ""
     if txt.startswith("/"):
@@ -589,8 +602,9 @@ async def text_handler(_, message: Message):
 @app.on_message((filters.video | filters.document | filters.animation) & filters.private)
 async def video_handler(_, message: Message):
     global cancel_event
+    log.info("Media received from chat %s", message.chat.id)
     if not owner_only(message):
-        await message.reply_text("❌ This bot is private.")
+        await message.reply_text(mismatch_text(message))
         return
     async with busy_lock:
         if job_state["active"]:
@@ -650,13 +664,10 @@ async def video_handler(_, message: Message):
             run_pipeline, input_path, output_path, info,
             scale, status, cancel_event, is_gif,
         )
-        await status.edit(
-            "🎞 Frames finished!\n\n"
-            " Encoding + audio restore ho raha hai...")
+        await status.edit("🎞 Frames finished!\n\nEncoding + audio restore ho raha hai...")
         if not output_path.exists():
             raise RuntimeError("Output file nahi bani.")
 
-        # ---- size guard (bot 50MB limit) ----
         size_mb = output_path.stat().st_size / (1024 * 1024)
         for crf in (23, 27):
             if size_mb <= 48:
@@ -710,6 +721,15 @@ async def video_handler(_, message: Message):
         job_state["active"] = False
         job_state["text"] = "😴 Idle — koi job nahi."
         cancel_event = None
+
+
+def quality_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    for sc in SCALE_OPTIONS:
+        mark = "✅ " if abs(settings["scale"] - sc) < 0.01 else ""
+        rows.append([InlineKeyboardButton(
+            f"{mark}{fmt_scale(sc)}×", callback_data=f"scale:{sc}")])
+    return InlineKeyboardMarkup(rows)
 
 
 # ============================================================
