@@ -14,9 +14,12 @@ jobs:
           python-version: '3.10'
           cache: 'pip'
       - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/boost || true
-          df -h .
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/boost || true
+      - name: Cache Real-ESRGAN weights
+        uses: actions/cache@v4
+        with:
+          path: weights
+          key: realesrgan-weights-v5
       - name: Install FFmpeg
         run: |
           sudo apt-get update
@@ -26,16 +29,14 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           pip install --index-url https://download.pytorch.org/whl/cpu torch==2.1.2 torchvision==0.16.2
           pip install -r requirements.txt
-      - name: Install Real-ESRGAN
+      - name: Install Real-ESRGAN + models
         run: |
           git clone --depth 1 https://github.com/xinntao/Real-ESRGAN.git realesrgan-src
-          cd realesrgan-src
-          pip install -e . --no-deps
-          cd ..
+          cd realesrgan-src && pip install -e . --no-deps && cd ..
           mkdir -p weights
-          wget -q --show-progress \
-            https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-animevideov3.pth \
-            -O weights/realesr-animevideov3.pth
+          [ -f weights/realesr-animevideov3.pth ] || wget -q https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-animevideov3.pth -O weights/realesr-animevideov3.pth
+          [ -f weights/realesr-general-x4v3.pth ] || wget -q https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth -O weights/realesr-general-x4v3.pth
+          [ -f weights/RealESRGAN_x4plus.pth ] || wget -q https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth -O weights/RealESRGAN_x4plus.pth
       - name: Run Telegram bot
         env:
           PYTHONUNBUFFERED: '1'
@@ -43,4 +44,5 @@ jobs:
           API_HASH: ${{ secrets.API_HASH }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           OWNER_CHAT_ID: ${{ secrets.OWNER_CHAT_ID }}
+          ARCHIVE_CHANNEL_ID: ${{ secrets.ARCHIVE_CHANNEL_ID }}
         run: python -u bot.py
