@@ -38,7 +38,14 @@ from realesrgan.archs.srvgg_arch import SRVGGNetCompact
 API_ID = int(os.getenv("API_ID", "0") or 0)
 API_HASH = os.getenv("API_HASH", "") or ""
 BOT_TOKEN = os.getenv("BOT_TOKEN", "") or ""
-OWNER_CHAT_ID = (os.getenv("OWNER_CHAT_ID", "") or "").strip()
+
+# Fully bulletproof OWNER_CHAT_ID parsing (removes quotes and spaces)
+_raw_owner = (os.getenv("OWNER_CHAT_ID", "") or "").strip().strip("'").strip('"')
+OWNER_CHAT_ID = _raw_owner
+try:
+    OWNER_CHAT_ID_INT = int(_raw_owner)
+except ValueError:
+    OWNER_CHAT_ID_INT = 0
 
 SCALE_OPTIONS = [1.5, 2.0, 3.0, 4.0]
 MODEL_PATH = Path("weights/realesr-animevideov3.pth")
@@ -456,7 +463,8 @@ busy_lock = asyncio.Lock()
 
 
 def owner_only(message: Message) -> bool:
-    ok = str(message.chat.id) == OWNER_CHAT_ID
+    # Check both string representation and integer to be 100% safe
+    ok = (str(message.chat.id) == OWNER_CHAT_ID) or (message.chat.id == OWNER_CHAT_ID_INT)
     if not ok:
         log.warning("OWNER MISMATCH | message chat=%s | secret OWNER_CHAT_ID=%r",
                     message.chat.id, OWNER_CHAT_ID)
@@ -542,7 +550,7 @@ async def quality_handler(_, message: Message):
 
 @app.on_callback_query(filters.create(lambda _, __, cq: bool(cq.data) and cq.data.startswith("scale:")))
 async def scale_callback(_, cq):
-    if str(cq.message.chat.id) != OWNER_CHAT_ID:
+    if str(cq.message.chat.id) != OWNER_CHAT_ID and cq.message.chat.id != OWNER_CHAT_ID_INT:
         await cq.answer("Private bot!", show_alert=True)
         return
     val = float(cq.data.split(":", 1)[1])
