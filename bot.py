@@ -1,3 +1,13 @@
+#!/usr/bin/env python3
+"""
+Telegram Anime Video Upscaler (GitHub Actions)
+- Real-ESRGAN AnimeVideo-v3 (CPU, server-safe)
+- Zero temp files: pipe decode -> upscale -> pipe encode (single pass)
+- Smart Hinglish replies, quality buttons, live ETA + per-frame time
+- GIF support: upscale -> seamless loop video (>=2 sec)
+- 2GB tak send/receive (Pyrogram MTProto)
+- Webhook auto-delete + HTTP API startup ping
+"""
 import asyncio
 import gc
 import json
@@ -5,11 +15,13 @@ import logging
 import math
 import os
 import subprocess
+import threading
 import time
 from pathlib import Path
 
 import cv2
 import numpy as np
+import requests
 import torch
 from pyrogram import Client, filters
 from pyrogram.types import (
@@ -21,7 +33,7 @@ from realesrgan import RealESRGANer
 from realesrgan.archs.srvgg_arch import SRVGGNetCompact
 
 # ============================================================
-# CONFIG (exact env names - no spaces!)
+# CONFIG (exact secret names - koi space nahi!)
 # ============================================================
 API_ID = int(os.getenv("API_ID", "0") or 0)
 API_HASH = os.getenv("API_HASH", "") or ""
@@ -37,7 +49,7 @@ MAX_FRAMES = int(os.getenv("MAX_FRAMES", "3600"))
 MAX_GIF_FRAMES = 240
 MAX_OUT_PIXELS = 3840 * 2160
 GIF_MIN_SEC = 2.0
-MAX_SEND_MB = 1900          # Telegram MTProto: ~2GB tak send ho sakta hai
+MAX_SEND_MB = 1900                      # Telegram MTProto ~2GB limit
 CPU_THREADS = os.cpu_count() or 4
 torch.set_num_threads(CPU_THREADS)
 os.environ.setdefault("OMP_NUM_THREADS", str(CPU_THREADS))
@@ -51,6 +63,9 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 log = logging.getLogger("anime-upscaler")
+
+for _key in ("API_ID", "API_HASH", "BOT_TOKEN", "OWNER_CHAT_ID"):
+    log.info("ENV CHECK | %s = %s", _key, "SET" if os.getenv(_key) else "MISSING")
 
 if not API_ID or not API_HASH or not BOT_TOKEN or not OWNER_CHAT_ID:
     raise RuntimeError(
@@ -90,7 +105,7 @@ def est_sec_per_frame(out_pixels: int) -> float:
 
 
 # ============================================================
-# MODEL
+# MODEL (adaptive tile + cache)
 # ============================================================
 _models = {}
 
@@ -180,7 +195,7 @@ def safe_stem(name: str):
 
 
 # ============================================================
-# LIVE STATUS
+# LIVE STATUS (flood-safe)
 # ============================================================
 class LiveStatus:
     def __init__(self, msg, loop):
@@ -222,7 +237,7 @@ class JobCancelled(Exception):
 # ============================================================
 def run_pipeline(input_path: Path, output_path: Path, info: dict,
                  scale: float, status: LiveStatus,
-                 cancel: asyncio.Event, is_gif: bool) -> dict:
+                 cancel: threading.Event, is_gif: bool) -> dict:
     w, h, fps = info["width"], info["height"], info["fps"]
     ow, oh, scale, _ = compute_out(w, h, scale)
     tile = choose_tile(ow * oh)
@@ -363,7 +378,7 @@ def run_pipeline(input_path: Path, output_path: Path, info: dict,
 
 
 # ============================================================
-# SMART REPLIES
+# SMART REPLIES (Hinglish)
 # ============================================================
 def smart_reply(text: str) -> str:
     t = text.lower()
@@ -465,6 +480,15 @@ async def debug_logger(_, message: Message):
             "document" if message.document else "other")
     log.info("INCOMING | chat_id=%s | kind=%s | text=%r",
              message.chat.id, kind, (message.text or "")[:60])
+
+
+def quality_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    for sc in SCALE_OPTIONS:
+        mark = "✅ " if abs(settings["scale"] - sc) < 0.01 else ""
+        rows.append([InlineKeyboardButton(
+            f"{mark}{fmt_scale(sc)}×", callback_data=f"scale:{sc}")])
+    return InlineKeyboardMarkup(rows)
 
 
 # ============================================================
@@ -604,7 +628,7 @@ async def video_handler(_, message: Message):
             await message.reply_text("⏳ Ek video already process ho raha hai, thoda wait karo.")
             return
         job_state["active"] = True
-        cancel_event = asyncio.Event()
+        cancel_event = threading.Event()
     job_dir = None
     try:
         media = message.video or message.document or message.animation
@@ -710,38 +734,67 @@ async def video_handler(_, message: Message):
         cancel_event = None
 
 
-def quality_keyboard() -> InlineKeyboardMarkup:
-    rows = []
-    for sc in SCALE_OPTIONS:
-        mark = "✅ " if abs(settings["scale"] - sc) < 0.01 else ""
-        rows.append([InlineKeyboardButton(
-            f"{mark}{fmt_scale(sc)}×", callback_data=f"scale:{sc}")])
-    return InlineKeyboardMarkup(rows)
+# ============================================================
+# STARTUP PING (HTTP API - one_time_bot.py wala reliable trick)
+# ============================================================
+def notify_owner_startup():
+    if not OWNER_CHAT_ID:
+        log.warning("⚠️ OWNER_CHAT_ID set nahi hai — startup ping skip.")
+        return
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        resp = requests.post(
+            url,
+            json={
+                "chat_id": OWNER_CHAT_ID,
+                "text": (
+                    "✅ Anime Upscaler Bot chal raha hai!\n\n"
+                    "🎥 Video/GIF bhejo (2GB tak)\n"
+                    "/quality se scale chuno\n"
+                    "/help se commands dekho"
+                ),
+            },
+            timeout=15,
+        )
+        data = {}
+        try:
+            data = resp.json()
+        except Exception:
+            pass
+        if resp.status_code == 200 and data.get("ok"):
+            log.info("✅ Startup ping HTTP API se bhej diya (chat_id=%s)", OWNER_CHAT_ID)
+        else:
+            log.error("❌ Startup ping FAIL: status=%s body=%s", resp.status_code, resp.text[:200])
+            log.error("💡 FIX: Telegram par bot ko ek baar /start karo, phir dobara run karo.")
+    except Exception as e:
+        log.error("❌ Startup ping exception: %s", e)
 
 
 # ============================================================
-# START
+# MAIN
 # ============================================================
 async def main():
+    # 🔥 Webhook force-delete (updates hamesha isi session ko milenge)
+    try:
+        log.info("🧹 Purana webhook delete kar raha hoon...")
+        res = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook",
+            json={"drop_pending_updates": False},
+            timeout=15,
+        )
+        log.info("Webhook status: %s", res.text[:200])
+    except Exception as e:
+        log.warning("Webhook delete error: %s", e)
+
     await app.start()
     me = await app.get_me()
     log.info("LOGGED IN AS: @%s (id=%s)", me.username, me.id)
     log.info("OWNER_CHAT_ID configured: %r (numeric=%s)",
              OWNER_CHAT_ID, OWNER_CHAT_ID.lstrip("-").isdigit())
     log.info("Bot started. Waiting for videos...")
-    try:
-        await app.send_message(
-            OWNER_CHAT_ID,
-            "✅ Anime Video Upscaler GitHub Action running!\n\n"
-            "🎥 Video/GIF bhejo (2GB tak)\n"
-            "/quality se scale chuno\n"
-            "⏱ Estimate + live per-frame time + ETA\n"
-            "🎞 GIF → loop video (≥2s)\n\n"
-            f"🎯 Default quality: {fmt_scale(settings['scale'])}×",
-            reply_markup=quality_keyboard(),
-        )
-    except Exception as exc:
-        log.warning("Startup message failed: %s", exc)
+
+    notify_owner_startup()
+
     await asyncio.Event().wait()
 
 
