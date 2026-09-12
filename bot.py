@@ -23,7 +23,7 @@ import cv2
 import numpy as np
 import requests
 import torch
-from pyrogram import Client, filters, idle
+from pyrogram import Client, filters
 from pyrogram.types import (
     Message,
     InlineKeyboardMarkup,
@@ -450,14 +450,14 @@ def smart_reply(text: str) -> str:
 
 
 # ============================================================
-# TELEGRAM CLIENT
+# TELEGRAM CLIENT (100% In-Memory to fix Ghost Processes)
 # ============================================================
 app = Client(
     "telegram_anime_upscaler",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    workdir=".",
+    in_memory=True,  # 👈 CRUCIAL: Ye ensure karega ki MTProto session file ghost ban kar na atke
 )
 busy_lock = asyncio.Lock()
 
@@ -800,10 +800,11 @@ async def main():
     log.info("Bot started. Waiting for videos...")
 
     notify_owner_startup()
+    log.info("Bot is fully active and listening...")
 
-    # Pyrogram ka official loop yahan chalega
-    await idle()
-    await app.stop()
+    # 100% Bulletproof fallback taaki GitHub Actions apne aap end na kare
+    while True:
+        await asyncio.sleep(3600)
 
 
 if __name__ == "__main__":
