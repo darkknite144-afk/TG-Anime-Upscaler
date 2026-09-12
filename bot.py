@@ -1,38 +1,50 @@
 import asyncio
+import gc
 import json
 import logging
+import math
 import os
-import shutil
 import subprocess
 import time
 from pathlib import Path
 
 import cv2
+import numpy as np
 import torch
-from basicsr.archs.srvgg_arch import SRVGGNetCompact
 from pyrogram import Client, filters
-from pyrogram.types import Message
+from pyrogram.types import (
+    Message,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 from realesrgan import RealESRGANer
-
+from realesrgan.archs.srvgg_arch import SRVGGNetCompact
 
 # ============================================================
-# CONFIG
+# CONFIG  (env names EXACT - no trailing spaces!)
 # ============================================================
+API_ID = int(os.getenv("API_ID", "0") or 0)
+API_HASH = os.getenv("API_HASH", "") or ""
+BOT_TOKEN = os.getenv("BOT_TOKEN", "") or ""
+OWNER_CHAT_ID = (os.getenv("OWNER_CHAT_ID", "") or "").strip()
 
-API_ID = int(os.getenv("API_ID", "0") or "0")
-API_HASH = os.getenv("API_HASH", "").strip()
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID", "").strip()
-
+SCALE_OPTIONS = [1.5, 2.0, 3.0, 4.0]
 MODEL_PATH = Path("weights/realesr-animevideov3.pth")
-WORK_ROOT = Path("work")
+WORK_DIR = Path("work")
+OUTPUT_DIR = Path("output")
 
-SCALE = 2
-TILE = 128
+# ---- Server-safety limits (GitHub runner ko overload nahi hone denge) ----
+MAX_FRAMES = int(os.getenv("MAX_FRAMES", "3600"))       # video frame cap
+MAX_GIF_FRAMES = 240                                    # gif frame cap
+MAX_OUT_PIXELS = 3840 * 2160                            # 4K output cap
+GIF_MIN_SEC = 2.0                                       # gif loop video min sec
+CPU_THREADS = os.cpu_count() or 4
+torch.set_num_threads(CPU_THREADS)
+os.environ.setdefault("OMP_NUM_THREADS", str(CPU_THREADS))
 
-SUPPORTED_EXTENSIONS = {
-    ".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v"
-}
+settings = {"scale": 2.0}
+job_state = {"active": False, "text": "😴 Idle — koi job nahi."}
+cancel_event = None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,26 +52,395 @@ logging.basicConfig(
 )
 log = logging.getLogger("anime-upscaler")
 
-
-# ============================================================
-# VALIDATION
-# ============================================================
-
-if not API_ID or not API_HASH or not BOT_TOKEN:
+if not API_ID or not API_HASH or not BOT_TOKEN or not OWNER_CHAT_ID:
     raise RuntimeError(
-        "Missing API_ID, API_HASH or BOT_TOKEN GitHub Secret."
+        "Missing GitHub Secrets. Required: "
+        "API_ID, API_HASH, BOT_TOKEN, OWNER_CHAT_ID"
     )
 
-if not OWNER_CHAT_ID:
-    raise RuntimeError(
-        "Missing OWNER_CHAT_ID GitHub Secret."
+WORK_DIR.mkdir(exist_ok=True)
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+def fmt_scale(s: float) -> str:
+    return f"{s:g}"
+
+
+def fmt_time(sec: float) -> str:
+    sec = max(0, int(sec))
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m {s}s"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
+def even(x: int) -> int:
+    x = int(round(x))
+    return x + (x % 2)
+
+
+def est_sec_per_frame(out_pixels: int) -> float:
+    """CPU heuristic estimate (pehle frames ke baad real speed se refine hota hai)."""
+    return 4.5e-7 * out_pixels + 0.06
+
+
+# ============================================================
+# MODEL (tile adaptive -> speed + RAM safety)
+# ============================================================
+_models = {}
+
+
+def get_upsampler(tile: int) -> RealESRGANer:
+    if tile in _models:
+        return _models[tile]
+    if not MODEL_PATH.exists():
+        raise FileNotFoundError(f"Model not found: {MODEL_PATH}")
+    log.info("Loading Real-ESRGAN AnimeVideo-v3 (tile=%s, threads=%s)...", tile, CPU_THREADS)
+    model = SRVGGNetCompact(
+        num_in_ch=3, num_out_ch=3, num_feat=64,
+        num_conv=16, upscale=4, act_type="prelu",
     )
+    ups = RealESRGANer(
+        scale=4,
+        model_path=str(MODEL_PATH),
+        model=model,
+        tile=tile,
+        tile_pad=10,
+        pre_pad=0,
+        half=False,
+        device=torch.device("cpu"),
+    )
+    _models[tile] = ups
+    return ups
+
+
+def choose_tile(out_pixels: int) -> int:
+    return 0 if out_pixels <= 2_600_000 else 320
+
+
+def compute_out(w: int, h: int, scale: float):
+    """4K se upar jane par scale auto-cap (server safety)."""
+    capped = False
+    while scale > 1.0 and even(w * scale) * even(h * scale) > MAX_OUT_PIXELS:
+        scale = max(1.0, scale - 0.5)
+        capped = True
+    return even(w * scale), even(h * scale), scale, capped
+
+
+# ============================================================
+# FFPROBE / VIDEO INFO
+# ============================================================
+def run_cmd(cmd):
+    log.info("CMD: %s", " ".join(map(str, cmd)))
+    return subprocess.run(
+        cmd, check=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+
+
+def ffprobe_json(path: Path):
+    result = run_cmd([
+        "ffprobe", "-v", "error", "-print_format", "json",
+        "-show_streams", "-show_format", str(path),
+    ])
+    return json.loads(result.stdout)
+
+
+def get_video_info(path: Path):
+    data = ffprobe_json(path)
+    video = next(s for s in data["streams"] if s.get("codec_type") == "video")
+    audio = next((s for s in data["streams"] if s.get("codec_type") == "audio"), None)
+    fps_value = video.get("avg_frame_rate") or "0/1"
+    num, den = fps_value.split("/")
+    fps = float(num) / float(den) if float(den) else 0.0
+    if fps <= 0:
+        fps_value = video.get("r_frame_rate") or "30/1"
+        num, den = fps_value.split("/")
+        fps = float(num) / float(den) if float(den) else 30.0
+    duration = float(video.get("duration") or data.get("format", {}).get("duration") or 0)
+    frames = int(float(video.get("nb_frames") or max(0, round(duration * fps))))
+    return {
+        "width": int(video["width"]),
+        "height": int(video["height"]),
+        "fps": fps,
+        "duration": duration,
+        "frames": frames,
+        "has_audio": audio is not None,
+        "codec": video.get("codec_name", "unknown"),
+    }
+
+
+def safe_stem(name: str):
+    stem = Path(name).stem
+    return "".join(c for c in stem if c not in '/\\\x00') or "video"
+
+
+# ============================================================
+# LIVE STATUS (flood-safe editing)
+# ============================================================
+class LiveStatus:
+    def __init__(self, msg, loop):
+        self.msg = msg
+        self.loop = loop
+        self.last = 0.0
+        self.last_text = ""
+
+    def request(self, text: str, force: bool = False):
+        job_state["text"] = text
+
+        def _do():
+            asyncio.create_task(self._edit(text, force))
+
+        self.loop.call_soon_threadsafe(_do)
+
+    async def _edit(self, text: str, force: bool):
+        now = time.time()
+        if not force and (now - self.last < 4 or text == self.last_text):
+            return
+        self.last = now
+        self.last_text = text
+        try:
+            await self.msg.edit_text(text)
+        except Exception:
+            pass
+
+    async def edit(self, text: str):
+        job_state["text"] = text
+        await self._edit(text, True)
+
+
+class JobCancelled(Exception):
+    pass
+
+
+# ============================================================
+# PIPELINE: decode pipe -> upscale -> encode pipe (ZERO temp files)
+# ============================================================
+def run_pipeline(input_path: Path, output_path: Path, info: dict,
+                 scale: float, status: LiveStatus,
+                 cancel: asyncio.Event, is_gif: bool) -> dict:
+    w, h, fps = info["width"], info["height"], info["fps"]
+    ow, oh, scale, _ = compute_out(w, h, scale)
+    tile = choose_tile(ow * oh)
+    ups = get_upsampler(tile)
+    t_start = time.time()
+    dec = enc = None
+    stats = {"frames": 0, "avg_spf": 0.0, "seconds": 0.0,
+             "out_w": ow, "out_h": oh, "loops": 1, "scale": scale}
+
+    def progress_text(done, total, spf):
+        pct = f"{done * 100 // total}%" if total else "…"
+        eta = (total - done) * spf if (total and spf) else 0
+        lines = [
+            f"✨ Upscaling — {fmt_scale(scale)}× (Real-ESRGAN AnimeVideo-v3)",
+            "",
+            f"🎞 Frames: {done}/{total if total else '?'} ({pct})",
+        ]
+        if spf > 0:
+            lines.append(f"⚡ Per-frame: {spf:.2f}s  ({1 / spf:.2f} frame/sec)")
+            lines.append(f"⏱ ETA: {fmt_time(eta)}")
+        else:
+            lines.append("⚡ Per-frame time measure ho raha hai...")
+        lines += [
+            f"🕒 Elapsed: {fmt_time(time.time() - t_start)}",
+            f"🖼 Output: {ow}×{oh} | 🧠 {CPU_THREADS} threads | tile {tile or 'full'}",
+            "",
+            "❌ Rokna ho to /cancel",
+        ]
+        return "\n".join(lines)
+
+    try:
+        if not is_gif:
+            total = info["frames"] or max(1, int(info["duration"] * fps))
+            dec = subprocess.Popen(
+                ["ffmpeg", "-v", "error", "-i", str(input_path),
+                 "-vsync", "0", "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"],
+                stdout=subprocess.PIPE,
+            )
+            cmd = ["ffmpeg", "-y", "-v", "error",
+                   "-f", "rawvideo", "-pix_fmt", "bgr24",
+                   "-s", f"{ow}x{oh}", "-r", f"{fps:.6f}", "-i", "pipe:0",
+                   "-i", str(input_path), "-map", "0:v:0"]
+            if info["has_audio"]:
+                cmd += ["-map", "1:a?"]
+            cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "19",
+                    "-pix_fmt", "yuv420p", "-c:a", "copy", "-shortest",
+                    "-movflags", "+faststart", str(output_path)]
+            enc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+
+            frame_bytes = w * h * 3
+            done = 0
+            sum_t = 0.0
+            while True:
+                if cancel.is_set():
+                    raise JobCancelled("User cancelled")
+                raw = dec.stdout.read(frame_bytes)
+                if not raw or len(raw) != frame_bytes:
+                    break
+                t0 = time.time()
+                img = np.frombuffer(raw, np.uint8).reshape(h, w, 3)
+                out, _ = ups.enhance(img, outscale=scale)
+                enc.stdin.write(out.tobytes())
+                sum_t += time.time() - t0
+                done += 1
+                spf = sum_t / done
+                status.request(progress_text(done, total, spf))
+                if done % 60 == 0:
+                    gc.collect()
+                del img, out
+            enc.stdin.close()
+            dec.wait()
+            enc.wait()
+            if enc.returncode != 0:
+                raise RuntimeError("FFmpeg encode failed")
+            stats.update(frames=done, avg_spf=(sum_t / done if done else 0.0))
+        else:
+            # ---- GIF: frames collect karo, upscale, phir loop video ----
+            fps_g = fps if fps > 0 else 10.0
+            dec = subprocess.Popen(
+                ["ffmpeg", "-v", "error", "-i", str(input_path),
+                 "-vsync", "0", "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"],
+                stdout=subprocess.PIPE,
+            )
+            frame_bytes = w * h * 3
+            raw_frames = []
+            while len(raw_frames) < MAX_GIF_FRAMES:
+                raw = dec.stdout.read(frame_bytes)
+                if not raw or len(raw) != frame_bytes:
+                    break
+                raw_frames.append(np.frombuffer(raw, np.uint8).reshape(h, w, 3).copy())
+            dec.wait()
+            if not raw_frames:
+                raise RuntimeError("GIF se frames nahi mile")
+            total = len(raw_frames)
+            ups_list = []
+            sum_t = 0.0
+            for i, fr in enumerate(raw_frames, start=1):
+                if cancel.is_set():
+                    raise JobCancelled("User cancelled")
+                t0 = time.time()
+                out, _ = ups.enhance(fr, outscale=scale)
+                sum_t += time.time() - t0
+                ups_list.append(out)
+                status.request(progress_text(i, total, sum_t / i))
+                del fr, out
+            raw_frames.clear()
+            gc.collect()
+            loops = max(1, math.ceil(GIF_MIN_SEC / (total / fps_g)))
+            loops = min(loops, max(1, 600 // total))
+            enc = subprocess.Popen(
+                ["ffmpeg", "-y", "-v", "error",
+                 "-f", "rawvideo", "-pix_fmt", "bgr24",
+                 "-s", f"{ow}x{oh}", "-r", f"{fps_g:.6f}", "-i", "pipe:0",
+                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                 "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(output_path)],
+                stdin=subprocess.PIPE,
+            )
+            for _ in range(loops):
+                for fr in ups_list:
+                    enc.stdin.write(fr.tobytes())
+            enc.stdin.close()
+            enc.wait()
+            if enc.returncode != 0:
+                raise RuntimeError("FFmpeg encode failed")
+            stats.update(frames=total, avg_spf=(sum_t / total if total else 0.0), loops=loops)
+        stats["seconds"] = time.time() - t_start
+        return stats
+    finally:
+        for p in (dec, enc):
+            try:
+                if p and p.poll() is None:
+                    p.kill()
+                if p:
+                    if p.stdout:
+                        p.stdout.close()
+                    if p.stdin:
+                        p.stdin.close()
+            except Exception:
+                pass
+
+
+def reencode_smaller(path: Path, crf: int) -> Path:
+    tmp = path.with_name(path.stem + f"_c{crf}.mp4")
+    run_cmd(["ffmpeg", "-y", "-v", "error", "-i", str(path),
+             "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf),
+             "-pix_fmt", "yuv420p", "-c:a", "copy",
+             "-movflags", "+faststart", str(tmp)])
+    return tmp
+
+
+# ============================================================
+# SMART CHAT REPLIES (Hinglish + English)
+# ============================================================
+def smart_reply(text: str) -> str:
+    t = text.lower()
+    s = fmt_scale(settings["scale"])
+    if any(k in t for k in ["hi", "hello", "hey", "namaste", "hlo", "yo "]):
+        return ("🙏 Namaste boss! Main tumhara Anime Video Upscaler hoon.\n\n"
+                "🎥 Video ya GIF bhejo — main upscale kar dunga.\n"
+                f"🎯 Abhi quality: {s}× (badalne ke liye /quality)\n"
+                "⏱ Har job me live progress + per-frame time + ETA dikhta hai.")
+    if "kaise ho" in t or "how are you" in t:
+        return ("💪 Ekdam badhiya! CPU thanda, RAM khali, aur Real-ESRGAN garam hai 🔥\n"
+                "Tum batao — kaunsi video upscale karni hai aaj?")
+    if any(k in t for k in ["quality", "scale", "kitni", "resolution", "select"]):
+        return (f"🎯 Abhi quality: {s}× hai.\n\n"
+                "Badalne ke liye /quality dabao aur button se chuno:\n"
+                "1.5× / 2× / 3× / 4×\n\n"
+                "Zyada scale = zyada detail, par zyada time.")
+    if any(k in t for k in ["time", "eta", "estimate", "kitna waqt", "kitna time"]):
+        return ("⏱ Jaise hi video aati hai, frames count karke main **estimate time** bata deta hoon.\n"
+                "Phir pehle kuch frames ke baad **asli per-frame speed** se ETA live update hoti hai.\n"
+                "Progress message me har frame ka time (sec/frame) dikhta rehta hai.")
+    if "gif" in t:
+        return ("🎞 GIF support hai boss!\n\n"
+                "GIF bhejo → frames upscale hongi → phir **seamless loop video (≥2 sec)** banegi.\n"
+                "Ye loop-wala rule sirf GIF par lagta hai, normal videos par nahi.")
+    if "audio" in t or "sound" in t:
+        return "🎧 Audio bilkul preserved rehta hai — original audio copy hoti hai, re-encode nahi."
+    if "model" in t or "kaunsa" in t:
+        return ("🧠 Model: **Real-ESRGAN AnimeVideo-v3** (anime ke liye best).\n"
+                "CPU par optimized: adaptive tiling + single-pass pipe encoding.")
+    if any(k in t for k in ["status", "progress", "kitna hua", "chal raha"]):
+        return job_state["text"]
+    if any(k in t for k in ["thank", "shukriya", "dhanyavad", "thx"]):
+        return "😊 Arre boss, apna kaam hai! Aur video/GIF bhejte raho, upscale karta rahunga."
+    if any(k in t for k in ["bye", "alvida", "good night", "gn"]):
+        return "👋 Bye boss! Main yahin rahunga — jab bhi video bhejni ho, bhej dena."
+    if any(k in t for k in ["help", "madad", "kya kar sakte", "command"]):
+        return ("📚 Commands:\n"
+                "/quality — upscale scale chuno\n"
+                "/status — live job status\n"
+                "/settings — bot settings\n"
+                "/cancel — chal rahi job roko\n\n"
+                "Bas video/GIF bhejo, baaki main sambhal lunga 😎")
+    if any(k in t for k in ["love", "pyar", "jaan"]):
+        return "😄 Pyar milta rahe boss! Badle me main 4K tak upscale kar deta hoon ❤️"
+    # default smart answer
+    variants = [
+        (f"🤖 Haan boss, sun raha hoon! Main upscale bot hoon — baatein kam, kaam zyada 😄\n\n"
+         f"🎯 Current quality: {s}×\n"
+         "🎥 Video ya GIF bhejo → estimate + live progress + per-frame time sab chat me milega.\n"
+         "🎛 Quality badalni ho to /quality."),
+        (f"📝 Note kar liya! Waise main sirf ek kaam me expert hoon: **anime upscale** 🔥\n"
+         f"Abhi setting: {s}× | Model: AnimeVideo-v3\n"
+         "Video/GIF bhejo ya /quality se scale chuno."),
+        ("🧐 Interesting! Par boss, meri specialty hai video upscaling.\n"
+         "🎥 Media bhejo → main frames, estimate time, per-frame speed sab dikhata hoon.\n"
+         "/help se poori list dekh lo."),
+    ]
+    return variants[len(text) % len(variants)]
 
 
 # ============================================================
 # TELEGRAM CLIENT
 # ============================================================
-
 app = Client(
     "telegram_anime_upscaler",
     api_id=API_ID,
@@ -67,617 +448,291 @@ app = Client(
     bot_token=BOT_TOKEN,
     workdir=".",
 )
+busy_lock = asyncio.Lock()
+
+
+def owner_only(message: Message) -> bool:
+    return str(message.chat.id) == OWNER_CHAT_ID
+
+
+def quality_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    for sc in SCALE_OPTIONS:
+        mark = "✅ " if abs(settings["scale"] - sc) < 0.01 else ""
+        rows.append([InlineKeyboardButton(
+            f"{mark}{fmt_scale(sc)}×", callback_data=f"scale:{sc}")])
+    return InlineKeyboardMarkup(rows)
 
 
 # ============================================================
-# REAL-ESRGAN
+# COMMANDS
 # ============================================================
-
-def load_upsampler():
-    if not MODEL_PATH.exists():
-        raise FileNotFoundError(
-            f"Real-ESRGAN model not found: {MODEL_PATH}"
-        )
-
-    log.info("Loading Real-ESRGAN AnimeVideo-v3 on CPU...")
-
-    model = SRVGGNetCompact(
-        num_in_ch=3,
-        num_out_ch=3,
-        num_feat=64,
-        num_conv=16,
-        upscale=4,
-        act_type="prelu",
-    )
-
-    upsampler = RealESRGANer(
-        scale=4,
-        model_path=str(MODEL_PATH),
-        model=model,
-        tile=TILE,
-        tile_pad=10,
-        pre_pad=0,
-        half=False,
-        device=torch.device("cpu"),
-    )
-
-    log.info("Real-ESRGAN model loaded.")
-    return upsampler
-
-
-upsampler = load_upsampler()
-
-
-# ============================================================
-# SHELL / FFMPEG HELPERS
-# ============================================================
-
-def run_cmd(cmd):
-    result = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-
-    if result.returncode != 0:
-        raise RuntimeError(
-            "Command failed:\n"
-            + " ".join(map(str, cmd))
-            + "\n\n"
-            + result.stderr[-4000:]
-        )
-
-    return result.stdout
-
-
-def ffprobe_json(path: Path):
-    output = run_cmd([
-        "ffprobe",
-        "-v", "error",
-        "-show_streams",
-        "-show_format",
-        "-of", "json",
-        str(path),
-    ])
-    return json.loads(output)
-
-
-def get_video_info(path: Path):
-    data = ffprobe_json(path)
-
-    video_stream = next(
-        (s for s in data.get("streams", []) if s.get("codec_type") == "video"),
-        None,
-    )
-
-    if not video_stream:
-        raise RuntimeError("No video stream found.")
-
-    audio_stream = next(
-        (s for s in data.get("streams", []) if s.get("codec_type") == "audio"),
-        None,
-    )
-
-    width = int(video_stream["width"])
-    height = int(video_stream["height"])
-
-    fps_text = (
-        video_stream.get("avg_frame_rate")
-        or video_stream.get("r_frame_rate")
-        or "30/1"
-    )
-
-    try:
-        num, den = fps_text.split("/")
-        fps = float(num) / float(den) if float(den) else 30.0
-    except Exception:
-        fps = 30.0
-
-    duration = float(
-        video_stream.get("duration")
-        or data.get("format", {}).get("duration")
-        or 0
-    )
-
-    try:
-        frames = int(video_stream.get("nb_frames") or 0)
-    except Exception:
-        frames = 0
-
-    if frames <= 0:
-        frames = max(1, round(duration * fps))
-
-    return {
-        "width": width,
-        "height": height,
-        "fps": fps,
-        "duration": duration,
-        "frames": frames,
-        "has_audio": audio_stream is not None,
-        "video_codec": video_stream.get("codec_name", "unknown"),
-    }
-
-
-def safe_name(name: str):
-    return Path(name).name
-
-
-def make_workdir():
-    WORK_ROOT.mkdir(parents=True, exist_ok=True)
-    path = WORK_ROOT / f"{int(time.time() * 1000)}"
-    path.mkdir(parents=True, exist_ok=False)
-    return path
-
-
-# ============================================================
-# VIDEO PROCESSING
-# ============================================================
-
-def extract_frames(input_video: Path, frames_dir: Path):
-    frames_dir.mkdir(parents=True, exist_ok=True)
-
-    run_cmd([
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel", "error",
-        "-i", str(input_video),
-        "-vsync", "0",
-        str(frames_dir / "frame_%08d.png"),
-    ])
-
-
-def upscale_frames(
-    frames_dir: Path,
-    output_frames_dir: Path,
-    progress_callback,
-):
-    output_frames_dir.mkdir(parents=True, exist_ok=True)
-
-    frame_paths = sorted(frames_dir.glob("frame_*.png"))
-
-    if not frame_paths:
-        raise RuntimeError("FFmpeg extracted 0 frames.")
-
-    total = len(frame_paths)
-
-    log.info("Upscaling %d frames at %dx...", total, SCALE)
-
-    for index, frame_path in enumerate(frame_paths, start=1):
-        img = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
-
-        if img is None:
-            raise RuntimeError(f"Could not read frame: {frame_path}")
-
-        try:
-            output, _ = upsampler.enhance(
-                img,
-                outscale=SCALE,
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                f"Real-ESRGAN failed on frame {index}/{total}: {exc}"
-            ) from exc
-
-        output_path = output_frames_dir / frame_path.name
-
-        if not cv2.imwrite(str(output_path), output):
-            raise RuntimeError(
-                f"Could not write frame: {output_path}"
-            )
-
-        if progress_callback:
-            progress_callback(index, total)
-
-
-def encode_video(
-    upscaled_frames_dir: Path,
-    output_video: Path,
-    fps: float,
-):
-    run_cmd([
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel", "error",
-        "-framerate", f"{fps:.12g}",
-        "-i", str(upscaled_frames_dir / "frame_%08d.png"),
-        "-c:v", "libx264",
-        "-preset", "slow",
-        "-crf", "16",
-        "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart",
-        str(output_video),
-    ])
-
-
-def merge_original_audio(
-    upscaled_video: Path,
-    original_video: Path,
-    final_output: Path,
-):
-    run_cmd([
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel", "error",
-        "-i", str(upscaled_video),
-        "-i", str(original_video),
-        "-map", "0:v:0",
-        "-map", "1:a?",
-        "-c:v", "copy",
-        "-c:a", "copy",
-        "-shortest",
-        "-movflags", "+faststart",
-        str(final_output),
-    ])
-
-
-def process_video(
-    input_video: Path,
-    workdir: Path,
-    progress_callback,
-):
-    info = get_video_info(input_video)
-
-    log.info(
-        "Input: %dx%d | %.3f FPS | %.2fs | audio=%s | codec=%s",
-        info["width"],
-        info["height"],
-        info["fps"],
-        info["duration"],
-        info["has_audio"],
-        info["video_codec"],
-    )
-
-    frames_dir = workdir / "frames"
-    upscaled_frames_dir = workdir / "upscaled_frames"
-    silent_output = workdir / "upscaled_silent.mp4"
-    final_output = workdir / "final_output.mp4"
-
-    extract_frames(input_video, frames_dir)
-
-    upscale_frames(
-        frames_dir,
-        upscaled_frames_dir,
-        progress_callback,
-    )
-
-    encode_video(
-        upscaled_frames_dir,
-        silent_output,
-        info["fps"],
-    )
-
-    merge_original_audio(
-        silent_output,
-        input_video,
-        final_output,
-    )
-
-    if not final_output.exists() or final_output.stat().st_size == 0:
-        raise RuntimeError("Final output video was not created.")
-
-    return final_output, info
-
-
-# ============================================================
-# TELEGRAM HELPERS
-# ============================================================
-
-async def safe_reply(message: Message, text: str):
-    try:
-        return await message.reply_text(text)
-    except Exception as exc:
-        log.warning(
-            "Could not reply to chat %s: %s",
-            message.chat.id,
-            exc,
-        )
-        return None
-
-
-# ============================================================
-# /START
-# IMPORTANT:
-# This handler is intentionally NOT owner-restricted.
-# It lets us diagnose a wrong OWNER_CHAT_ID instead of silently
-# ignoring /start.
-# ============================================================
-
-@app.on_message(filters.private & filters.command("start"))
-async def start_handler(client: Client, message: Message):
-    chat_id = str(message.chat.id)
-    username = getattr(message.from_user, "username", None)
-
-    log.info(
-        "Received /start from chat_id=%s username=%s",
-        chat_id,
-        username,
-    )
-
-    matches = chat_id == OWNER_CHAT_ID
-
-    await safe_reply(
-        message,
-        "✅ Anime Video Upscaler is online!\n\n"
-        f"🆔 Your Chat ID: `{chat_id}`\n"
-        f"🔐 OWNER_CHAT_ID match: "
-        f"{'YES ✅' if matches else 'NO ❌'}\n\n"
-        "Send a video to upscale it 2×."
-    )
-
-    if matches:
-        try:
-            await client.send_message(
-                message.chat.id,
-                "🟢 GitHub Action connected successfully.\n"
-                "Waiting for your video..."
-            )
-        except Exception as exc:
-            log.warning(
-                "Post-/start status failed for chat %s: %s",
-                chat_id,
-                exc,
-            )
-
-
-# ============================================================
-# /ID
-# Gives the exact Telegram chat ID for OWNER_CHAT_ID.
-# ============================================================
-
-@app.on_message(filters.private & filters.command("id"))
-async def id_handler(client: Client, message: Message):
-    chat_id = str(message.chat.id)
-
-    await safe_reply(
-        message,
-        "🆔 Your Telegram Chat ID is:\n"
-        f"`{chat_id}`\n\n"
-        "Put this exact number in GitHub Secret:\n"
-        "`OWNER_CHAT_ID`"
-    )
-
-    log.info("Chat ID requested: %s", chat_id)
-
-
-# ============================================================
-# TEXT HANDLER
-# ============================================================
-
-@app.on_message(
-    filters.private
-    & filters.text
-    & ~filters.command(["start", "id"])
-)
-async def text_handler(client: Client, message: Message):
-    chat_id = str(message.chat.id)
-
-    if chat_id != OWNER_CHAT_ID:
-        await safe_reply(
-            message,
-            "❌ This bot is restricted to its configured owner."
-        )
-        log.warning(
-            "Unauthorized text message from chat_id=%s",
-            chat_id,
-        )
+@app.on_message(filters.command("start") & filters.private)
+async def start_handler(_, message: Message):
+    if not owner_only(message):
+        await message.reply_text("❌ This bot is private.")
         return
-
-    await safe_reply(
-        message,
-        "👋 Bot is running.\n\n"
-        "Send a video file and I will upscale it 2×."
+    await message.reply_text(
+        "🎬 **Anime Video Upscaler Bot**\n\n"
+        "Real-ESRGAN AnimeVideo-v3 se video/GIF upscale — GitHub CPU server par,\n"
+        "memory/CPU safe tarike se, minimum time me.\n\n"
+        "📛 Commands:\n"
+        "/quality — upscale quality select karo\n"
+        "/status — live job status\n"
+        "/settings — bot settings\n"
+        "/cancel — job roko\n"
+        "/help — sab kuch samjho\n\n"
+        "🎥 Video ya GIF bhejo:\n"
+        "• Frames detect hote hi **estimate time**\n"
+        "• Live **per-frame time + ETA + progress**\n"
+        "• Audio preserved | GIF → loop video (≥2s)\n\n"
+        f"🎯 Current quality: {fmt_scale(settings['scale'])}×",
+        reply_markup=quality_keyboard(),
     )
 
 
-# ============================================================
-# VIDEO / DOCUMENT HANDLER
-# ============================================================
-
-@app.on_message(
-    filters.private & (filters.video | filters.document)
-)
-async def video_handler(client: Client, message: Message):
-    chat_id = str(message.chat.id)
-
-    if chat_id != OWNER_CHAT_ID:
-        await safe_reply(
-            message,
-            "❌ Unauthorized chat.\n"
-            "Send `/id` to see your Chat ID."
-        )
-        log.warning(
-            "Unauthorized video attempt from chat_id=%s",
-            chat_id,
-        )
+@app.on_message(filters.command("help") & filters.private)
+async def help_handler(_, message: Message):
+    if not owner_only(message):
+        await message.reply_text("❌ This bot is private.")
         return
+    await message.reply_text(smart_reply("help"))
 
-    if message.video:
-        file_name = message.video.file_name or "video.mp4"
+
+@app.on_message(filters.command("quality") & filters.private)
+async def quality_handler(_, message: Message):
+    if not owner_only(message):
+        await message.reply_text("❌ This bot is private.")
+        return
+    await message.reply_text(
+        "🎛 Upscale quality chuno:\n"
+        f"(abhi: {fmt_scale(settings['scale'])}×)\n\n"
+        "Zyada scale = zyada detail + zyada time.",
+        reply_markup=quality_keyboard(),
+    )
+
+
+@app.on_callback_query(filters.create(lambda _, __, cq: cq.data.startswith("scale:")))
+async def scale_callback(_, cq):
+    if str(cq.message.chat.id) != OWNER_CHAT_ID:
+        await cq.answer("Private bot!", show_alert=True)
+        return
+    val = float(cq.data.split(":", 1)[1])
+    settings["scale"] = val
+    await cq.answer(f"Quality: {fmt_scale(val)}×")
+    try:
+        await cq.message.edit_text(
+            f"✅ Quality set: **{fmt_scale(val)}×**\n\n"
+            "Ab jo video/GIF bhejoge wo isi scale par upscale hogi.",
+            reply_markup=quality_keyboard(),
+        )
+    except Exception:
+        pass
+
+
+@app.on_message(filters.command("status") & filters.private)
+async def status_handler(_, message: Message):
+    if not owner_only(message):
+        await message.reply_text("❌ This bot is private.")
+        return
+    await message.reply_text(job_state["text"])
+
+
+@app.on_message(filters.command("settings") & filters.private)
+async def settings_handler(_, message: Message):
+    if not owner_only(message):
+        await message.reply_text("❌ This bot is private.")
+        return
+    await message.reply_text(
+        "⚙️ Bot settings:\n\n"
+        f"🎯 Scale: {fmt_scale(settings['scale'])}×\n"
+        f"🧠 Model: Real-ESRGAN AnimeVideo-v3 (CPU)\n"
+        f"🧵 Threads: {CPU_THREADS}\n"
+        f"🎞 Max frames: {MAX_FRAMES} (GIF: {MAX_GIF_FRAMES})\n"
+        f"🖼 Max output: 4K (auto-cap)\n"
+        f"🔁 GIF loop video: ≥{GIF_MIN_SEC:g}s\n"
+        "💾 Pipeline: zero temp files (pipe decode→upscale→encode)"
+    )
+
+
+@app.on_message(filters.command("cancel") & filters.private)
+async def cancel_handler(_, message: Message):
+    if not owner_only(message):
+        await message.reply_text("❌ This bot is private.")
+        return
+    if job_state["active"] and cancel_event is not None:
+        cancel_event.set()
+        await message.reply_text("🛑 Cancel request bhej di — current frame ke baad ruk jayega.")
     else:
-        file_name = message.document.file_name or "video"
-        extension = Path(file_name).suffix.lower()
+        await message.reply_text("😴 Abhi koi job chal nahi rahi.")
 
-        if extension not in SUPPORTED_EXTENSIONS:
-            await safe_reply(
-                message,
-                "❌ Unsupported file type.\n"
-                "Please send MP4/MKV/MOV/WEBM/AVI/M4V."
-            )
+
+# ============================================================
+# SMART TEXT REPLIES
+# ============================================================
+@app.on_message(filters.text & filters.private & ~filters.command(
+    ["start", "help", "quality", "status", "settings", "cancel"]))
+async def text_handler(_, message: Message):
+    if not owner_only(message):
+        await message.reply_text("❌ This bot is private.")
+        return
+    txt = message.text or ""
+    if txt.startswith("/"):
+        await message.reply_text("🤔 Aisa koi command nahi hai boss. /help dekh lo.")
+        return
+    await message.reply_text(smart_reply(txt))
+
+
+# ============================================================
+# VIDEO / GIF HANDLER
+# ============================================================
+@app.on_message((filters.video | filters.document | filters.animation) & filters.private)
+async def video_handler(_, message: Message):
+    global cancel_event
+    if not owner_only(message):
+        await message.reply_text("❌ This bot is private.")
+        return
+    async with busy_lock:
+        if job_state["active"]:
+            await message.reply_text("⏳ Ek video already process ho raha hai, thoda wait karo.")
             return
-
-    file_name = safe_name(file_name)
-
-    if not Path(file_name).suffix:
-        file_name += ".mp4"
-
-    workdir = make_workdir()
-    input_path = workdir / file_name
-
-    await safe_reply(
-        message,
-        "📥 Video received.\n"
-        "Downloading..."
-    )
-
+        job_state["active"] = True
+        cancel_event = asyncio.Event()
+    job_dir = None
     try:
-        log.info(
-            "Downloading video: chat=%s file=%s",
-            chat_id,
-            file_name,
-        )
-
-        await message.download(file_name=str(input_path))
-
-        if not input_path.exists():
-            raise RuntimeError(
-                "Telegram download did not create the input file."
-            )
-
-        size_mb = input_path.stat().st_size / (1024 * 1024)
-
-        await safe_reply(
-            message,
-            f"✅ Download complete: {size_mb:.1f} MB\n"
-            "🔍 Reading video information..."
-        )
-
+        media = message.video or message.document or message.animation
+        mime = getattr(media, "mime_type", "") or ""
+        filename = media.file_name or f"video_{message.id}.mp4"
+        is_gif = filename.lower().endswith(".gif") or mime == "image/gif"
+        allowed = (".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".gif")
+        if not filename.lower().endswith(allowed):
+            await message.reply_text(
+                "❌ Video ya GIF file bhejo.\n\nSupported:\nMP4 / MKV / MOV / WEBM / AVI / M4V / GIF")
+            return
+        status_msg = await message.reply_text("📥 Video received.\nDownloading...")
         loop = asyncio.get_running_loop()
+        status = LiveStatus(status_msg, loop)
 
-        progress_state = {
-            "last_time": 0.0,
-            "last_percent": -1,
-        }
+        job_name = f"job_{message.id}_{int(time.time())}"
+        job_dir = WORK_DIR / job_name
+        job_dir.mkdir(parents=True, exist_ok=True)
+        input_path = job_dir / filename
+        await app.download_media(message, file_name=str(input_path))
 
-        async def send_progress(index: int, total: int):
-            percent = int(index * 100 / total)
-            now = time.monotonic()
+        info = await asyncio.to_thread(get_video_info, input_path)
+        scale = settings["scale"]
+        ow, oh, scale, capped = compute_out(info["width"], info["height"], scale)
+        total = info["frames"] or max(0, round(info["duration"] * info["fps"]))
+        if not is_gif and total > MAX_FRAMES:
+            await status.edit(
+                f"❌ Video bahut lambi hai: ~{total} frames.\n"
+                f"Server safety limit: {MAX_FRAMES} frames.\n\n"
+                "Chhoti video bhejo ya duration kam karo.")
+            return
+        est = (total or 1) * est_sec_per_frame(ow * oh)
+        cap_note = "\n⚠️ Server safety ke liye scale auto-cap hua." if capped else ""
+        await status.edit(
+            "🔍 Video detect hua\n\n"
+            f"📐 {info['width']}×{info['height']}\n"
+            f"🎞 FPS: {info['fps']:.3f}\n"
+            f"⏱ Duration: {info['duration']:.2f}s\n"
+            f"🖼 Total frames: {total if total else 'counting...'}\n"
+            f"🎧 Audio: {'Yes' if info['has_audio'] else 'No'}\n"
+            f"🎬 Codec: {info['codec']}\n"
+            f"{'🎞 GIF mode: loop video (≥2s) banega' if is_gif else ''}\n\n"
+            f"🎯 Quality: {fmt_scale(scale)}× → output {ow}×{oh}\n"
+            f"⏳ Estimated time: ~{fmt_time(est)} (±30%){cap_note}\n\n"
+            "✨ Processing shuru... pehle frames ke baad asli speed + ETA dikhegi.")
 
-            # Telegram message throttling.
-            # Always allow 100%.
-            if (
-                percent != 100
-                and percent == progress_state["last_percent"]
-            ):
-                return
-
-            if (
-                percent != 100
-                and now - progress_state["last_time"] < 5
-            ):
-                return
-
-            progress_state["last_time"] = now
-            progress_state["last_percent"] = percent
-
-            await safe_reply(
-                message,
-                f"⚙️ Upscaling: {percent}% "
-                f"({index}/{total} frames)\n"
-                "🤖 Real-ESRGAN AnimeVideo-v3\n"
-                f"📈 Scale: {SCALE}×"
-            )
-
-        def progress_sync(index: int, total: int):
-            loop.call_soon_threadsafe(
-                lambda: asyncio.create_task(
-                    send_progress(index, total)
-                )
-            )
-
-        await safe_reply(
-            message,
-            "🚀 Starting Real-ESRGAN AnimeVideo-v3...\n"
-            "CPU processing can take a while.\n"
-            "Keep the GitHub Action running."
+        output_name = f"{safe_stem(filename)}_upscaled.mp4"
+        output_path = OUTPUT_DIR / output_name
+        stats = await asyncio.to_thread(
+            run_pipeline, input_path, output_path, info,
+            scale, status, cancel_event, is_gif,
         )
+        await status.edit(
+            "🎞 Frames finished!\n\n"
+            " Encoding + audio restore ho raha hai...")
+        if not output_path.exists():
+            raise RuntimeError("Output file nahi bani.")
 
-        final_output, info = await asyncio.to_thread(
-            process_video,
-            input_path,
-            workdir,
-            progress_sync,
-        )
-
-        await safe_reply(
-            message,
-            "🎬 Upscaling finished.\n"
-            "🔊 Restoring original audio..."
-        )
+        # ---- size guard (bot 50MB limit) ----
+        size_mb = output_path.stat().st_size / (1024 * 1024)
+        for crf in (23, 27):
+            if size_mb <= 48:
+                break
+            await status.edit(f"📦 Size {size_mb:.1f}MB zyada hai — compress kar raha hoon (crf {crf})...")
+            new_path = await asyncio.to_thread(reencode_smaller, output_path, crf)
+            output_path.unlink(missing_ok=True)
+            new_path = new_path.rename(output_path)
+            size_mb = output_path.stat().st_size / (1024 * 1024)
 
         caption = (
-            "✅ Upscaling complete!\n\n"
-            f"📐 {info['width']}×{info['height']} → "
-            f"{info['width'] * SCALE}×{info['height'] * SCALE}\n"
-            f"🎞 FPS: {info['fps']:.3f}\n"
-            f"🔊 Original audio: "
-            f"{'kept' if info['has_audio'] else 'none'}\n"
-            f"🤖 Real-ESRGAN AnimeVideo-v3 • {SCALE}×"
+            "✅ Upscale complete!\n\n"
+            "🧠 Model: Real-ESRGAN AnimeVideo-v3\n"
+            f"🎯 Scale: {fmt_scale(stats['scale'])}× → {stats['out_w']}×{stats['out_h']}\n"
+            f"🎞 Frames: {stats['frames']}"
+            + (f" (loop ×{stats['loops']})" if is_gif else "") + "\n"
+            f"⚡ Avg per-frame: {stats['avg_spf']:.2f}s\n"
+            f"🕒 Total time: {fmt_time(stats['seconds'])}\n"
+            f"📦 Size: {size_mb:.1f} MB\n"
+            f"🎧 Audio: {'preserved' if info['has_audio'] and not is_gif else ('n/a (gif)' if is_gif else 'none')}"
         )
-
-        log.info(
-            "Sending final video: %s",
-            final_output,
-        )
-
-        await message.reply_video(
-            video=str(final_output),
-            caption=caption,
-            supports_streaming=True,
-        )
-
-        log.info("Video sent successfully.")
-
+        await status.edit(f"📤 Upload ho raha hai... ({size_mb:.1f} MB)")
+        if is_gif:
+            await app.send_animation(
+                chat_id=message.chat.id, animation=str(output_path), caption=caption)
+        else:
+            await app.send_video(
+                chat_id=message.chat.id, video=str(output_path),
+                caption=caption, supports_streaming=True)
+        await status.edit("✅ Done!\n\nUpscaled result Telegram par bhej diya. 🎉")
+    except JobCancelled:
+        try:
+            await message.reply_text("🛑 Job cancel kar di gayi.")
+        except Exception:
+            pass
     except Exception as exc:
-        log.exception("Video processing failed")
-
-        await safe_reply(
-            message,
-            "❌ Processing failed.\n\n"
-            f"`{type(exc).__name__}: {exc}`\n\n"
-            "Check the GitHub Actions log for the full traceback."
-        )
-
+        log.exception("Upscaling failed")
+        try:
+            await message.reply_text(f"❌ Upscaling failed:\n\n{type(exc).__name__}: {exc}")
+        except Exception:
+            pass
     finally:
-        shutil.rmtree(workdir, ignore_errors=True)
-        log.info("Cleaned workdir: %s", workdir)
+        if job_dir:
+            import shutil
+            shutil.rmtree(job_dir, ignore_errors=True)
+        for f in OUTPUT_DIR.glob("*.mp4"):
+            try:
+                f.unlink()
+            except Exception:
+                pass
+        job_state["active"] = False
+        job_state["text"] = "😴 Idle — koi job nahi."
+        cancel_event = None
 
 
 # ============================================================
-# MAIN
+# START
 # ============================================================
-
 async def main():
-    log.info("Starting Telegram Anime Video Upscaler...")
-
     await app.start()
-
-    me = await app.get_me()
-
-    log.info(
-        "Telegram bot connected: @%s (id=%s)",
-        me.username,
-        me.id,
-    )
-
-    log.info(
-        "Configured OWNER_CHAT_ID=%s",
-        OWNER_CHAT_ID,
-    )
-
-    log.info(
-        "Bot started. Waiting for videos..."
-    )
-
-    # DO NOT send a startup message to OWNER_CHAT_ID here.
-    # If the user has not opened /started the bot, Telegram can return
-    # PEER_ID_INVALID. The /start handler sends the status after the
-    # Telegram peer is known.
+    log.info("Bot started. Waiting for videos...")
+    try:
+        await app.send_message(
+            OWNER_CHAT_ID,
+            "✅ Anime Video Upscaler GitHub Action running!\n\n"
+            "🎥 Video/GIF bhejo\n"
+            "/quality se scale chuno\n"
+            "⏱ Estimate + live per-frame time + ETA\n"
+            "🎞 GIF → loop video (≥2s)\n\n"
+            f"🎯 Default quality: {fmt_scale(settings['scale'])}×",
+            reply_markup=quality_keyboard(),
+        )
+    except Exception as exc:
+        log.warning("Startup message failed: %s", exc)
     await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        log.info("Bot stopped by user.")
+    asyncio.run(main())
