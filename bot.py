@@ -23,7 +23,7 @@ import cv2
 import numpy as np
 import requests
 import torch
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import (
     Message,
     InlineKeyboardMarkup,
@@ -782,12 +782,12 @@ def notify_owner_startup():
 # MAIN
 # ============================================================
 async def main():
-    # 🔥 Webhook force-delete (updates hamesha isi session ko milenge)
+    # 🔥 Webhook aur purane jammed messages force-delete karo
     try:
-        log.info("🧹 Purana webhook delete kar raha hoon...")
+        log.info("🧹 Purana webhook aur jammed updates delete kar raha hoon...")
         res = requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook",
-            json={"drop_pending_updates": False},
+            json={"drop_pending_updates": True},
             timeout=15,
         )
         log.info("Webhook status: %s", res.text[:200])
@@ -797,13 +797,13 @@ async def main():
     await app.start()
     me = await app.get_me()
     log.info("LOGGED IN AS: @%s (id=%s)", me.username, me.id)
-    log.info("OWNER_CHAT_ID configured: %r (numeric=%s)",
-             OWNER_CHAT_ID, OWNER_CHAT_ID.lstrip("-").isdigit())
     log.info("Bot started. Waiting for videos...")
 
     notify_owner_startup()
 
-    await asyncio.Event().wait()
+    # Pyrogram ka official loop yahan chalega
+    await idle()
+    await app.stop()
 
 
 if __name__ == "__main__":
