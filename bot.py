@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-Smart Anime/Game Upscaler v9
-- Secrets EXACTLY waise hi (koi change nahi) — sirf self-healing add hua
-- 🔁 Session watchdog: updates rukhe to khud reconnect
-- 📚 Archive auto-retry + forward-se-channel-set
-- 🧠 Governor v2 + 💾 RAM-minimal pipeline + 🎌/🎮 models + 🖼 photo + ️ preview
+Smart Anime/Game Upscaler v8
+- 🧠 Governor v2: CPU-load + RAM EMA se khud upgrade/downgrade decisions
+- 💾 RAM-minimal streaming (decode q=2, backlog=2, frame encode hote hi free)
+- 🎌 Anime / 🎮 Game Fast / 🎮 Game HQ models
+- 🖼 Photo upscale + ⬅️➡️ Before/After preview
+- 📤 Upload auto-retry (3 attempts, FloodWait-safe)
+- ⏰ Job watchdog + 💓 heartbeat +  archive self-test + /stats
+- 📚 Channel archive (settings/history/videos) + panel UI
+- v8 fixes: idle crash, channel-id normalize, forward-ID, unbuffered logs
 """
 import asyncio
 import gc
@@ -23,7 +27,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 try:
-    sys.stdout.reconfigure(line_buffering=True)
+    sys.stdout.reconfigure(line_buffering=True)   # Actions me logs turant dikhein
 except Exception:
     pass
 
@@ -46,14 +50,24 @@ try:
 except Exception:
     ChannelArchive = None
 
-# ================= CONFIG (secrets untouched) =================
+# ================= CONFIG =================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("anime-upscaler")
 
 API_ID = int(os.getenv("API_ID", "0") or 0)
 API_HASH = (os.getenv("API_HASH", "") or "").strip()
 BOT_TOKEN = (os.getenv("BOT_TOKEN", "") or "").strip()
-OWNER_CHAT_ID = (os.getenv("OWNER_CHAT_ID", "") or "").strip()
+
+# Bulletproof Owner ID check (Handles both String & Integer securely)
+_raw_owner = (os.getenv("OWNER_CHAT_ID", "") or "").strip().strip("'").strip('"')
+OWNER_CHAT_ID = _raw_owner
+try:
+    OWNER_CHAT_ID_INT = int(_raw_owner)
+except ValueError:
+    OWNER_CHAT_ID_INT = 0
+
+def is_owner(chat_id) -> bool:
+    return chat_id == OWNER_CHAT_ID_INT or str(chat_id) == OWNER_CHAT_ID
 
 if not API_ID or not API_HASH or not BOT_TOKEN or not OWNER_CHAT_ID:
     raise RuntimeError("Missing GitHub Secrets: API_ID, API_HASH, BOT_TOKEN, OWNER_CHAT_ID")
@@ -87,7 +101,6 @@ settings = {"scale": 2.0, "preset": "balanced", "audio": "keep", "model": "anime
 job_state = {"active": False}
 current_job: Optional[Dict[str, Any]] = None
 cancel_event: Optional[threading.Event] = None
-LAST_UPDATE = {"ts": time.time()}
 
 # ================= SYSTEM =================
 def mem_avail_gb() -> float:
@@ -115,13 +128,6 @@ def fmt_scale(s: float) -> str: return f"{s:g}"
 def bar(pct: float, n: int = 8) -> str:
     f = int(n * min(100, max(0, pct)) / 100)
     return "▰" * f + "▱" * (n - f)
-
-def owner_ok(m) -> bool:
-    cid = getattr(getattr(m, "chat", None), "id", None)
-    ok = str(cid) == OWNER_CHAT_ID
-    if not ok:
-        log.warning("🚫 OWNER MISMATCH | aaya=%s | expected=%s", cid, OWNER_CHAT_ID)
-    return ok
 
 # ================= GOVERNOR v2 =================
 CONFIGS = [(1, 4), (2, 2), (2, 3), (3, 1), (4, 1)]
@@ -292,7 +298,7 @@ def a_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔙 Panel", callback_data="b:back")]])
 
 def panel_text() -> str:
-    lines = [f"🎛 **Upscaler v9** • 🧠 {CPU_THREADS} cores • 🛡 {mem_avail_gb():.1f}GB free • load {load1():.1f}",
+    lines = [f"🎛 **Upscaler v8** • 🧠 {CPU_THREADS} cores • 🛡 {mem_avail_gb():.1f}GB free • load {load1():.1f}",
              f"Model: {MODELS[settings['model']]['label']} • {fmt_scale(settings['scale'])}× • "
              f"{settings['preset'].title()} • 🔊 {settings['audio'].title()}", ""]
     if job_state.get("active") and current_job:
@@ -322,46 +328,10 @@ async def refresh_panel():
     except Exception:
         pass
 
-# ================= DEBUG + WATCHDOG (self-healing) =================
-@app.on_message(filters.all, group=-2)
-async def debug_incoming(client, message):
-    LAST_UPDATE["ts"] = time.time()
-    log.info("📥 INCOMING | chat=%s | text=%r", message.chat.id, (message.text or "")[:60])
-
-async def _session_watchdog():
-    """Updates ruk gaye ho to session khud reconnect karo (ghost-session fix)."""
-    while True:
-        await asyncio.sleep(90)
-        if job_state.get("active"):
-            LAST_UPDATE["ts"] = time.time()
-            continue
-        gap = time.time() - LAST_UPDATE["ts"]
-        if gap > 240:
-            log.warning("🔁 %d sec se koi update nahi — session reconnect...", int(gap))
-            try:
-                await app.stop()
-                await asyncio.sleep(3)
-                await app.start()
-                LAST_UPDATE["ts"] = time.time()
-                log.info("🔁 Reconnect OK — updates dobara listen ho rahi hain")
-            except Exception as e:
-                log.error("🔁 Reconnect fail: %s", e)
-
-async def _archive_retry_loop():
-    for i in range(1, 11):
-        await asyncio.sleep(60)
-        if archive is None or archive.channel_id:
-            return
-        log.info("📚 Archive retry #%d ...", i)
-        await archive.load()
-    if archive and not archive.channel_id:
-        log.error("❌ Archive 10 retries ke baad bhi fail — channel ki post bot ko forward karo")
-
-# ================= CALLBACKS =================
 @app.on_callback_query(filters.regex(r"^b:"))
 async def btn(client, cq):
     global _panel
-    if not owner_ok(cq.message):
+    if not is_owner(cq.message.chat.id):
         await cq.answer("Private bot!", show_alert=True); return
     parts = cq.data[2:].split(":"); a = parts[0]; v = parts[1] if len(parts) > 1 else ""
     kb = panel_kb()
@@ -618,7 +588,8 @@ async def _refresh_loop():
 @app.on_message((filters.video | filters.document | filters.animation) & filters.private)
 async def media_handler(client, message: Message):
     global cancel_event, current_job
-    if not owner_ok(message): return
+    if not is_owner(message.chat.id):
+        await message.reply_text("❌ Private bot."); return
     async with busy_lock:
         if job_state.get("active"):
             await message.reply_text("⏳ Ek job chal rahi hai."); return
@@ -694,8 +665,6 @@ async def media_handler(client, message: Message):
                 message.chat.id, str(out_path), caption=cap,
                 supports_streaming=True, progress=ul_cb), "video")
         if archive:
-            if not archive.channel_id:
-                await archive.load()
             await archive.archive_video(out_path, f"{filename} | {MODELS[model_key]['label']} | "
                                                   f"{fmt_scale(scale)}× | {fmt_time(time.time() - t0)}")
             archive.record_job(filename, scale, time.time() - t0, True,
@@ -723,7 +692,8 @@ async def media_handler(client, message: Message):
 # ================= PHOTO =================
 @app.on_message(filters.photo & filters.private)
 async def photo_handler(client, message: Message):
-    if not owner_ok(message): return
+    if not is_owner(message.chat.id):
+        await message.reply_text("❌ Private bot."); return
     async with busy_lock:
         if job_state.get("active"):
             await message.reply_text("⏳ Job chal rahi hai, photo baad me bhejo."); return
@@ -759,7 +729,7 @@ async def photo_handler(client, message: Message):
 # ================= COMMANDS / TEXT =================
 @app.on_message(filters.command("stats") & filters.private)
 async def stats_cmd(client, message: Message):
-    if not owner_ok(message): return
+    if not is_owner(message.chat.id): return
     if not archive:
         await message.reply_text("ℹ️ Archive channel set nahi hai."); return
     st = archive.state
@@ -773,40 +743,38 @@ async def stats_cmd(client, message: Message):
 
 @app.on_message(filters.command("cancel") & filters.private)
 async def cancel_cmd(client, message: Message):
-    if not owner_ok(message): return
+    if not is_owner(message.chat.id): return
     if cancel_event: cancel_event.set()
     await message.reply_text("🛑 Cancel request bhej di.")
 
 @app.on_message(filters.forwarded & filters.private)
 async def forward_id_handler(client, message: Message):
-    """Channel post forward karo → archive turant usi channel par set ho jayega (secret change nahi)."""
-    if not owner_ok(message): return
+    """Channel ki koi post forward karo → bot exact channel ID bata dega."""
+    if not is_owner(message.chat.id): return
     src = getattr(message, "forward_from_chat", None)
     if src is not None and getattr(src, "id", None):
-        if archive:
-            archive.candidates = [src.id]
-            archive.channel_id = src.id
-            archive.state_msg_id = None
-            asyncio.create_task(archive.save_state())
-            log.info("📌 Archive channel forward se set: %s", src.id)
-        await message.reply_text(f"📌 Channel ID set ho gayi: `{src.id}` — archive ab isi par chalega.")
+        await message.reply_text(
+            f"📌 Is channel ki exact ID: `{src.id}`\n"
+            "1) GitHub secret ARCHIVE_CHANNEL_ID me yahi paste karo\n"
+            "2) Workflow dobara run karo")
 
 @app.on_message(filters.text & filters.private & ~filters.command(["start", "stats", "cancel"]))
 async def text_handler(client, message: Message):
-    if not owner_ok(message): return
+    if not is_owner(message.chat.id): return
     t = (message.text or "").lower()
     if any(k in t for k in ["game", "free fire", "pubg", "bgmi"]):
         await message.reply_text("🎮 Game videos: panel me model button → Game (Fast) ya Game (HQ).")
     elif any(k in t for k in ["ram", "cpu", "load"]):
         await message.reply_text(f"🛡 RAM free: {mem_avail_gb():.1f}GB • load: {load1():.1f} • cores: {CPU_THREADS}")
     else:
-        await message.reply_text("🤖 v9: video/GIF/photo bhejo. Panel se model 🎌/🎮, scale, preset, audio. "
-                                 "/stats dekho, /cancel se roko. Channel post forward karo → archive set.")
+        await message.reply_text("🤖 v8: video/GIF/photo bhejo. Panel se model 🎌/🎮, scale, preset, audio. "
+                                 "/stats dekho, /cancel se roko. Channel post forward karo → ID milegi.")
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client, message: Message):
     global _panel
-    if not owner_ok(message): return
+    if not is_owner(message.chat.id):
+        await message.reply_text("❌ Private bot."); return
     try:
         if _panel: await _panel.delete()
     except Exception: pass
@@ -818,8 +786,8 @@ async def start_handler(client, message: Message):
 def notify_owner_startup():
     try:
         r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                          json={"chat_id": OWNER_CHAT_ID,
-                                "text": "✅ Upscaler v9 online!\n🔁 Self-healing session + 📚 archive auto-retry.\nPanel se control karo."},
+                          json={"chat_id": OWNER_CHAT_ID_INT or OWNER_CHAT_ID,
+                                "text": "✅ Upscaler v8 online!\n🧠 Governor +  photo +  retry +  self-test.\nPanel se control karo."},
                           timeout=15)
         log.info("Startup ping: %s", r.status_code)
     except Exception as e:
@@ -843,17 +811,21 @@ async def _boot():
             except Exception as e:
                 log.error("❌ Archive channel WRITE FAIL: %s", e)
         else:
-            log.warning("⚠️ Archive connect nahi hua — auto-retry shuru (har 60s, 10 baar)")
-            asyncio.create_task(_archive_retry_loop())
-    log.info("🚀 v9 ready (cores=%s)", CPU_THREADS)
+            log.warning("⚠️ Archive channel connect nahi hua — channel post bot ko forward karo, wo ID dega")
+    log.info("🚀 v8 ready (cores=%s)", CPU_THREADS)
 
 async def _main():
     try:
         await app.start()
         log.info("🔌 Client started — ab boot...")
         await _boot()
-        asyncio.create_task(_session_watchdog())
-        await asyncio.Event().wait()
+        
+        # 🛑 GITHUB ACTIONS FIX:
+        # GitHub ki machine par background terminal nahi hota, isliye purana idle()
+        # apne aap exit ho jata tha. Ye infinite loop bot ko hamesha zinda rakhega.
+        while True:
+            await asyncio.sleep(3600)
+            
     finally:
         try: await app.stop()
         except Exception: pass
