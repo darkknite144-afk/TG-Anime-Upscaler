@@ -1,14 +1,24 @@
 import json, logging, time
 from typing import Any, Dict, Optional, List
+
 log = logging.getLogger("anime-upscaler.archive")
 MARKER = "⚙️ UPSCALER-STATE v1"
 
-def normalize_channel_id(raw) -> List[int]:
-    """-100 prefix missing / raw positive / adhoora negative — sab formats ke candidates."""
+def normalize_channel_id(raw) -> List[Any]:
+    """Supports both string usernames (@username) and numeric IDs."""
     raw = (raw or "").strip()
     if not raw: return []
+    
+    # Agar username hai (characters hain)
+    if not raw.replace("-", "").isdigit():
+        if not raw.startswith("@") and "t.me" not in raw:
+            raw = "@" + raw
+        return [raw]
+        
+    # Agar purely numeric ID hai
     try: v = int(raw)
-    except ValueError: return []
+    except ValueError: return [raw]
+    
     cands = [v]
     if v > 0:
         cands.append(-(1000000000000 + v))
@@ -20,7 +30,7 @@ class ChannelArchive:
     def __init__(self, app, channel_id: str):
         self.app = app
         self.candidates = normalize_channel_id(channel_id)
-        self.channel_id: Optional[int] = None
+        self.channel_id: Optional[Any] = None
         if not self.candidates:
             log.warning("ARCHIVE_CHANNEL_ID set nahi/galat — archive OFF")
         self.state_msg_id: Optional[int] = None
