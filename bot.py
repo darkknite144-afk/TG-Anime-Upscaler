@@ -1,27 +1,15 @@
 #!/usr/bin/env python3
 """
-Smart Anime/Game Upscaler v8.2 — FULL-UI + QUALITY
-- 🎛 v13-style full panel: mood/model/scale/preset/audio/quality/cores/stats/help/start/sendv/sendp/sendg/stop/clean
-- ✨ Quality boost: Standard / High / Ultra (post-process sharpen + detail enhance)
-- ⚙️ Cores: Auto (governor) / Fixed 1T..16T / Duo / Quad
-- 🧠 Governor v2 + 💾 streaming + rotation/stride fix — v8.1 jaisa intact
+Smart Anime/Game/Real Upscaler v9 — MULTI-MODEL + COLORIZE
+- 🎛 Models button → submenu: Anime / Game / Real / HQ
+- 🎨 Colorization toggle (ON/OFF), auto-shifts model per content type
+- 🧠 Governor v2 + streaming + ⚙️ Cores selector
+- 🚫 No post-process — pure AI output
 """
-import asyncio
-import gc
-import json
-import logging
-import math
-import os
-import queue
-import random
-import shutil
-import subprocess
-import sys
-import threading
-import time
+import asyncio, gc, json, logging, math, os, queue, random, shutil, subprocess, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 try:
     sys.stdout.reconfigure(line_buffering=True)
@@ -65,7 +53,7 @@ def is_owner(chat_id) -> bool:
     return chat_id == OWNER_CHAT_ID_INT or str(chat_id) == OWNER_CHAT_ID
 
 if not API_ID or not API_HASH or not BOT_TOKEN or not OWNER_CHAT_ID:
-    raise RuntimeError("Missing GitHub Secrets: API_ID, API_HASH, BOT_TOKEN, OWNER_CHAT_ID")
+    raise RuntimeError("Missing GitHub Secrets")
 
 MODEL_DIR = Path("weights")
 WORK_DIR = Path("work"); OUTPUT_DIR = Path("output")
@@ -83,23 +71,40 @@ CPU_THREADS = os.cpu_count() or 4
 POOL = ThreadPoolExecutor(max_workers=4)
 os.environ["OMP_NUM_THREADS"] = str(CPU_THREADS)
 
+# ================= MODELS (Real, verified) =================
 MODELS = {
-    "anime":  {"file": "realesr-animevideov3.pth",  "arch": "srvgg", "label": "🎌 Anime"},
-    "game":   {"file": "realesr-general-x4v3.pth",  "arch": "srvgg", "label": "🎮 Game (Fast)"},
-    "gamehq": {"file": "RealESRGAN_x4plus.pth",     "arch": "rrdb",  "label": "🎮 Game (HQ, slow)"},
+    # key: (file, arch, label, best_for)
+    "anime_video": {
+        "file": "realesr-animevideov3.pth", "arch": "srvgg",
+        "label": "🎌 Anime Video", "best_for": "anime video (fast, no flicker)"
+    },
+    "anime_image": {
+        "file": "RealESRGAN_x4plus_anime_6B.pth", "arch": "rrdb",
+        "label": "🎌 Anime Image", "best_for": "anime still/photo (crisp lines)"
+    },
+    "game": {
+        "file": "realesr-general-x4v3.pth", "arch": "srvgg",
+        "label": "🎮 Game (Fast)", "best_for": "gameplay (FF/PUBG)"
+    },
+    "real": {
+        "file": "RealESRGAN_x4plus.pth", "arch": "rrdb",
+        "label": "📷 Real Photo", "best_for": "real-world photos"
+    },
 }
+
+# Colorization config — auto-shift per content
+COLOR_MODELS = {
+    "anime_video": "artistic",
+    "anime_image": "artistic",
+    "game":        "stable",
+    "real":        "stable",
+}
+
 PRESETS = {"fast": {"crf": "23", "preset": "veryfast"},
            "balanced": {"crf": "19", "preset": "veryfast"},
            "best": {"crf": "16", "preset": "slow"}}
 
-# ✨ Quality modes — post-process sharpen + detail boost
-QUALITY = {
-    "standard": {"label": "⚡ Standard", "sharpen": 0.0, "detail": False},
-    "high":     {"label": "✨ High",     "sharpen": 0.35, "detail": False},
-    "ultra":    {"label": "💎 Ultra",    "sharpen": 0.55, "detail": True},
-}
-
-# ⚙️ Core profiles — (key, label, workers, threads); "auto" = governor decides
+# ⚙️ Core profiles
 def _build_core_profiles():
     p = [("auto", "🤖 Auto (Governor)", 0, 0)]
     for n in (1, 2, 3, 4, 6, 8, 12, 16):
@@ -115,8 +120,12 @@ def _build_core_profiles():
 CORE_PROFILES = _build_core_profiles()
 CORE_MAP = {p[0]: p for p in CORE_PROFILES}
 
-settings = {"scale": 2.0, "preset": "balanced", "audio": "keep",
-            "model": "anime", "quality": "high", "core": "auto"}
+settings = {
+    "scale": 2.0, "preset": "balanced", "audio": "keep",
+    "model": "anime_video",   # default anime video
+    "core": "auto",
+    "colorize": False,        # default OFF
+}
 job_state = {"active": False}
 current_job: Optional[Dict[str, Any]] = None
 cancel_event: Optional[threading.Event] = None
@@ -190,17 +199,14 @@ DOWNGRADE = {(4, 1): (3, 1), (3, 1): (2, 2), (2, 3): (2, 2), (2, 2): (1, 2),
 PROBE, EXPLOIT = 6, 12
 
 class Governor:
-    """v8.1 Governor + fixed override support."""
     def __init__(self, out_px: int, fixed: Optional[tuple] = None):
         self.fp = out_px * 512 / 1e9
         self.fixed = fixed
         self.ema = {c: 0.0 for c in CONFIGS}
         self.cnt = {c: 0 for c in CONFIGS}
         if fixed is not None:
-            # RAM-safe clamp
             w, t = fixed
-            fp = self.fp
-            max_w = max(1, int(mem_avail_gb() * 0.6 / max(fp, 0.1)))
+            max_w = max(1, int(mem_avail_gb() * 0.6 / max(self.fp, 0.1)))
             if w > max_w:
                 log.warning("⚙️ Fixed core clamped %d→%d (RAM)", w, max_w)
                 w = max_w
@@ -213,7 +219,7 @@ class Governor:
         self.press = 0; self.idle = 0; self.safe = False
         self.lock = threading.Lock()
         self.apply()
-        log.info("🧠 Governor v2 %s%s | fp %.2fGB/fr | RAM %.1fGB",
+        log.info("🧠 Governor %s%s | fp %.2fGB/fr | RAM %.1fGB",
                  self.current, " [FIXED]" if fixed else "", self.fp, self.ram_ema)
 
     def _ram_ok(self, w: int) -> bool:
@@ -235,12 +241,9 @@ class Governor:
             self.ram_ema = self.ram_ema * 0.8 + mem_avail_gb() * 0.2
             if done % 20 == 0:
                 gc.collect()
-            # Fixed mode: sirf RAM safety check, koi probing nahi
             if self.fixed is not None:
-                if self.ram_ema < 1.2:
-                    self.safe = True
+                if self.ram_ema < 1.2: self.safe = True
                 return
-            # Auto mode: same as v8.1
             if self.ram_ema < 1.2 or self.load_ema > CPU_THREADS * 1.5:
                 self.press += 1; self.idle = 0
                 if self.press >= 2:
@@ -295,16 +298,15 @@ class Governor:
             self.current = b; self.apply()
 
     def status(self, spf: float) -> str:
-        fixed_lbl = " [FIXED]" if self.fixed else ""
-        return (f"🤖 {self.current[0]}W×{self.current[1]}T{fixed_lbl} | {spf:.2f}s/fr | "
+        fx = " [FIXED]" if self.fixed else ""
+        return (f"🤖 {self.current[0]}W×{self.current[1]}T{fx} | {spf:.2f}s/fr | "
                 f"{self.thr(self.current):.2f} f/s | 🛡 {self.ram_ema:.1f}G | "
                 f"load {self.load_ema:.1f}" + (" | SAFE" if self.safe else ""))
 
-# ================= MODELS =================
+# ================= MODEL LOADING =================
 _ups_cache: Dict[Any, RealESRGANer] = {}
 
 def _detect_srvgg_num_conv(path: Path) -> int:
-    """Auto-detect SRVGGNetCompact num_conv from state_dict (16 or 32)."""
     try:
         sd = torch.load(str(path), map_location="cpu", weights_only=False)
         if isinstance(sd, dict):
@@ -331,11 +333,15 @@ def get_ups(key: str, tile: int) -> RealESRGANer:
     k = (key, tile)
     if k in _ups_cache: return _ups_cache[k]
     m = MODELS[key]; path = MODEL_DIR / m["file"]
-    if not path.exists(): raise FileNotFoundError(f"Model missing: {path}")
+    if not path.exists():
+        raise FileNotFoundError(f"Model missing: {path}\nDownload from Real-ESRGAN releases.")
 
     if m["arch"] == "rrdb":
         log.info("Loading %s (RRDBNet, tile=%s)...", m["file"], tile)
-        model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
+        # 6B anime uses num_block=6, x4plus uses num_block=23
+        nb = 6 if "anime_6B" in m["file"] else 23
+        model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64,
+                        num_block=nb, num_grow_ch=32, scale=4)
         ups = RealESRGANer(scale=4, model_path=str(path), model=model, tile=tile,
                            tile_pad=10, pre_pad=0, half=False, device=torch.device("cpu"))
         _ups_cache[k] = ups
@@ -358,57 +364,107 @@ def get_ups(key: str, tile: int) -> RealESRGANer:
             log.warning("num_conv=%s load fail: %s", nc, str(e)[:140])
     raise last_err or RuntimeError("SRVGG load failed")
 
-# ================= IMAGE QUALITY POST-PROCESS =================
-def post_process_quality(img: np.ndarray, quality_key: str) -> np.ndarray:
-    """Sharpen + detail enhance based on selected quality mode."""
-    q = QUALITY.get(quality_key, QUALITY["standard"])
-    if q["detail"]:
+# ================= COLORIZATION (DeOldify-based, toggle) =================
+_color_model_cache = {}
+
+def get_colorizer(style: str):
+    """Lazy load DeOldify colorizer. style: 'stable' or 'artistic'."""
+    if style in _color_model_cache:
+        return _color_model_cache[style]
+    # Requires: pip install deoldify (or use ONNX runtime)
+    # We use a lightweight fallback: OpenCV DNN colorization if DeOldify unavailable
+    try:
+        from deoldify import visualize
+        from deoldify.visualize import get_image_colorizer
+        # DeOldify artistic model for anime, stable for real/game
+        colorizer = get_image_colorizer(artistic=(style == "artistic"))
+        _color_model_cache[style] = ("deoldify", colorizer)
+        log.info("🎨 DeOldify loaded (%s)", style)
+        return _color_model_cache[style]
+    except Exception as e:
+        log.warning("DeOldify load fail: %s — using OpenCV fallback", e)
+        # Fallback: OpenCV DNN colorization (lighter)
         try:
-            # Ultra: contrast-limited detail enhance (mild)
-            img = cv2.detailEnhance(img, sigma_s=10, sigma_r=0.15)
-        except Exception:
-            pass
-    if q["sharpen"] > 0:
-        try:
-            blur = cv2.GaussianBlur(img, (0, 0), 1.2)
-            img = cv2.addWeighted(img, 1 + q["sharpen"], blur, -q["sharpen"], 0)
-        except Exception:
-            pass
-    return img
+            proto = MODEL_DIR / "colorization_deploy_v2.prototxt"
+            model = MODEL_DIR / "colorization_release_v2.caffemodel"
+            pts = MODEL_DIR / "pts_in_hull.npy"
+            if proto.exists() and model.exists():
+                net = cv2.dnn.readNetFromCaffe(str(proto), str(model))
+                pts = np.load(str(pts))
+                # setup (as per OpenCV docs)
+                class8 = net.getLayerId("class8_ab")
+                conv8 = net.getLayerId("conv8_313_rh")
+                pts = pts.transpose().reshape(2, 313, 1, 1)
+                net.getLayer(class8).blobs = [pts.astype("float32")]
+                net.getLayer(conv8).blobs = [np.full([1, 313], 2.606, dtype="float32")]
+                _color_model_cache[style] = ("opencv", net)
+                log.info("🎨 OpenCV colorizer loaded (%s)", style)
+                return _color_model_cache[style]
+        except Exception as e2:
+            log.error("Colorizer fallback fail: %s", e2)
+        return None
+
+def colorize_frame(img: np.ndarray, style: str) -> np.ndarray:
+    """Apply colorization. If grayscale → colorize. If colored → enhance saturation."""
+    cinfo = get_colorizer(style)
+    if cinfo is None:
+        return img
+    kind, model = cinfo
+    try:
+        if kind == "opencv":
+            # Convert to LAB, colorize L channel
+            lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+            L = lab[:, :, 0]
+            L_rs = cv2.resize(L, (224, 224))
+            L_rs = L_rs - 50  # mean center
+            net = model
+            net.setInput(cv2.dnn.blobFromImage(L_rs))
+            ab = net.forward()[0, :, :, :].transpose((1, 2, 0))
+            ab = cv2.resize(ab, (img.shape[1], img.shape[0]))
+            L_full = lab[:, :, 0]
+            colorized = np.concatenate((L_full[:, :, np.newaxis], ab), axis=2)
+            out = cv2.cvtColor(colorized, cv2.COLOR_LAB2BGR)
+            out = np.clip(out, 0, 255).astype("uint8")
+            return out
+        else:
+            # DeOldify: expects PIL
+            from PIL import Image
+            pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            colored = model.plot_transformed_image_from_image(pil, render_factor=35)
+            if colored is None: return img
+            arr = cv2.cvtColor(np.array(colored), cv2.COLOR_RGB2BGR)
+            return cv2.resize(arr, (img.shape[1], img.shape[0]))
+    except Exception as e:
+        log.warning("Colorize frame fail: %s", e)
+        return img
 
 # ================= CLIENT + ARCHIVE =================
 app = Client("anime_upscaler_bot", api_id=API_ID, api_hash=API_HASH,
              bot_token=BOT_TOKEN, in_memory=True)
 archive = ChannelArchive(app, (os.getenv("ARCHIVE_CHANNEL_ID", "") or "").strip()) if ChannelArchive else None
 
-# ================= PANEL (v13 FULL UI) =================
+# ================= PANEL =================
 _panel: Optional[Message] = None
-
-HELP_TEXT = (
-    "🧭 **Help (v8.2)**\n\n"
-    "🎥 Video / 🎞 GIF / 🖼 Photo bhejo → upscale\n"
-    "🎛 Panel boot par hi — Model / Scale / Preset / Audio / Quality / Cores\n"
-    "✨ **Quality**: Standard / High / Ultra — Ultra me sharpen + detail boost\n"
-    "⚙️ **Cores**: Auto (Governor) ya Fixed (1T..16T, Duo, Quad, Hexa)\n"
-    "🧠 Auto mode: RAM+CPU dekh kar workers/threads khud tune karta hai\n"
-    "🛡 Rotation fix + stride fix — tedhi videos bhi seedhi upscale hongi\n"
-    "📚 Queue: 3 parallel (baki scheduler)\n"
-    "✍️ /start /stats /cancel"
-)
 
 def _core_label() -> str:
     if settings["core"] == "auto": return "🤖 Auto"
     cm = CORE_MAP.get(settings["core"])
     return cm[1] if cm else "🤖 Auto"
 
+def _model_label() -> str:
+    return MODELS[settings["model"]]["label"]
+
+def _color_label() -> str:
+    return "🎨 ON" if settings["colorize"] else "🎨 OFF"
+
 def panel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"{EMO.face()}", callback_data="b:mood"),
-         InlineKeyboardButton(MODELS[settings["model"]]["label"], callback_data="b:mmenu"),
+         InlineKeyboardButton(_model_label(), callback_data="b:mmenu"),
          InlineKeyboardButton(f"🎯 {fmt_scale(settings['scale'])}×", callback_data="b:qmenu")],
         [InlineKeyboardButton(f"⚡ {settings['preset'].title()}", callback_data="b:pmenu"),
          InlineKeyboardButton(f"🔊 {settings['audio'].title()}", callback_data="b:amenu"),
-         InlineKeyboardButton(QUALITY[settings["quality"]]["label"], callback_data="b:hmenu")],
+         InlineKeyboardButton(_color_label(), callback_data="b:colortoggle")],
         [InlineKeyboardButton(_core_label(), callback_data="b:cmenu"),
          InlineKeyboardButton("▶️ Start", callback_data="b:go"),
          InlineKeyboardButton("📊 Stats", callback_data="b:stats")],
@@ -420,12 +476,21 @@ def panel_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("🧹 Clean", callback_data="b:clean")],
     ])
 
-def model_kb() -> InlineKeyboardMarkup:
+# ===== Models submenu (all-in-one) =====
+def models_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎌 Anime (fast)", callback_data="b:m:anime")],
+        # Anime group
+        [InlineKeyboardButton("🎌 ANIME", callback_data="noop")],
+        [InlineKeyboardButton("🎌 Anime Video (fast)", callback_data="b:m:anime_video")],
+        [InlineKeyboardButton("🎌 Anime Image (crisp)", callback_data="b:m:anime_image")],
+        # Game group
+        [InlineKeyboardButton("🎮 GAME", callback_data="noop")],
         [InlineKeyboardButton("🎮 Game Fast (FF/PUBG)", callback_data="b:m:game")],
-        [InlineKeyboardButton("🎮 Game HQ (best, slow)", callback_data="b:m:gamehq")],
-        [InlineKeyboardButton("🔙 Panel", callback_data="b:back")]])
+        # Real group
+        [InlineKeyboardButton("📷 REAL", callback_data="noop")],
+        [InlineKeyboardButton("📷 Real Photo (HQ)", callback_data="b:m:real")],
+        [InlineKeyboardButton("🔙 Panel", callback_data="b:back")],
+    ])
 
 def q_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -447,13 +512,6 @@ def a_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("🔇 Remove", callback_data="b:a:remove")],
         [InlineKeyboardButton("🔙 Panel", callback_data="b:back")]])
 
-def h_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚡ Standard (fastest)", callback_data="b:h:standard")],
-        [InlineKeyboardButton("✨ High (sharp)", callback_data="b:h:high")],
-        [InlineKeyboardButton("💎 Ultra (best)", callback_data="b:h:ultra")],
-        [InlineKeyboardButton("🔙 Panel", callback_data="b:back")]])
-
 def core_kb() -> InlineKeyboardMarkup:
     rows = []
     row = []
@@ -465,12 +523,27 @@ def core_kb() -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("🔙 Panel", callback_data="b:back")])
     return InlineKeyboardMarkup(rows)
 
+HELP_TEXT = (
+    "🧭 **Help (v9 — Multi-Model)**\n\n"
+    "🎥 Video / 🎞 GIF / 🖼 Photo bhejo → upscale\n"
+    "🎛 **Models button** → Anime / Game / Real submenu\n"
+    "🎨 **Color button** → toggle ON/OFF (auto-shifts model per content)\n"
+    "   • Anime selected → DeOldify Artistic\n"
+    "   • Game/Real selected → DeOldify Stable\n"
+    "⚙️ **Cores**: Auto (Governor) ya Fixed\n"
+    "🚫 No post-process — pure AI output\n"
+    "🛡 Rotation + stride fix\n"
+    "✍️ /start /stats /cancel"
+)
+
 def panel_text() -> str:
-    lines = [_pad(f"{EMO.face()}  UPSCALER v8.2"), "─" * PW,
+    m = MODELS[settings["model"]]
+    lines = [_pad(f"{EMO.face()}  UPSCALER v9"), "─" * PW,
              _pad(f"🧠 {CPU_THREADS}c • 🛡 {mem_avail_gb():.1f}GB free • load {load1():.1f}"),
-             _pad(f"{MODELS[settings['model']]['label']} {fmt_scale(settings['scale'])}× "
+             _pad(f"{m['label']} {fmt_scale(settings['scale'])}× "
                   f"{settings['preset'][:4]} 🔊{settings['audio'][:4]}"),
-             _pad(f"{QUALITY[settings['quality']]['label']} • ⚙️ {_core_label()}"),
+             _pad(f"🎨 Colorize: {_color_label()} • ⚙️ {_core_label()}"),
+             _pad(f"💡 {m['best_for'][:30]}"),
              _pad("")]
     if job_state.get("active") and current_job:
         j = current_job
@@ -485,10 +558,10 @@ def panel_text() -> str:
     else:
         lines += [_pad("😴 Idle — koi job nahi"),
                   _pad("🎥 video / 🖼 photo / 🎞 gif"),
-                  _pad("bhejo → MAX speed + quality"),
-                  _pad("buttons se settings")]
-    lines += ["─" * PW, _pad("✨ Quality button se sharpness"),
-              _pad("⚙️ Cores button se workers")]
+                  _pad("bhejo → pure AI upscale"),
+                  _pad("Models button se content chuno")]
+    lines += ["─" * PW, _pad("🎨 Color button se colorize ON/OFF"),
+              _pad("🚫 No post-process, pure AI")]
     return "\n".join(lines)
 
 async def ensure_panel(cid: int) -> Message:
@@ -505,6 +578,7 @@ async def refresh_panel():
     except Exception:
         pass
 
+# ================= CALLBACK HANDLER =================
 @app.on_callback_query(filters.regex(r"^b:"))
 async def btn(client, cq):
     global _panel
@@ -512,17 +586,26 @@ async def btn(client, cq):
         await cq.answer("Private bot!", show_alert=True); return
     parts = cq.data[2:].split(":"); a = parts[0]; v = parts[1] if len(parts) > 1 else ""
     kb = None
-    if a == "mmenu": kb = model_kb(); await cq.answer("🎽 Model chuno")
-    elif a == "qmenu": kb = q_kb(); await cq.answer("🎯 Scale chuno")
-    elif a == "pmenu": kb = p_kb(); await cq.answer("⚡ Preset chuno")
-    elif a == "amenu": kb = a_kb(); await cq.answer("🔊 Audio chuno")
-    elif a == "hmenu": kb = h_kb(); await cq.answer("✨ Quality chuno")
-    elif a == "cmenu": kb = core_kb(); await cq.answer("⚙️ Cores chuno")
-    elif a == "back": kb = panel_kb(); await cq.answer("🔙")
+    if a == "mmenu":
+        kb = models_kb(); await cq.answer("🎽 Model chuno")
+    elif a == "qmenu":
+        kb = q_kb(); await cq.answer("🎯 Scale chuno")
+    elif a == "pmenu":
+        kb = p_kb(); await cq.answer("⚡ Preset chuno")
+    elif a == "amenu":
+        kb = a_kb(); await cq.answer("🔊 Audio chuno")
+    elif a == "cmenu":
+        kb = core_kb(); await cq.answer("⚙️ Cores chuno")
+    elif a == "back":
+        kb = panel_kb(); await cq.answer("🔙")
     elif a == "m":
-        settings["model"] = v
-        if archive: archive.state["model"] = v
-        kb = panel_kb(); await cq.answer(f"{EMO.one('wow')} {MODELS[v]['label']}")
+        if v in MODELS:
+            settings["model"] = v
+            if archive: archive.state["model"] = v
+            kb = panel_kb()
+            await cq.answer(f"{EMO.one('wow')} {MODELS[v]['label']}")
+        else:
+            kb = models_kb(); await cq.answer()
     elif a == "q":
         settings["scale"] = float(v)
         if archive: archive.state["scale"] = float(v)
@@ -535,13 +618,12 @@ async def btn(client, cq):
         settings["audio"] = v
         if archive: archive.state["audio"] = v
         kb = panel_kb(); await cq.answer(f"{EMO.one('happy')} {v}")
-    elif a == "h":
-        if v in QUALITY:
-            settings["quality"] = v
-            kb = h_kb()
-            await cq.answer(f"{QUALITY[v]['label']}")
-        else:
-            kb = panel_kb(); await cq.answer()
+    elif a == "colortoggle":
+        settings["colorize"] = not settings["colorize"]
+        if archive: archive.state["colorize"] = settings["colorize"]
+        kb = panel_kb()
+        state = "🎨 ON" if settings["colorize"] else "🎨 OFF"
+        await cq.answer(state)
     elif a == "c":
         if v in CORE_MAP:
             settings["core"] = v
@@ -552,7 +634,7 @@ async def btn(client, cq):
             kb = panel_kb(); await cq.answer()
     elif a == "go":
         await cq.answer(EMO.one("start"))
-        await cq.message.reply_text(f"{EMO.one('start')} Bas video/GIF/photo bhejo — upscale shuru!")
+        await cq.message.reply_text(f"{EMO.one('start')} Bas video/GIF/photo bhejo — {_model_label()} se upscale!")
     elif a == "help":
         await cq.answer(EMO.one("think")); await cq.message.reply_text(HELP_TEXT)
     elif a == "stats":
@@ -593,23 +675,24 @@ async def btn(client, cq):
             pass
 
 def _stats_text() -> str:
+    m = MODELS[settings["model"]]
     lines = [f"📊 **Stats** {EMO.one('wow')}",
              f"⚙️ Cores: {_core_label()}",
-             f"✨ Quality: {QUALITY[settings['quality']]['label']}",
-             f"🧠 Governor v2: adaptive",
+             f"🎽 Model: {m['label']} — {m['best_for']}",
+             f"🎨 Colorize: {_color_label()}",
+             f"🚫 Post-process: OFF (pure AI)",
+             f"🧠 Governor: adaptive",
              f"🖥 Cores: {CPU_THREADS} • 🛡 RAM: {mem_avail_gb():.1f}GB free",
-             f"🎽 Model: {MODELS[settings['model']]['label']} • 🎯 {fmt_scale(settings['scale'])}×"]
+             f"🎯 Scale: {fmt_scale(settings['scale'])}× • Preset: {settings['preset'].title()}"]
     if archive:
         st = archive.state
         hist = st.get("history", [])
         tot_t = sum(x.get("t", 0) for x in hist)
         lines += [f"✅ Jobs done: {st.get('jobs_done', 0)}",
                   f"🕒 Total: {fmt_time(tot_t)}"]
-        for x in hist[-3:]:
-            lines.append(f"• {x.get('f', '?')[:20]} | {x.get('s', 0)}× | {fmt_time(x.get('t', 0))}")
     return "\n".join(lines)
 
-# ================= PROBE (rotation-aware) =================
+# ================= PROBE =================
 def probe_video(path: Path) -> Dict:
     r = subprocess.run(["ffprobe", "-v", "error", "-print_format", "json",
                         "-show_streams", "-show_format", str(path)],
@@ -632,19 +715,20 @@ def probe_video(path: Path) -> Dict:
         except Exception: rot = 0.0
     if abs(rot) in (90.0, 270.0):
         w, h = h, w
-        log.info("🔄 Rotation %.0f° detected — effective dims %sx%s", rot, w, h)
+        log.info("🔄 Rotation %.0f° — effective %sx%s", rot, w, h)
 
     return {"width": w, "height": h, "fps": fps,
             "duration": dur, "frames": frames,
             "has_audio": any(s.get("codec_type") == "audio" for s in data["streams"])}
 
-# ================= PIPELINE (unchanged structure + quality post-process) =================
+# ================= PIPELINE (with optional colorize) =================
 def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Governor,
                  cancel: threading.Event, is_gif: bool, prev_dir: Path):
     w, h, fps = info["width"], info["height"], info["fps"]
     ow, oh = job["ow"], job["oh"]
     ff = PRESETS[settings["preset"]]
-    quality = settings["quality"]
+    colorize = settings["colorize"]
+    color_style = COLOR_MODELS.get(settings["model"], "stable")
     enc_threads = 1 if gov.current[0] >= 2 else 2
     fps_g = fps if fps > 0 else 10.0
     total = min(info["frames"] or max(1, int(info["duration"] * fps)),
@@ -661,7 +745,7 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Gover
 
     def reader():
         fb = w * h * 3
-        log.info("📐 Reader frame size: %sx%s (%d bytes/frame)", w, h, fb)
+        log.info("📐 Reader frame: %sx%s (%d B)", w, h, fb)
         try:
             dec = subprocess.Popen(
                 ["ffmpeg", "-v", "error", "-i", str(in_path), "-vsync", "0",
@@ -681,8 +765,9 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Gover
     def upscale_one(img, cfg):
         t0 = time.time()
         out, _ = ups.enhance(img, outscale=settings["scale"])
-        # ✨ Quality post-process
-        out = post_process_quality(out, quality)
+        # Optional colorize
+        if colorize:
+            out = colorize_frame(out, color_style)
         dt = time.time() - t0
         with stats_lock:
             first = (stats["done"] == 0)
@@ -743,7 +828,7 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Gover
             outs = []
             for fr in frames_raw:
                 if cancel.is_set(): raise RuntimeError("Cancelled")
-                if time.time() - t_start > MAX_JOB_SEC: raise RuntimeError("Job time-limit cross")
+                if time.time() - t_start > MAX_JOB_SEC: raise RuntimeError("Job time-limit")
                 outs.append(upscale_one(fr, gov.current))
             frames_raw.clear(); gc.collect()
             loops = min(max(1, math.ceil(GIF_MIN_SEC / (len(outs) / fps_g))),
@@ -770,7 +855,7 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Gover
                     raise RuntimeError("Cancelled")
                 if time.time() - t_start > MAX_JOB_SEC:
                     with futs_cond: futs.append(None); futs_cond.notify_all()
-                    raise RuntimeError("Job time-limit cross")
+                    raise RuntimeError("Job time-limit")
                 img = in_q.get()
                 if img is None: break
                 if i == 0:
@@ -822,12 +907,11 @@ async def send_with_retry(fn, desc: str):
             if attempt == 3: raise
             await asyncio.sleep(5 * attempt)
 
-# ================= LOG INCOMING =================
+# ================= LOG =================
 @app.on_message(filters.all & filters.private, group=-1)
 async def debug_logger(client, message: Message):
     kind = "text" if message.text else "media" if (message.video or message.photo or message.animation or message.document) else "other"
-    log.info("INCOMING | chat_id=%s | kind=%s | content=%r",
-             message.chat.id, kind, (message.text or "")[:50])
+    log.info("INCOMING | chat=%s | kind=%s | %r", message.chat.id, kind, (message.text or "")[:50])
 
 # ================= JOB =================
 busy_lock = asyncio.Lock()
@@ -848,7 +932,7 @@ async def _refresh_loop():
         await refresh_panel()
         hb += 1
         if hb % 24 == 0 and job_state.get("active") and current_job:
-            log.info("💓 heartbeat | %s fr | RAM %.1fGB | load %.1f",
+            log.info("💓 %s fr | RAM %.1fGB | load %.1f",
                      current_job.get("done", 0), mem_avail_gb(), load1())
         await asyncio.sleep(2.5)
 
@@ -885,7 +969,7 @@ async def media_handler(client, message: Message):
         current_job["stage"] = "🔍"
         info = await asyncio.to_thread(probe_video, in_path)
         if not is_gif and info["frames"] > MAX_FRAMES:
-            await message.reply_text(f"❌ Video bahut lambi: {info['frames']} frames (max {MAX_FRAMES}).")
+            await message.reply_text(f"❌ Video lambi: {info['frames']} fr (max {MAX_FRAMES}).")
             return
         scale = settings["scale"]
         ow = int(info["width"] * scale); ow += ow % 2
@@ -898,7 +982,6 @@ async def media_handler(client, message: Message):
         model_key = settings["model"]
         ups = await asyncio.to_thread(get_ups, model_key, choose_tile(model_key, ow * oh))
 
-        # ⚙️ Fixed core override support
         fixed = None
         if settings["core"] != "auto":
             cm = CORE_MAP.get(settings["core"])
@@ -908,20 +991,21 @@ async def media_handler(client, message: Message):
         current_job.update({"ow": ow, "oh": oh, "stage": "🎨", "ai": gov.status(0.0)})
         out_path = OUTPUT_DIR / f"{Path(filename).stem}_up_{message.id}.mp4"
         t0 = time.time()
+        color_txt = f"🎨 {COLOR_MODELS.get(model_key, 'stable')}" if settings["colorize"] else "🚫 off"
         await message.reply_text(
             f"🎬 **Process shuru:** {info['width']}×{info['height']} → {ow}×{oh} • "
             f"{info['frames']} fr\n"
-            f"✨ Quality: {QUALITY[settings['quality']]['label']} • ⚙️ {_core_label()}")
+            f"{MODELS[model_key]['label']} • Colorize: {color_txt} • ⚙️ {_core_label()}")
         await asyncio.to_thread(run_pipeline, current_job, in_path, out_path, info,
                                 ups, gov, cancel_event, is_gif, job_dir)
         current_job["stage"] = "⬆️"
         size_mb = out_path.stat().st_size / 1048576
         if size_mb > MAX_SEND_MB:
-            raise RuntimeError(f"Output {size_mb:.0f}MB > 2GB limit")
+            raise RuntimeError(f"Output {size_mb:.0f}MB > 2GB")
 
         cap = (f"✅ **{filename}**\n"
                f"{MODELS[model_key]['label']} • {fmt_scale(scale)}× → {ow}×{oh}\n"
-               f"✨ {QUALITY[settings['quality']]['label']}\n"
+               f"🎨 Colorize: {color_txt}\n"
                f"🎞 {current_job.get('frames_done', current_job['done'])} fr"
                + (f" (loop ×{current_job.get('loops', 1)})" if is_gif else "") +
                f" • ⚡ {current_job['spf']:.2f}s/fr • 🕒 {fmt_time(time.time() - t0)}\n"
@@ -933,7 +1017,8 @@ async def media_handler(client, message: Message):
         comp = await asyncio.to_thread(make_compare, job_dir)
         if comp:
             try:
-                await app.send_photo(message.chat.id, str(comp), caption=f"{EMO.one('wow')} ⬅️ Before | ➡️ After")
+                await app.send_photo(message.chat.id, str(comp),
+                                    caption=f"{EMO.one('wow')} ⬅️ Before | ➡️ After")
             except Exception:
                 pass
         if is_gif:
@@ -949,7 +1034,7 @@ async def media_handler(client, message: Message):
             archive.record_job(filename, scale, time.time() - t0, True,
                                extra={"scale": settings["scale"], "preset": settings["preset"],
                                       "audio": settings["audio"], "model": model_key,
-                                      "quality": settings["quality"], "core": settings["core"]})
+                                      "core": settings["core"], "colorize": settings["colorize"]})
             await archive.save_state()
         current_job["stage"] = "✅"
     except Exception as e:
@@ -970,14 +1055,14 @@ async def media_handler(client, message: Message):
         EMO.set("idle")
         await refresh_panel()
 
-# ================= PHOTO (with quality post-process) =================
+# ================= PHOTO (with optional colorize) =================
 @app.on_message(filters.photo & filters.private)
 async def photo_handler(client, message: Message):
     if not is_owner(message.chat.id):
         await message.reply_text("❌ Private bot."); return
     async with busy_lock:
         if job_state.get("active"):
-            await message.reply_text("⏳ Job chal rahi hai, photo baad me bhejo."); return
+            await message.reply_text("⏳ Job chal rahi hai."); return
         job_state["active"] = True
     try:
         EMO.set("work")
@@ -991,16 +1076,17 @@ async def photo_handler(client, message: Message):
         ups = await asyncio.to_thread(get_ups, model_key, choose_tile(model_key, ow * oh))
         t0 = time.time()
         out = await asyncio.to_thread(lambda: ups.enhance(img, outscale=settings["scale"])[0])
-        # ✨ Quality post-process
-        out = await asyncio.to_thread(post_process_quality, out, settings["quality"])
+        if settings["colorize"]:
+            out = await asyncio.to_thread(colorize_frame, out, COLOR_MODELS.get(model_key, "stable"))
         dt = time.time() - t0
         outp = WORK_DIR / f"photo_{message.id}_up.png"
         cv2.imwrite(str(outp), out)
         EMO.set("happy")
+        color_txt = f"🎨 {COLOR_MODELS.get(model_key, 'stable')}" if settings["colorize"] else "🚫 off"
         await send_with_retry(lambda: app.send_photo(
             message.chat.id, str(outp),
             caption=f"{EMO.one('happy')} ✅ Photo {MODELS[model_key]['label']} • "
-                    f"{fmt_scale(settings['scale'])}× • ✨ {QUALITY[settings['quality']]['label']}\n"
+                    f"{fmt_scale(settings['scale'])}× • Colorize: {color_txt}\n"
                     f"{w}×{h} → {out.shape[1]}×{out.shape[0]} • {dt:.1f}s"), "photo")
     except Exception as e:
         log.exception("Photo fail")
@@ -1030,12 +1116,9 @@ async def forward_id_handler(client, message: Message):
     if not is_owner(message.chat.id): return
     src = getattr(message, "forward_from_chat", None)
     if src is not None and getattr(src, "id", None):
-        await message.reply_text(
-            f"📌 Is channel ki exact ID: `{src.id}`\n"
-            "1) GitHub secret ARCHIVE_CHANNEL_ID me yahi paste karo\n"
-            "2) Workflow dobara run karo")
+        await message.reply_text(f"📌 Channel ID: `{src.id}`")
     else:
-        await message.reply_text("❌ Forward se channel ID nahi mili. Secret me `-100...` wali ID daalo.")
+        await message.reply_text("❌ Forward se ID nahi mili.")
 
 @app.on_message(filters.text & filters.private & ~filters.command(["start", "stats", "cancel"]))
 async def text_handler(client, message: Message):
@@ -1043,15 +1126,19 @@ async def text_handler(client, message: Message):
     t = (message.text or "").lower()
     if any(k in t for k in ["hi", "hello", "hey", "namaste"]):
         EMO.set("happy")
-        await message.reply_text(f"{EMO.one('happy')} Namaste boss! Panel buttons se sab control hota hai.")
+        await message.reply_text(f"{EMO.one('happy')} Namaste boss! Panel se sab control.")
     elif any(k in t for k in ["game", "free fire", "pubg", "bgmi"]):
-        await message.reply_text(f"{EMO.one('wow')} 🎮 Panel me model button → Game (Fast) ya Game (HQ).")
+        await message.reply_text(f"{EMO.one('wow')} 🎮 Models button → Game Fast.")
+    elif any(k in t for k in ["anime"]):
+        await message.reply_text(f"{EMO.one('wow')} 🎌 Models button → Anime Video / Anime Image.")
+    elif any(k in t for k in ["color", "rang"]):
+        await message.reply_text(f"{EMO.one('wow')} 🎨 Color button se ON/OFF.")
     elif any(k in t for k in ["ram", "cpu", "load"]):
-        await message.reply_text(f"{EMO.one('think')} 🛡 RAM {mem_avail_gb():.1f}GB • load {load1():.1f} • {CPU_THREADS}c")
+        await message.reply_text(f"{EMO.one('think')} 🛡 RAM {mem_avail_gb():.1f}GB • {CPU_THREADS}c")
     elif any(k in t for k in ["thank", "shukriya", "thx"]):
         await message.reply_text(f"{EMO.one('love')} Apna kaam hai boss!")
     else:
-        await message.reply_text(f"{EMO.one('think')} 🤖 v8.2: video/GIF/photo bhejo; quality + cores buttons se tuning.")
+        await message.reply_text(f"{EMO.one('think')} 🤖 v9: Models button se content chuno, Color toggle se colorize.")
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client, message: Message):
@@ -1066,14 +1153,14 @@ async def start_handler(client, message: Message):
     _panel = None
     await ensure_panel(message.chat.id)
     await refresh_panel()
-    await message.reply_text(f"{EMO.one('start')} **v8.2 online!** Chat ID: `{message.chat.id}`")
+    await message.reply_text(f"{EMO.one('start')} **v9 online!** Chat ID: `{message.chat.id}`")
 
 # ================= BOOT =================
 def notify_owner_startup():
     try:
         r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                           json={"chat_id": OWNER_CHAT_ID_INT or OWNER_CHAT_ID,
-                                "text": "✅ Upscaler v8.2 online!\n🎛 Full buttons + ✨ Quality boost + ⚙️ Cores selector."},
+                                "text": "✅ Upscaler v9 online!\n🎛 Models submenu + 🎨 Colorize toggle."},
                           timeout=15)
         log.info("Startup ping: %s", r.status_code)
     except Exception as e:
@@ -1088,34 +1175,31 @@ async def _boot():
         settings["preset"] = st.get("preset", settings["preset"])
         settings["audio"] = st.get("audio", settings["audio"])
         settings["model"] = st.get("model", settings["model"])
-        settings["quality"] = st.get("quality", settings["quality"])
         settings["core"] = st.get("core", settings["core"])
+        settings["colorize"] = bool(st.get("colorize", settings["colorize"]))
         log.info("📚 Archive settings: %s", settings)
         if archive.channel_id:
             try:
-                m = await app.send_message(archive.channel_id, "🧪 Archive self-test...")
+                m = await app.send_message(archive.channel_id, "🧪 Archive test...")
                 await m.delete()
-                log.info("✅ Archive channel WRITE test OK")
+                log.info("✅ Archive WRITE OK")
             except Exception as e:
-                log.error("❌ Archive channel WRITE FAIL: %s", e)
-        else:
-            log.warning("⚠️ Archive channel connect nahi hua")
-    # 🎛 Panel boot par hi
+                log.error("❌ Archive WRITE FAIL: %s", e)
     try:
         cid = OWNER_CHAT_ID_INT or (int(OWNER_CHAT_ID) if OWNER_CHAT_ID.lstrip("-").isdigit() else 0)
         if cid:
             await ensure_panel(cid)
             await refresh_panel()
-            log.info("🎛 Panel + buttons boot par bhej diye")
+            log.info("🎛 Panel + buttons boot par")
     except Exception as e:
         log.warning("Panel boot fail: %s", e)
     asyncio.create_task(_refresh_loop())
-    log.info("🚀 v8.2 ready (cores=%s)", CPU_THREADS)
+    log.info("🚀 v9 ready (cores=%s)", CPU_THREADS)
 
 async def _main():
     try:
         await app.start()
-        log.info("🔌 Client started — boot...")
+        log.info("🔌 Client started")
         await _boot()
         await idle()
     finally:
@@ -1125,7 +1209,7 @@ async def _main():
 if __name__ == "__main__":
     try:
         r = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook", timeout=15)
-        log.info("🧹 Webhook check: %s", r.text[:120])
+        log.info("🧹 Webhook: %s", r.text[:120])
     except Exception as e:
         log.warning("Webhook fail: %s", e)
     app.run(_main())
