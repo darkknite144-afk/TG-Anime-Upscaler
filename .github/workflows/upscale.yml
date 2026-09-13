@@ -1,4 +1,4 @@
-name: Telegram Anime Video Upscaler v9
+name: Telegram Anime Upscaler v10
 on:
   workflow_dispatch:
 jobs:
@@ -15,11 +15,11 @@ jobs:
           python-version: '3.10'
           cache: 'pip'
 
-      - name: Cache Real-ESRGAN weights + colorizer
+      - name: Cache weights + DDColor
         uses: actions/cache@v4
         with:
           path: weights
-          key: realesrgan-weights-v9
+          key: weights-v10
 
       - name: Install FFmpeg
         run: |
@@ -39,64 +39,69 @@ jobs:
           pip install -e . --no-deps
           cd ..
 
-      - name: Download all model weights + colorizer files
+      - name: Install DDColor
         run: |
-          mkdir -p weights
-          cd weights
+          git clone --depth 1 https://github.com/piddnad/DDColor.git ddcolor-src || \
+          git clone --depth 1 https://github.com/ai-anchorite/DDColor.git ddcolor-src
+          cd ddcolor-src
+          pip install -e . --no-deps || echo "⚠️ DDColor pip install failed (non-critical)"
+          cd ..
 
-          # ===== Upscale models (v9) =====
-          [ -f realesr-animevideov3.pth ] || \
-            wget -q --show-progress \
-              https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-animevideov3.pth \
-              -O realesr-animevideov3.pth
+      - name: Download upscale models
+        shell: bash
+        run: |
+          mkdir -p weights && cd weights
 
-          [ -f RealESRGAN_x4plus_anime_6B.pth ] || \
-            wget -q --show-progress \
-              https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth \
-              -O RealESRGAN_x4plus_anime_6B.pth
+          dl() {
+            local url="$1" out="$2"
+            if [ -s "$out" ]; then echo "✓ $out cached"; return 0; fi
+            echo "⬇️  $out"
+            wget -q --show-progress --timeout=90 -O "$out" "$url"
+          }
 
-          [ -f realesr-general-x4v3.pth ] || \
-            wget -q --show-progress \
-              https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth \
-              -O realesr-general-x4v3.pth
+          dl "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-animevideov3.pth" \
+             "realesr-animevideov3.pth"
+          dl "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth" \
+             "RealESRGAN_x4plus_anime_6B.pth"
+          dl "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth" \
+             "realesr-general-x4v3.pth"
+          dl "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth" \
+             "RealESRGAN_x4plus.pth"
 
-          [ -f RealESRGAN_x4plus.pth ] || \
-            wget -q --show-progress \
-              https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth \
-              -O RealESRGAN_x4plus.pth
-
-          # ===== Colorizer files (OpenCV DNN) =====
-          [ -f colorization_deploy_v2.prototxt ] || \
-            wget -q --show-progress \
-              https://raw.githubusercontent.com/richzhang/colorization/caffe/colorization/models/colorization_deploy_v2.prototxt \
-              -O colorization_deploy_v2.prototxt
-
-          [ -f pts_in_hull.npy ] || \
-            wget -q --show-progress \
-              https://raw.githubusercontent.com/richzhang/colorization/caffe/colorization/resources/pts_in_hull.npy \
-              -O pts_in_hull.npy
-
-          [ -f colorization_release_v2.caffemodel ] || \
-            wget -q --show-progress \
-              https://eecs.berkeley.edu/~rich.zhang/projects/2016_colorization/files/demo_v2/colorization_release_v2.caffemodel \
-              -O colorization_release_v2.caffemodel || \
-            wget -q --show-progress \
-              https://github.com/ManishChauhan04/Colorization/raw/main/colorization_release_v2.caffemodel \
-              -O colorization_release_v2.caffemodel
-
-          # ===== Verify all downloads =====
-          echo "=== Downloaded weights ==="
-          ls -lh
-
-          # Quick sanity: fail fast if any critical file is missing
           for f in realesr-animevideov3.pth RealESRGAN_x4plus_anime_6B.pth \
                    realesr-general-x4v3.pth RealESRGAN_x4plus.pth; do
-            if [ ! -s "$f" ]; then
-              echo "❌ Missing: $f"
-              exit 1
-            fi
+            [ -s "$f" ] || { echo "❌ Missing: $f"; exit 1; }
           done
           echo "✅ All 4 upscale models present"
+          ls -lh
+
+      - name: Download DDColor models (both Fast + High)
+        shell: bash
+        run: |
+          cd weights
+
+          # --- DDColor Fast (tiny, ~215MB) ---
+          if [ ! -s ddcolor_tiny.pth ]; then
+            echo "⬇️  DDColor Fast (tiny)..."
+            wget -q --show-progress --timeout=120 \
+              "https://huggingface.co/piddnad/ddcolor_paper_tiny/resolve/main/pytorch_model.bin" \
+              -O ddcolor_tiny.pth || echo "⚠️ tiny fail"
+          fi
+
+          # --- DDColor High (modelscope, ~870MB) ---
+          if [ ! -s ddcolor_high.pth ]; then
+            echo "⬇️  DDColor High (modelscope, this takes a few minutes)..."
+            wget -q --show-progress --timeout=300 \
+              "https://huggingface.co/piddnad/ddcolor_modelscope/resolve/main/pytorch_model.bin" \
+              -O ddcolor_high.pth || echo "⚠️ high fail"
+          fi
+
+          echo "=== weights/ ==="
+          ls -lh
+          for f in ddcolor_tiny.pth ddcolor_high.pth; do
+            if [ -s "$f" ]; then echo "✅ $f OK"
+            else echo "⚠️  $f missing (colorize limited)"; fi
+          done
 
       - name: Run Telegram bot
         env:
