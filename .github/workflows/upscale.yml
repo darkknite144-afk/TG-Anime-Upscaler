@@ -1,4 +1,4 @@
-name: Telegram Anime Video Upscaler
+name: Telegram Anime Video Upscaler v9
 on:
   workflow_dispatch:
 jobs:
@@ -15,11 +15,11 @@ jobs:
           python-version: '3.10'
           cache: 'pip'
 
-      - name: Cache Real-ESRGAN weights
+      - name: Cache Real-ESRGAN weights + colorizer
         uses: actions/cache@v4
         with:
           path: weights
-          key: realesrgan-weights-v8
+          key: realesrgan-weights-v9
 
       - name: Install FFmpeg
         run: |
@@ -32,16 +32,71 @@ jobs:
           pip install --index-url https://download.pytorch.org/whl/cpu torch==2.1.2 torchvision==0.16.2
           pip install -r requirements.txt
 
-      - name: Install Real-ESRGAN + models
+      - name: Install Real-ESRGAN
         run: |
           git clone --depth 1 https://github.com/xinntao/Real-ESRGAN.git realesrgan-src
           cd realesrgan-src
           pip install -e . --no-deps
           cd ..
+
+      - name: Download all model weights + colorizer files
+        run: |
           mkdir -p weights
-          [ -f weights/realesr-animevideov3.pth ] || wget -q https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-animevideov3.pth -O weights/realesr-animevideov3.pth
-          [ -f weights/realesr-general-x4v3.pth ] || wget -q https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth -O weights/realesr-general-x4v3.pth
-          [ -f weights/RealESRGAN_x4plus.pth ] || wget -q https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth -O weights/RealESRGAN_x4plus.pth
+          cd weights
+
+          # ===== Upscale models (v9) =====
+          [ -f realesr-animevideov3.pth ] || \
+            wget -q --show-progress \
+              https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-animevideov3.pth \
+              -O realesr-animevideov3.pth
+
+          [ -f RealESRGAN_x4plus_anime_6B.pth ] || \
+            wget -q --show-progress \
+              https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth \
+              -O RealESRGAN_x4plus_anime_6B.pth
+
+          [ -f realesr-general-x4v3.pth ] || \
+            wget -q --show-progress \
+              https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth \
+              -O realesr-general-x4v3.pth
+
+          [ -f RealESRGAN_x4plus.pth ] || \
+            wget -q --show-progress \
+              https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth \
+              -O RealESRGAN_x4plus.pth
+
+          # ===== Colorizer files (OpenCV DNN) =====
+          [ -f colorization_deploy_v2.prototxt ] || \
+            wget -q --show-progress \
+              https://raw.githubusercontent.com/richzhang/colorization/caffe/colorization/models/colorization_deploy_v2.prototxt \
+              -O colorization_deploy_v2.prototxt
+
+          [ -f pts_in_hull.npy ] || \
+            wget -q --show-progress \
+              https://raw.githubusercontent.com/richzhang/colorization/caffe/colorization/resources/pts_in_hull.npy \
+              -O pts_in_hull.npy
+
+          [ -f colorization_release_v2.caffemodel ] || \
+            wget -q --show-progress \
+              https://eecs.berkeley.edu/~rich.zhang/projects/2016_colorization/files/demo_v2/colorization_release_v2.caffemodel \
+              -O colorization_release_v2.caffemodel || \
+            wget -q --show-progress \
+              https://github.com/ManishChauhan04/Colorization/raw/main/colorization_release_v2.caffemodel \
+              -O colorization_release_v2.caffemodel
+
+          # ===== Verify all downloads =====
+          echo "=== Downloaded weights ==="
+          ls -lh
+
+          # Quick sanity: fail fast if any critical file is missing
+          for f in realesr-animevideov3.pth RealESRGAN_x4plus_anime_6B.pth \
+                   realesr-general-x4v3.pth RealESRGAN_x4plus.pth; do
+            if [ ! -s "$f" ]; then
+              echo "❌ Missing: $f"
+              exit 1
+            fi
+          done
+          echo "✅ All 4 upscale models present"
 
       - name: Run Telegram bot
         env:
