@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
 """
-Smart Anime/Game Upscaler v8.1 — ROTATION/STRIDE FIX (patched)
+Smart Anime/Game Upscaler v8.1 — ROTATION/STRIDE FIX
 - 🛠 Shear/tilt/black-bands fix: rotation metadata detect + exact raw frame size (-vf scale)
-  PATCH: autorotate ab -noautorotate se explicitly OFF hai, aur rotation khud humara
-  transpose filter apply karta hai (deterministic, ffmpeg-version-independent). Rotation
-  angle detection bhi ab tolerance ke saath hai (-89.999...° bhi 90° maana jayega) —
-  isse purani shear/skew/wrong-aspect-ratio bug fix ho gayi hai.
 - 🧠 Governor v2, 💾 RAM-minimal streaming, 🎌/🎮 models, 🖼 photo, ⬅️➡️ preview,
   📤 retry, ⏰ watchdog, 💓 heartbeat, 📚 archive — sab v8 jaisa intact
 """
@@ -377,7 +373,7 @@ async def btn(client, cq):
         pass
     await cq.answer()
 
-# ================= PROBE (v8.1: rotation-aware, tolerance-based) =================
+# ================= PROBE (v8.1: rotation-aware) =================
 def probe_video(path: Path) -> Dict:
     r = subprocess.run(["ffprobe", "-v", "error", "-print_format", "json",
                         "-show_streams", "-show_format", str(path)],
@@ -389,11 +385,8 @@ def probe_video(path: Path) -> Dict:
     dur = float(vid.get("duration") or data.get("format", {}).get("duration") or 0)
     frames = int(float(vid.get("nb_frames") or max(1, dur * fps)))
 
-    # 🛠 PATCH: rotation metadata detect karo → coded (raw) dims + normalized theta
-    # dono nikalo. Float rotation kabhi -89.999...° hoti hai (matrix se aayi), isliye
-    # ab nearest-90 round karke tolerance ke saath detect karte hain — purana strict
-    # `abs(rot) in (90.0, 270.0)` check aksar miss kar deta tha.
-    cw = int(vid["width"]); ch = int(vid["height"])
+    # 🛠 v8.1 FIX: rotation metadata detect karo → effective dims use karo
+    w = int(vid["width"]); h = int(vid["height"])
     rot = 0.0
     for sd in (vid.get("side_data_list") or []):
         if isinstance(sd, dict) and "rotation" in sd:
@@ -402,26 +395,18 @@ def probe_video(path: Path) -> Dict:
     if rot == 0.0:
         try: rot = float((vid.get("tags") or {}).get("rotate", 0) or 0)
         except Exception: rot = 0.0
-    # ffmpeg ke apne internal autorotate jaisa hi normalization (theta = -rot, [0,360) me)
-    theta = int(round((-rot) / 90.0) * 90) % 360
-    w, h = (ch, cw) if theta in (90, 270) else (cw, ch)
-    if theta:
-        log.info("🔄 Rotation %.1f° (theta=%d°) detected — coded %sx%s → effective %sx%s",
-                 rot, theta, cw, ch, w, h)
+    if abs(rot) in (90.0, 270.0):
+        w, h = h, w
+        log.info("🔄 Rotation %.0f° detected — effective dims %sx%s", rot, w, h)
 
-    return {"width": w, "height": h, "coded_width": cw, "coded_height": ch, "rot_theta": theta,
-            "fps": fps, "duration": dur, "frames": frames,
+    return {"width": w, "height": h, "fps": fps,
+            "duration": dur, "frames": frames,
             "has_audio": any(s.get("codec_type") == "audio" for s in data["streams"])}
 
 # ================= PIPELINE (v8.1: exact frame size guarantee) =================
 def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Governor,
                  cancel: threading.Event, is_gif: bool, prev_dir: Path):
     w, h, fps = info["width"], info["height"], info["fps"]
-    theta = info.get("rot_theta", 0)
-    # 🛠 PATCH: humara khud ka deterministic rotation filter — ffmpeg ke built-in
-    # autorotate (version/build ke hisaab se alag behave karta hai) pe depend nahi
-    # karta. -noautorotate se autorotate OFF, phir yeh transpose apply hota hai.
-    rot_filter = {90: "transpose=1", 270: "transpose=2", 180: "hflip,vflip"}.get(theta)
     ow, oh = job["ow"], job["oh"]
     ff = PRESETS[settings["preset"]]
     enc_threads = 1 if gov.current[0] >= 2 else 2
@@ -440,21 +425,19 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Gover
 
     def reader():
         fb = w * h * 3
-        log.info("📐 Reader frame size: %sx%s (%d bytes/frame) | rotate theta=%d°", w, h, fb, theta)
+        log.info("📐 Reader frame size: %sx%s (%d bytes/frame)", w, h, fb)
         try:
-            # 🛠 PATCH: -noautorotate + humara apna transpose (agar zaroorat ho) +
-            # exact-size scale (ab yeh sirf safety-net hai, real distortion nahi karta
-            # kyunki transpose ke baad dims already w x h hi hote hain).
-            vf_chain = ([rot_filter] if rot_filter else []) + [f"scale={w}:{h}:flags=fast_bilinear"]
             dec = subprocess.Popen(
-                ["ffmpeg", "-v", "error", "-noautorotate", "-i", str(in_path), "-vsync", "0",
-                 "-vf", ",".join(vf_chain),
+                ["ffmpeg", "-v", "error", "-i", str(in_path), "-vsync", "0",
+                 # 🛠 v8.1 FIX: exact output size force karo → stride mismatch/shear impossible
+                 "-vf", f"scale={w}:{h}:flags=fast_bilinear",
                  "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"],
                 stdout=subprocess.PIPE)
             n = 0
             while not cancel.is_set():
                 raw = dec.stdout.read(fb)
                 if not raw or len(raw) != fb: break
+                if is_gif and n >= MAX_GIF_FRAMES: break
                 in_q.put(np.frombuffer(raw, np.uint8).reshape(h, w, 3)); n += 1
             dec.wait()
         finally:
