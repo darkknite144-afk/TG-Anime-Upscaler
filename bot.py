@@ -5,6 +5,8 @@ FIXES:
   - ✅ Button submenu overwrite bug (panel_mode tracker)
   - ✅ Black lines / rotation distortion (explicit transpose)
   - ✅ Legacy archive migration (anime → anime_video)
+  - ✅ FFMPEG pipe dimension matching (black box fix)
+  - ✅ Real-ESRGAN tile pre_pad fix (grid lines fix)
 """
 import asyncio, gc, json, logging, math, os, queue, random, shutil, subprocess, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor
@@ -318,8 +320,9 @@ def get_ups(key: str, tile: int) -> RealESRGANer:
         log.info("Loading %s (RRDBNet, tile=%s)...", m["file"], tile)
         nb = 6 if "anime_6B" in m["file"] else 23
         model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=nb, num_grow_ch=32, scale=4)
+        # FIX: pre_pad=10 avoids black tile grids at borders
         ups = RealESRGANer(scale=4, model_path=str(path), model=model, tile=tile,
-                           tile_pad=16, pre_pad=0, half=False, device=torch.device("cpu"))
+                           tile_pad=16, pre_pad=10, half=False, device=torch.device("cpu"))
         _ups_cache[k] = ups; return ups
 
     nconv = _detect_srvgg_num_conv(path)
@@ -329,8 +332,9 @@ def get_ups(key: str, tile: int) -> RealESRGANer:
         try:
             model = SRVGGNetCompact(num_in_ch=3, num_out_ch=3, num_feat=64,
                                     num_conv=nc, upscale=4, act_type="prelu")
+            # FIX: pre_pad=10 avoids black tile grids at borders
             ups = RealESRGANer(scale=4, model_path=str(path), model=model, tile=tile,
-                               tile_pad=16, pre_pad=0, half=False, device=torch.device("cpu"))
+                               tile_pad=16, pre_pad=10, half=False, device=torch.device("cpu"))
             if nc != nconv: log.info("✅ Fallback num_conv=%s worked!", nc)
             _ups_cache[k] = ups; return ups
         except Exception as e:
@@ -362,7 +366,7 @@ def _load_ddcolor(mode: str):
                         super().__init__(**kwargs)
             except Exception: DDColorHF = DDColor
             log.info("🎨 Loading DDColor %s ...", mode)
-            model = DDColorHF.from_pretrained(str(path))
+            model = DDColorHF.frompretrained(str(path))
             model.eval()
             _ddcolor_cache[mode] = model
             log.info("✅ DDColor %s ready", mode)
@@ -788,6 +792,11 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Gover
         out, _ = ups.enhance(img, outscale=settings["scale"])
         if colorize_mode != "off":
             out = colorize_frame(out, colorize_mode)
+            
+        # FIX: Ensure exact dimension match to avoid FFMPEG pipe corruption / black boxes
+        if out.shape[1] != ow or out.shape[0] != oh:
+            out = cv2.resize(out, (ow, oh), interpolation=cv2.INTER_LANCZOS4)
+            
         dt = time.time() - t0
         with stats_lock:
             first = (stats["done"] == 0)
