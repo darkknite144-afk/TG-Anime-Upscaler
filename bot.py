@@ -35,7 +35,8 @@ import cv2
 import numpy as np
 import requests
 import torch
-from pyrogram import Client, filters
+
+from pyrogram import Client, filters, idle
 from pyrogram.errors import FloodWait
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from realesrgan import RealESRGANer
@@ -58,7 +59,7 @@ API_ID = int(os.getenv("API_ID", "0") or 0)
 API_HASH = (os.getenv("API_HASH", "") or "").strip()
 BOT_TOKEN = (os.getenv("BOT_TOKEN", "") or "").strip()
 
-# Bulletproof Owner ID check (Handles both String & Integer securely)
+# Bulletproof Owner ID check
 _raw_owner = (os.getenv("OWNER_CHAT_ID", "") or "").strip().strip("'").strip('"')
 OWNER_CHAT_ID = _raw_owner
 try:
@@ -572,6 +573,13 @@ async def send_with_retry(fn, desc: str):
             if attempt == 3: raise
             await asyncio.sleep(5 * attempt)
 
+# ================= LOG INCOMING MESSAGES =================
+@app.on_message(filters.all & filters.private, group=-1)
+async def debug_logger(client, message: Message):
+    kind = "text" if message.text else "media" if (message.video or message.photo or message.animation or message.document) else "other"
+    log.info("INCOMING MESSAGE | chat_id=%s | kind=%s | content=%r", 
+             message.chat.id, kind, (message.text or "")[:50])
+
 # ================= JOB =================
 busy_lock = asyncio.Lock()
 
@@ -757,6 +765,8 @@ async def forward_id_handler(client, message: Message):
             f"📌 Is channel ki exact ID: `{src.id}`\n"
             "1) GitHub secret ARCHIVE_CHANNEL_ID me yahi paste karo\n"
             "2) Workflow dobara run karo")
+    else:
+        await message.reply_text("❌ Forward ki hui post se channel ID nahi mili. Ya to channel private hai ya identity hide hai. Seedha GitHub secrets me `-1004383888217` daal do.")
 
 @app.on_message(filters.text & filters.private & ~filters.command(["start", "stats", "cancel"]))
 async def text_handler(client, message: Message):
@@ -768,7 +778,7 @@ async def text_handler(client, message: Message):
         await message.reply_text(f"🛡 RAM free: {mem_avail_gb():.1f}GB • load: {load1():.1f} • cores: {CPU_THREADS}")
     else:
         await message.reply_text("🤖 v8: video/GIF/photo bhejo. Panel se model 🎌/🎮, scale, preset, audio. "
-                                 "/stats dekho, /cancel se roko. Channel post forward karo → ID milegi.")
+                                 "/stats dekho, /cancel se roko.")
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client, message: Message):
@@ -780,14 +790,14 @@ async def start_handler(client, message: Message):
     except Exception: pass
     _panel = None
     await ensure_panel(message.chat.id)
-    await message.reply_text(f"ℹ️ Tumhara chat ID: `{message.chat.id}` (OWNER_CHAT_ID secret verify karne ke liye)")
+    await message.reply_text(f"ℹ️ Tumhara chat ID: `{message.chat.id}`")
 
 # ================= BOOT =================
 def notify_owner_startup():
     try:
         r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                           json={"chat_id": OWNER_CHAT_ID_INT or OWNER_CHAT_ID,
-                                "text": "✅ Upscaler v8 online!\n🧠 Governor +  photo +  retry +  self-test.\nPanel se control karo."},
+                                "text": "✅ Upscaler v8 online!\n🧠 Governor + photo + retry + self-test.\nPanel se control karo."},
                           timeout=15)
         log.info("Startup ping: %s", r.status_code)
     except Exception as e:
@@ -819,21 +829,17 @@ async def _main():
         await app.start()
         log.info("🔌 Client started — ab boot...")
         await _boot()
-        
-        # 🛑 GITHUB ACTIONS FIX:
-        # GitHub ki machine par background terminal nahi hota, isliye purana idle()
-        # apne aap exit ho jata tha. Ye infinite loop bot ko hamesha zinda rakhega.
-        while True:
-            await asyncio.sleep(3600)
-            
+        await idle()
     finally:
         try: await app.stop()
         except Exception: pass
 
 if __name__ == "__main__":
     try:
-        r = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=True", timeout=15)
-        log.info("🧹 Webhook: %s", r.text[:120])
+        # Note: drop_pending_updates=True hata diya gaya hai taki messages delete na hon
+        r = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook", timeout=15)
+        log.info("🧹 Webhook check: %s", r.text[:120])
     except Exception as e:
-        log.warning("Webhook delete fail: %s", e)
-    asyncio.run(_main())
+        log.warning("Webhook fail: %s", e)
+    
+    app.run(_main())
