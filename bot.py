@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Smart Anime/Game/Real Upscaler v10.3
+Smart Anime/Game/Real Upscaler v10.4
 FIXES:
   - ✅ Button submenu overwrite bug (panel_mode tracker)
   - ✅ Black lines / rotation distortion (explicit transpose)
   - ✅ Legacy archive migration (anime → anime_video)
-  - ✅ FFMPEG pipe dimension matching (black box fix)
   - ✅ 1-second strict refresh rate (no panel spamming)
   - ✅ Removed extra messages during processing
-  - ✅ PyTorch C-Contiguous memory fix (Permanent garbled/black frame fix)
+  - ✅ Strip Metadata (-map_metadata -1) to fix mobile rotation squishing
+  - ✅ PyTorch C-Contiguous memory fix (Permanent garbled frame fix)
   - ✅ Strict OS pipe chunk reading (Fixes shifted frame artifacts)
 """
 import asyncio, gc, json, logging, math, os, queue, random, shutil, subprocess, sys, threading, time
@@ -488,7 +488,7 @@ SUBMENU_BUTTONS = {"mmenu", "qmenu", "pmenu", "amenu", "colormenu", "cmenu"}
 VALUE_BUTTONS   = {"m", "q", "p", "a", "col", "c", "back"}
 
 HELP_TEXT = (
-    "🧭 **Help (v10.3)**\n\n"
+    "🧭 **Help (v10.4)**\n\n"
     "🎥 Video / 🎞 GIF / 🖼 Photo bhejo → upscale\n"
     "🎛 **Models** → Anime Video / Anime Image / Game / Real\n"
     "🎨 **Color** → OFF / Fast (tiny) / 💎 High (DDColor)\n"
@@ -500,7 +500,7 @@ HELP_TEXT = (
 
 def panel_text() -> str:
     m = MODELS.get(settings["model"], MODELS["anime_video"])
-    lines = [_pad(f"{EMO.face()}  UPSCALER v10.3"), "─" * PW,
+    lines = [_pad(f"{EMO.face()}  UPSCALER v10.4"), "─" * PW,
              _pad(f"🧠 {CPU_THREADS}c • 🛡 {mem_avail_gb():.1f}GB free • load {load1():.1f}"),
              _pad(f"{m['label']} {fmt_scale(settings['scale'])}× "
                   f"{settings['preset'][:4]} 🔊{settings['audio'][:4]}"),
@@ -562,12 +562,11 @@ async def refresh_panel():
     try:
         await _panel.edit_text(panel_text(), reply_markup=panel_kb())
     except FloodWait as e:
-        # Spam prevention: Telegram bola slow down, toh bot utne seconds ruk jayega
+        # Spam prevention check
         await asyncio.sleep(e.value)
     except Exception as e:
         err = str(e).lower()
         if "not modified" in err: return
-        # Sirf tab naya panel bhejega jab purana sach mein delete ho gaya ho
         if "message_id_invalid" in err or "message to edit not found" in err or "deleted" in err:
             log.warning("Panel msg lost. Will re-send.")
             _panel = None
@@ -581,7 +580,6 @@ async def btn(client, cq):
     parts = cq.data[2:].split(":"); a = parts[0]; v = parts[1] if len(parts) > 1 else ""
     kb = None
 
-    # Submenu openers → lock refresh
     if a in SUBMENU_BUTTONS:
         _panel_mode = "submenu"
         if a == "mmenu": kb = models_kb(); await cq.answer("🎽 Model chuno")
@@ -590,8 +588,6 @@ async def btn(client, cq):
         elif a == "amenu": kb = a_kb(); await cq.answer("🔊 Audio chuno")
         elif a == "colormenu": kb = color_kb(); await cq.answer("🎨 Colorize mode")
         elif a == "cmenu": kb = core_kb(); await cq.answer("⚙️ Cores chuno")
-
-    # Value selections → back to main
     elif a == "back":
         _panel_mode = "main"; kb = panel_kb(); await cq.answer("🔙")
     elif a == "m":
@@ -621,7 +617,7 @@ async def btn(client, cq):
         if v in ("off", "fast", "high"):
             settings["colorize_mode"] = v
             if archive: archive.state["colorize_mode"] = v
-            _panel_mode = "submenu"; kb = color_kb()   # stay in color menu after pick
+            _panel_mode = "submenu"; kb = color_kb() 
             await cq.answer(f"🎨 {v}")
         else:
             kb = color_kb(); await cq.answer()
@@ -633,8 +629,6 @@ async def btn(client, cq):
             await cq.answer(f"⚙️ {lbl}")
         else:
             kb = panel_kb(); await cq.answer()
-
-    # Action buttons (no keyboard change)
     elif a == "go":
         await cq.answer("▶️")
         await cq.message.reply_text(f"▶️ Bas video/GIF/photo bhejo — {_model_label()} upscale!")
@@ -722,7 +716,6 @@ def probe_video(path: Path) -> Dict:
         try: rot = float((vid.get("tags") or {}).get("rotate", 0) or 0)
         except Exception: rot = 0.0
 
-    # Effective display dims after rotation
     if abs(rot) in (90.0, 270.0):
         w, h = raw_h, raw_w
         log.info("🔄 Rotation %.0f° — display %sx%s (raw %sx%s)", rot, w, h, raw_w, raw_h)
@@ -733,12 +726,10 @@ def probe_video(path: Path) -> Dict:
             "rotation": rot, "fps": fps, "duration": dur, "frames": frames,
             "has_audio": any(s.get("codec_type") == "audio" for s in data["streams"])}
 
-# ================= PIPELINE (rotation-safe & strict pipe) =================
+# ================= PIPELINE (STRICT Memory Alignment + Metadata Strip) =================
 def _build_vf_chain(w: int, h: int, rot: float) -> str:
-    """Build ffmpeg filter: transpose (if needed) + exact scale + format."""
     parts = []
     if abs(rot) in (90.0, 270.0):
-        # transpose=1 → 90° clockwise; transpose=2 → 90° counter-clockwise
         t = "1" if rot > 0 else "2"
         parts.append(f"transpose={t}")
     parts.append(f"scale={w}:{h}:flags=fast_bilinear")
@@ -746,7 +737,6 @@ def _build_vf_chain(w: int, h: int, rot: float) -> str:
     return ",".join(parts)
 
 def read_exact(pipe, size):
-    """Ensure we read exactly 'size' bytes to prevent FFMPEG pipe shifting!"""
     buf = bytearray()
     while len(buf) < size:
         chunk = pipe.read(size - len(buf))
@@ -792,7 +782,7 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Gover
                 stdout=subprocess.PIPE)
             n = 0
             while not cancel.is_set():
-                # Strict read ensures FFMPEG doesn't fragment bytes and corrupt frames
+                # Strict bytes reading (Fixes shifted/garbled buffer issue)
                 raw = read_exact(dec.stdout, fb)
                 if not raw or len(raw) != fb:
                     break
@@ -808,13 +798,18 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Gover
         if colorize_mode != "off":
             out = colorize_frame(out, colorize_mode)
             
-        # FIX 1: Exact dimension match
+        # FIX 1: Enforce EXACT 3-channel structure (some ESRGAN engines output 4 channels)
+        if len(out.shape) == 3 and out.shape[2] == 4:
+            out = out[:, :, :3]
+        elif len(out.shape) == 2:
+            out = cv2.cvtColor(out, cv2.COLOR_GRAY2BGR)
+            
+        # FIX 2: Exact matching of required FFMPEG boundaries
         if out.shape[1] != ow or out.shape[0] != oh:
             out = cv2.resize(out, (ow, oh), interpolation=cv2.INTER_LANCZOS4)
             
-        # FIX 2 (CRITICAL): PyTorch tensor manipulation causes F-contiguous strides.
-        # This scrambles the bytes when sent to FFMPEG, causing garbled/black boxes!
-        # We MUST force it to C-contiguous memory before saving it to a raw pipe.
+        # FIX 3 (CRITICAL): Absolutely guarantees the bytes are packed in C-contiguous memory!
+        # If memory is disjointed, ffmpeg will slant and garble every frame in the pipe.
         out = np.ascontiguousarray(out, dtype=np.uint8)
             
         dt = time.time() - t0
@@ -832,17 +827,27 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Gover
         nonlocal enc
         cmd = ["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "bgr24",
                "-s", f"{ow}x{oh}", "-r", f"{(fps_g if is_gif else fps):.6f}", "-i", "pipe:0"]
+        
         if not is_gif:
             cmd += ["-i", str(in_path), "-map", "0:v:0"]
             if info["has_audio"]:
                 if settings["audio"] == "keep": cmd += ["-map", "1:a?", "-c:a", "copy"]
                 elif settings["audio"] == "compress": cmd += ["-map", "1:a?", "-c:a", "aac", "-b:a", "128k"]
+            
+            # FIX 4 (CRITICAL for mobile videos): Strip all metadata!
+            # If the original file had a corrupted rotation tag, Ffmpeg would copy it here and
+            # force players to squish and box the video entirely.
+            cmd += ["-map_metadata", "-1"]
+            
         cmd += ["-c:v", "libx264", "-preset", ff["preset"], "-crf", ff["crf"],
                 "-threads", str(enc_threads), "-pix_fmt", "yuv420p"]
+                
         if not is_gif and info["has_audio"] and settings["audio"] != "remove":
             cmd += ["-shortest"]
+            
         cmd += ["-movflags", "+faststart", str(out_path)]
         enc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+        
         i = 0
         while True:
             with futs_cond:
@@ -877,11 +882,13 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Gover
                         max(1, 600 // max(1, len(outs))))
             job["loops"] = loops
             job["stage"] = "📦"
-            enc = subprocess.Popen(["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "bgr24",
-                                    "-s", f"{ow}x{oh}", "-r", f"{fps_g:.6f}", "-i", "pipe:0",
-                                    "-c:v", "libx264", "-preset", ff["preset"], "-crf", ff["crf"],
-                                    "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(out_path)],
-                                   stdin=subprocess.PIPE)
+            
+            cmd_gif = ["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "bgr24",
+                       "-s", f"{ow}x{oh}", "-r", f"{fps_g:.6f}", "-i", "pipe:0",
+                       "-c:v", "libx264", "-preset", ff["preset"], "-crf", ff["crf"],
+                       "-pix_fmt", "yuv420p", "-map_metadata", "-1", "-movflags", "+faststart", str(out_path)]
+            
+            enc = subprocess.Popen(cmd_gif, stdin=subprocess.PIPE)
             for _ in range(loops):
                 for arr in outs: enc.stdin.write(arr.tobytes())
             enc.stdin.close(); enc.wait()
@@ -948,13 +955,11 @@ async def _refresh_loop():
     owner = _owner_cid()
     while True:
         try:
-            # Determine mode from current state
             if job_state.get("active"):
                 _panel_mode = "job"
             elif _panel_mode == "job":
-                _panel_mode = "main"   # job just finished
+                _panel_mode = "main"
 
-            # Emoji face state
             if job_state.get("active") and current_job:
                 st = current_job.get("stage", "")
                 if st.startswith("📥"): EMO.set("download")
@@ -966,11 +971,9 @@ async def _refresh_loop():
             else:
                 EMO.set("idle")
 
-            # Refresh ONLY when safe
             if _panel is None and owner:
                 await ensure_panel(owner)
             elif _panel_mode in ("main", "job"):
-                # Refresh main panel or job progress — BUT NOT when user is in submenu
                 await refresh_panel()
 
             hb += 1
@@ -980,7 +983,7 @@ async def _refresh_loop():
         except Exception as e:
             log.warning("refresh_loop err: %s", e)
         
-        # Ab panel strictly har 1 second mein refresh hoga
+        # Ab panel 1 second ki exact delay ke saath hi update hoga (spam limit bypass)
         await asyncio.sleep(1.0)
 
 @app.on_message((filters.video | filters.document | filters.animation) & filters.private)
@@ -1037,7 +1040,7 @@ async def media_handler(client, message: Message):
         out_path = OUTPUT_DIR / f"{Path(filename).stem}_up_{message.id}.mp4"
         t0 = time.time()
         
-        # NOTE: "Process shuru..." aur baki unnecessary spam hata diye gaye hain
+        # "Process shuru" message completely REMOVED -> directly updating the panel message!
         await asyncio.to_thread(run_pipeline, current_job, in_path, out_path, info,
                                 ups, gov, cancel_event, is_gif, job_dir)
         current_job["stage"] = "⬆️"
@@ -1055,6 +1058,7 @@ async def media_handler(client, message: Message):
         def ul_cb(cur, tot, *a):
             current_job["stage"] = f"⬆️ {cur/1048576:.0f}/{tot/1048576:.0f}MB"
 
+        # Direct final video send
         if is_gif:
             await send_with_retry(lambda: app.send_animation(
                 message.chat.id, str(out_path), caption=cap, progress=ul_cb), "animation")
@@ -1196,7 +1200,7 @@ async def text_handler(client, message: Message):
     elif any(k in t for k in ["thank", "shukriya", "thx"]):
         await message.reply_text("Apna kaam hai boss!")
     else:
-        await message.reply_text("🤖 v10.3: /panel se panel; Models + Color buttons se tune.")
+        await message.reply_text("🤖 v10.4: /panel se panel; Models + Color buttons se tune.")
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client, message: Message):
@@ -1204,14 +1208,14 @@ async def start_handler(client, message: Message):
         await message.reply_text("❌ Private bot."); return
     EMO.set("start")
     await send_panel(message.chat.id)
-    await message.reply_text(f"✅ **v10.3 online!** Chat ID: `{message.chat.id}`")
+    await message.reply_text(f"✅ **v10.4 online!** Chat ID: `{message.chat.id}`")
 
 # ================= BOOT =================
 def notify_owner_startup():
     try:
         r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                           json={"chat_id": OWNER_CHAT_ID_INT or OWNER_CHAT_ID,
-                                "text": "✅ Upscaler v10.3 online!\n🎛 Panel bhej raha hoon..."},
+                                "text": "✅ Upscaler v10.4 online!\n🎛 Panel bhej raha hoon..."},
                           timeout=15)
         log.info("Startup ping: %s", r.status_code)
     except Exception as e:
@@ -1244,7 +1248,7 @@ async def _boot():
         except Exception as e: log.error("Panel send fail: %s", e)
 
     asyncio.create_task(_refresh_loop())
-    log.info("🚀 v10.3 ready (cores=%s)", CPU_THREADS)
+    log.info("🚀 v10.4 ready (cores=%s)", CPU_THREADS)
 
 async def _main():
     try:
