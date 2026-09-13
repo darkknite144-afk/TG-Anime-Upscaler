@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """
-Smart Anime/Game Upscaler v8
-- 🧠 Governor v2: CPU-load + RAM EMA se khud upgrade/downgrade decisions
-- 💾 RAM-minimal streaming (decode q=2, backlog=2, frame encode hote hi free)
-- 🎌 Anime / 🎮 Game Fast / 🎮 Game HQ models
-- 🖼 Photo upscale + ⬅️➡️ Before/After preview
-- 📤 Upload auto-retry (3 attempts, FloodWait-safe)
-- ⏰ Job watchdog + 💓 heartbeat +  archive self-test + /stats
-- 📚 Channel archive (settings/history/videos) + panel UI
-- v8 fixes: idle crash, channel-id normalize, forward-ID, unbuffered logs
+Smart Anime/Game Upscaler v11 — SMOOTH MOTION EDITION
+- 🎭 EmoteEngine v2: 20 frames/mood, 25fps time-based animation (Telegram-safe snapshots)
+- ⛔ Job ke dauran sirf Cancel button; complete hote hi full panel
+- 🤖 AI Optimizer v3: named profiles + learned-best memory (archive me save)
+- 🎬 Braille spinner + playhead progress bar + animated faces during processing
+- 🧠 Governor: throughput-first (speed badhao), RAM/CPU pressure par hi downgrade
+- 💾 RAM-minimal pipeline + 📚 archive + 📤 retry + 🖼 photo + preview (sab working intact)
 """
 import asyncio
 import gc
@@ -17,6 +15,7 @@ import logging
 import math
 import os
 import queue
+import random
 import shutil
 import subprocess
 import sys
@@ -27,7 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 try:
-    sys.stdout.reconfigure(line_buffering=True)   # Actions me logs turant dikhein
+    sys.stdout.reconfigure(line_buffering=True)
 except Exception:
     pass
 
@@ -35,7 +34,6 @@ import cv2
 import numpy as np
 import requests
 import torch
-
 from pyrogram import Client, filters, idle
 from pyrogram.errors import FloodWait
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
@@ -58,8 +56,6 @@ log = logging.getLogger("anime-upscaler")
 API_ID = int(os.getenv("API_ID", "0") or 0)
 API_HASH = (os.getenv("API_HASH", "") or "").strip()
 BOT_TOKEN = (os.getenv("BOT_TOKEN", "") or "").strip()
-
-# Bulletproof Owner ID check
 _raw_owner = (os.getenv("OWNER_CHAT_ID", "") or "").strip().strip("'").strip('"')
 OWNER_CHAT_ID = _raw_owner
 try:
@@ -103,6 +99,57 @@ job_state = {"active": False}
 current_job: Optional[Dict[str, Any]] = None
 cancel_event: Optional[threading.Event] = None
 
+# ================= EMOTE ENGINE v2 (20 frames, 25fps) =================
+FACE_FPS = 25
+FACE_FRAMES = 20
+
+def _mk(eyes, mouths, hands, tail=""):
+    out = []
+    for i in range(FACE_FRAMES):
+        e = eyes[i % len(eyes)]
+        m = mouths[(i // 2) % len(mouths)]
+        h = hands[(i // 3) % len(hands)]
+        out.append(f"({e}{m}{e}){h}{tail}")
+    return out
+
+FACES = {
+    "idle":     _mk(["-", "¬", "˘", "◡"], ["ᴗ", "", "▽"], [" …", " zZ", " ♪", " ~~"]),
+    "work":     _mk(["•", "◕", "◔", "◑"], ["_", "‿", ""], ["っ⚡", "っ✦", "っ✧", "っ⚙️", "っ●"]),
+    "think":    _mk(["◔", "", "◑", "•"], ["_", "…", "_"], [" 🤔", " ✍️", " 💭", " 🔍"]),
+    "happy":    _mk(["◕", "＾", "✧", ""], ["‿", "▽", "◡"], ["ﾉ★", "ﾉ✧", "ﾉ*:･", " ﾉ♪"]),
+    "error":    _mk(["×", "⊙", "╥", ""], ["_", "…", "﹏"], [" ;", " !", " …"]),
+    "love":     _mk(["♥", "♡", "◕"], ["‿", "ω", "◡"], [" ﾉ♥", " ♡", " "]),
+    "start":    _mk(["ò", "◉", "ᐛ", ""], ["_", "‿", "ω"], ["و✦", "و⚡", "و✧"]),
+    "upload":   _mk(["⇀", "", "‿"], ["_", "‿"], ["📤", "☁️", "🚀"]),
+    "download": _mk(["⇂", "_", "◡"], ["_", "‿"], ["", "🌀", "✦"]),
+    "wow":      _mk(["✧", "", "✦"], ["ω", "▽", "‿"], [" !", " ✨", " ★"]),
+}
+MOOD_ORDER = ["idle", "happy", "wow", "love", "think", "work", "start"]
+BRAILLE = "⠋⠹⠼⠦⠧⠇⠏"
+
+class EmoteEngine:
+    """25fps time-based frame engine — har call par us moment ka sahi frame."""
+    def __init__(self):
+        self.state = "idle"; self.t0 = time.time()
+    def set(self, state: str):
+        if state != self.state:
+            self.state = state; self.t0 = time.time()
+    def frame_idx(self) -> int:
+        return int((time.time() - self.t0) * FACE_FPS) % FACE_FRAMES
+    def face(self) -> str:
+        return FACES.get(self.state, FACES["idle"])[self.frame_idx()]
+    def one(self, state: str) -> str:
+        return random.choice(FACES.get(state, FACES["idle"]))
+    def spin(self) -> str:
+        return BRAILLE[self.frame_idx() % len(BRAILLE)]
+
+EMO = EmoteEngine()
+
+def playbar(pct: float, n: int = 12) -> str:
+    f = int(n * min(100, max(0, pct)) / 100)
+    head = "▶" if 0 <= f < n else ""
+    return "▰" * f + head + "▱" * max(0, n - f - (1 if head else 0))
+
 # ================= SYSTEM =================
 def mem_avail_gb() -> float:
     try:
@@ -126,58 +173,73 @@ def fmt_time(s: float) -> str:
 
 def fmt_scale(s: float) -> str: return f"{s:g}"
 
-def bar(pct: float, n: int = 8) -> str:
-    f = int(n * min(100, max(0, pct)) / 100)
-    return "▰" * f + "▱" * (n - f)
-
-# ================= GOVERNOR v2 =================
-CONFIGS = [(1, 4), (2, 2), (2, 3), (3, 1), (4, 1)]
-DOWNGRADE = {(4, 1): (3, 1), (3, 1): (2, 2), (2, 3): (2, 2), (2, 2): (1, 2),
-             (1, 4): (1, 2), (1, 2): (1, 1), (1, 1): (1, 1)}
-PROBE, EXPLOIT = 6, 12
+# ================= AI OPTIMIZER v3 (named profiles + memory) =================
+PROFILES = [
+    ("solo", 1, 4, "Solo Turbo", "1 frame × 4 threads"),
+    ("duo2", 2, 2, "Duo Balanced", "2 frames × 2 threads"),
+    ("duo3", 2, 3, "Duo Wide", "2 frames × 3 threads"),
+    ("trio", 3, 1, "Trio Fast", "3 frames × 1 thread"),
+    ("quad", 4, 1, "Quad Max", "4 frames × 1 thread"),
+]
+P_BY_KEY = {p[0]: p for p in PROFILES}
+DOWN_CHAIN = {"quad": "trio", "trio": "duo2", "duo3": "duo2", "duo2": "solo", "solo": "solo"}
+PROBE, EXPLOIT = 4, 10
 
 class Governor:
+    """Throughput-first: jaldi frames nikalo. Downgrade sirf RAM/CPU pressure par."""
     def __init__(self, out_px: int):
         self.fp = out_px * 512 / 1e9
-        self.ema = {c: 0.0 for c in CONFIGS}
-        self.cnt = {c: 0 for c in CONFIGS}
-        start = (2, 2) if self._ram_ok(2) else ((1, 2) if self._ram_ok(1) else (1, 1))
-        self.current = start
+        self.bucket = "sd" if out_px < 1_500_000 else ("hd" if out_px < 3_000_000 else "uhd")
+        self.ema = {k: 0.0 for k in P_BY_KEY}
+        self.cnt = {k: 0 for k in P_BY_KEY}
+        learned = (archive.state.get("ai_best") or {}).get(self.bucket) if archive else None
+        if learned in P_BY_KEY and self._ram_ok(P_BY_KEY[learned][1]):
+            self.key = learned
+            log.info("🤖 Learned best use kar raha hoon: %s (%s)", self.key, self.label())
+        else:
+            self.key = "duo2" if self._ram_ok(2) else "solo"
+        self.best_key = self.key
         self.probe_left, self.exploit = PROBE, 0
         self.load_ema = load1(); self.ram_ema = mem_avail_gb()
-        self.press = 0; self.idle = 0; self.safe = False
+        self.press = 0; self.idle_n = 0; self.safe = False
         self.lock = threading.Lock()
         self.apply()
-        log.info("🧠 Governor v2 %s | fp %.2fGB/fr | RAM %.1fGB | load %.1f",
-                 self.current, self.fp, self.ram_ema, self.load_ema)
+        log.info("🧠 Governor v3 %s | fp %.2fGB/fr | RAM %.1fGB | load %.1f",
+                 self.label(), self.fp, self.ram_ema, self.load_ema)
 
-    def _ram_ok(self, w: int) -> bool:
-        return w * self.fp <= max(1.0, mem_avail_gb() * 0.7)
+    def _ram_ok(self, workers: int) -> bool:
+        return workers * self.fp <= max(1.0, mem_avail_gb() * 0.7)
+
+    def workers(self) -> int: return P_BY_KEY[self.key][1]
+    def threads(self) -> int: return P_BY_KEY[self.key][2]
+    def label(self) -> str:
+        p = P_BY_KEY[self.key]
+        return f"{p[3]} • {p[4]}"
 
     def apply(self):
-        torch.set_num_threads(self.current[1])
+        torch.set_num_threads(self.threads())
 
-    def thr(self, c) -> float:
-        return c[0] / self.ema[c] if self.ema[c] else 0.0
+    def thr(self, key: str) -> float:
+        e = self.ema.get(key, 0.0)
+        return P_BY_KEY[key][1] / e if e else 0.0
 
-    def on_frame(self, cfg, dt: float, done: int):
+    def on_frame(self, key: str, dt: float, done: int):
         with self.lock:
-            c = tuple(cfg)
-            if c in self.ema:
-                self.ema[c] = dt if self.cnt[c] == 0 else self.ema[c] * 0.7 + dt * 0.3
-                self.cnt[c] += 1
+            if key in self.ema:
+                self.ema[key] = dt if self.cnt[key] == 0 else self.ema[key] * 0.7 + dt * 0.3
+                self.cnt[key] += 1
             self.load_ema = self.load_ema * 0.8 + load1() * 0.2
             self.ram_ema = self.ram_ema * 0.8 + mem_avail_gb() * 0.2
             if done % 20 == 0:
                 gc.collect()
             if self.ram_ema < 1.2 or self.load_ema > CPU_THREADS * 1.5:
-                self.press += 1; self.idle = 0
+                self.press += 1; self.idle_n = 0
                 if self.press >= 2:
                     self.press = 0; self.safe = True
-                    nxt = DOWNGRADE.get(self.current, self.current)
-                    if nxt != self.current:
-                        self.current = nxt; self.apply()
-                        log.warning("🛡 DOWNGRADE -> %s (RAM %.1fGB, load %.1f)", nxt, self.ram_ema, self.load_ema)
+                    nxt = DOWN_CHAIN.get(self.key, self.key)
+                    if nxt != self.key:
+                        self.key = nxt; self.apply()
+                        log.warning("🛡 DOWNGRADE -> %s (RAM %.1fGB, load %.1f)", self.label(), self.ram_ema, self.load_ema)
                     return
             else:
                 self.press = 0
@@ -185,11 +247,11 @@ class Governor:
                     self.safe = False
                     log.info("🛡 safe-mode OFF (RAM %.1fGB)", self.ram_ema)
             if not self.safe and self.load_ema < CPU_THREADS * 0.55 and self.ram_ema > 4.0:
-                self.idle += 1
-                if self.idle >= 4:
-                    self.idle = 0; self._probe(up=True); return
+                self.idle_n += 1
+                if self.idle_n >= 4:
+                    self.idle_n = 0; self._probe(up=True); return
             else:
-                self.idle = 0
+                self.idle_n = 0
             if self.safe: return
             if self.probe_left > 0:
                 self.probe_left -= 1
@@ -204,32 +266,39 @@ class Governor:
 
     def _probe(self, up: bool = False):
         if up:
-            target = next((c for c in CONFIGS if c[0] == self.current[0] + 1 and self._ram_ok(c[0])), None)
+            i = next((n for n, p in enumerate(PROFILES) if p[0] == self.key), 0)
+            target = None
+            for p in PROFILES[i + 1:]:
+                if self._ram_ok(p[1]):
+                    target = p[0]; break
             if target is None:
                 self.probe_left = PROBE; return
         else:
-            cand = [c for c in CONFIGS if self.cnt[c] < 3 and self._ram_ok(c[0])]
+            cand = [p[0] for p in PROFILES if self.cnt[p[0]] < 3 and self._ram_ok(p[1])]
             if not cand:
-                cand = [c for c in CONFIGS if self._ram_ok(c[0])]
+                cand = [p[0] for p in PROFILES if self._ram_ok(p[1])]
             if not cand: return
             target = cand[0]
-        if target != self.current:
-            self.current = target; self.apply()
-            log.info("🤖 AI probe -> %s%s", target, " (UPGRADE)" if up else "")
+        if target != self.key:
+            self.key = target; self.apply()
+            log.info("🤖 AI probe -> %s%s", self.label(), " (UPGRADE)" if up else "")
         self.probe_left = PROBE
 
     def _pick_best(self):
-        tested = [c for c in CONFIGS if self.cnt[c] >= 3 and self._ram_ok(c[0])]
+        tested = [k for k in P_BY_KEY if self.cnt[k] >= 3 and self._ram_ok(P_BY_KEY[k][1])]
         if not tested: return
         b = max(tested, key=self.thr)
-        if b != self.current:
-            self.current = b; self.apply()
-            log.info("🤖 AI best -> %s (%.2f f/s)", b, self.thr(b))
+        if b != self.best_key:
+            self.best_key = b
+            if archive:
+                archive.state.setdefault("ai_best", {})[self.bucket] = b
+            log.info("🤖 AI best -> %s (%.2f f/s) [saved for %s]", P_BY_KEY[b][3], self.thr(b), self.bucket)
+        if b != self.key:
+            self.key = b; self.apply()
 
     def status(self, spf: float) -> str:
-        return (f"🤖 {self.current[0]}W×{self.current[1]}T | {spf:.2f}s/fr | "
-                f"{self.thr(self.current):.2f} f/s | 🛡 RAM {self.ram_ema:.1f}GB | "
-                f"load {self.load_ema:.1f}" + (" | SAFE" if self.safe else ""))
+        return (f"🤖 {self.label()} | {spf:.2f}s/fr | {self.thr(self.key):.2f} f/s | "
+                f"🛡 RAM {self.ram_ema:.1f}GB | load {self.load_ema:.1f}" + (" | SAFE" if self.safe else ""))
 
 # ================= MODELS =================
 _ups_cache: Dict[Any, RealESRGANer] = {}
@@ -258,15 +327,48 @@ app = Client("anime_upscaler_bot", api_id=API_ID, api_hash=API_HASH,
              bot_token=BOT_TOKEN, in_memory=True)
 archive = ChannelArchive(app, (os.getenv("ARCHIVE_CHANNEL_ID", "") or "").strip()) if ChannelArchive else None
 
-# ================= PANEL =================
-_panel: Optional[Message] = None
+async def react(message, emoji: str):
+    try:
+        await app.send_reaction(message.chat.id, message.id, emoji)
+    except Exception:
+        pass
 
-def panel_kb() -> InlineKeyboardMarkup:
+# ================= PANEL v11 =================
+_panel: Optional[Message] = None
+JOB_REFRESH = 1.0
+IDLE_REFRESH = 1.5
+
+HELP_TEXT = (
+    "🧭 **Help & Controls (v11)**\n\n"
+    "🎥 **Video / 🎞 GIF / 🖼 Photo bhejo** → upscale shuru\n\n"
+    "🎛 **Buttons:** model 🎌/🎮, scale 🎯, preset ⚡, audio 🔊, stats 📊, help 🧭, re-learn 🔄\n"
+    "⛔ Job ke dauran sirf Cancel dikhta hai — baaki complete hone par wapas\n\n"
+    "🤖 **AI profiles (speed-first):**\n"
+    + "\n".join(f"• **{p[3]}** — {p[4]}" for p in PROFILES) +
+    "\n\nAI har job me sabse fast profile khud chunta hai aur seekha hua best "
+    "archive me save karta hai → agli job frame-1 se full speed\n"
+    "🎭 Faces 20 frames × 25fps engine se animate hote hain\n"
+    "✍️ Commands: /start /stats /cancel"
+)
+
+def panel_kb(active: bool = False) -> InlineKeyboardMarkup:
+    if active:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("⛔ Cancel Job", callback_data="b:stop")],
+        ])
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(MODELS[settings["model"]]["label"], callback_data="b:mmenu"),
-         InlineKeyboardButton(f"🎯 {fmt_scale(settings['scale'])}×", callback_data="b:qmenu"),
-         InlineKeyboardButton(f"⚡ {settings['preset'].title()}", callback_data="b:pmenu"),
-         InlineKeyboardButton(f"🔊 {settings['audio'].title()}", callback_data="b:amenu")],
+        [InlineKeyboardButton(f"{EMO.face()}", callback_data="b:mood"),
+         InlineKeyboardButton(MODELS[settings["model"]]["label"], callback_data="b:mmenu"),
+         InlineKeyboardButton(f"🎯 {fmt_scale(settings['scale'])}×", callback_data="b:qmenu")],
+        [InlineKeyboardButton(f"⚡ {settings['preset'].title()}", callback_data="b:pmenu"),
+         InlineKeyboardButton(f"🔊 {settings['audio'].title()}", callback_data="b:amenu"),
+         InlineKeyboardButton("📊 Stats", callback_data="b:stats")],
+        [InlineKeyboardButton("▶️ Start Upscale", callback_data="b:go"),
+         InlineKeyboardButton("🧭 Help", callback_data="b:help"),
+         InlineKeyboardButton("🔄 Re-learn AI", callback_data="b:relearn")],
+        [InlineKeyboardButton("🎥 Video", callback_data="b:sendv"),
+         InlineKeyboardButton("🖼 Photo", callback_data="b:sendp"),
+         InlineKeyboardButton("🎞 GIF", callback_data="b:sendg")],
         [InlineKeyboardButton("⛔ Stop", callback_data="b:stop"),
          InlineKeyboardButton("🧹 Clean", callback_data="b:clean")],
     ])
@@ -299,43 +401,91 @@ def a_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔙 Panel", callback_data="b:back")]])
 
 def panel_text() -> str:
-    lines = [f"🎛 **Upscaler v8** • 🧠 {CPU_THREADS} cores • 🛡 {mem_avail_gb():.1f}GB free • load {load1():.1f}",
-             f"Model: {MODELS[settings['model']]['label']} • {fmt_scale(settings['scale'])}× • "
-             f"{settings['preset'].title()} • 🔊 {settings['audio'].title()}", ""]
-    if job_state.get("active") and current_job:
+    active = job_state.get("active") and current_job
+    lines = [f"{EMO.face()}  **UPSCALER v11 • SMOOTH MOTION**",
+             "━━━━━━━━━━━━━━━━━━━━━━",
+             f"🧠 {CPU_THREADS} cores • 🛡 {mem_avail_gb():.1f}GB free • load {load1():.1f}",
+             f"🎽 {MODELS[settings['model']]['label']} • 🎯 {fmt_scale(settings['scale'])}× • "
+             f"⚡ {settings['preset'].title()} • 🔊 {settings['audio'].title()}"]
+    if active:
         j = current_job
         if j.get("total"):
             pct = j["done"] * 100 / j["total"]
-            lines += [f"{j.get('stage', '🎨')} **{j['filename'][:22]}** — {bar(pct)} {pct:.0f}%",
-                      f"   {j['done']}/{j['total']} fr • ⏱ ETA {fmt_time(j.get('eta', 0))}",
-                      "   " + j.get("ai", "")]
+            lines += ["",
+                      f"{EMO.spin()} {j.get('stage', '🎨')} **{j['filename'][:20]}**",
+                      f"{playbar(pct)} {pct:.0f}%",
+                      f"🎞 {j['done']}/{j['total']} fr • ⏱ ETA {fmt_time(j.get('eta', 0))}",
+                      j.get("ai", ""),
+                      "━━━━━━━━━━━━━━━━━━━━━━",
+                      "⛔ Cancel ke alawa sab buttons job ke baad wapas aayenge"]
         else:
-            lines += [f"{j.get('stage', '📥')} **{j.get('filename', '')[:22]}**"]
+            lines += ["", f"{EMO.spin()} {j.get('stage', '📥')} **{j.get('filename', '')[:20]}**",
+                      "━━━━━━━━━━━━━━━━━━━━━━"]
     else:
-        lines += ["😴 Idle — video/GIF/photo bhejo. Model button se 🎌/🎮 chuno."]
+        lines += ["", "😴 Idle — buttons se kuch bhi karo, ya seedha video/photo bhejo!",
+                  "━━━━━━━━━━━━━━━━━━━━━━"]
     return "\n".join(lines)
 
 async def ensure_panel(cid: int) -> Message:
     global _panel
     if _panel is None:
-        _panel = await app.send_message(cid, panel_text(), reply_markup=panel_kb())
+        _panel = await app.send_message(cid, panel_text(), reply_markup=panel_kb(job_state.get("active", False)))
     return _panel
 
 async def refresh_panel():
     global _panel
     try:
         if _panel:
-            await _panel.edit_text(panel_text(), reply_markup=panel_kb())
+            await _panel.edit_text(panel_text(), reply_markup=panel_kb(job_state.get("active", False) and bool(current_job)))
     except Exception:
         pass
 
+async def _panel_loop():
+    hb = 0
+    while True:
+        try:
+            if job_state.get("active") and current_job:
+                st = current_job.get("stage", "")
+                if st.startswith("📥"): EMO.set("download")
+                elif st.startswith("🔍"): EMO.set("think")
+                elif st.startswith("⬆️"): EMO.set("upload")
+                elif st.startswith("✅"): EMO.set("happy")
+                elif st.startswith("❌"): EMO.set("error")
+                else: EMO.set("work")
+            else:
+                EMO.set("idle")
+            if _panel:
+                await refresh_panel()
+            hb += 1
+            if hb % 30 == 0 and job_state.get("active") and current_job:
+                log.info("💓 heartbeat | %s fr | RAM %.1fGB | load %.1f",
+                         current_job.get("done", 0), mem_avail_gb(), load1())
+        except Exception:
+            pass
+        await asyncio.sleep(JOB_REFRESH if (job_state.get("active") and current_job) else IDLE_REFRESH)
+
+def stats_text() -> str:
+    if not archive:
+        return "ℹ️ Archive channel set nahi hai."
+    st = archive.state
+    hist = st.get("history", [])
+    tot_t = sum(x.get("t", 0) for x in hist)
+    lines = [f"📊 **Stats** {EMO.one('wow')}",
+             f"✅ Jobs done: {st.get('jobs_done', 0)}",
+             f"🕒 Total process time: {fmt_time(tot_t)}",
+             f"🤖 Learned best: {st.get('ai_best', {})}"]
+    for x in hist[-3:]:
+        lines.append(f"• {x.get('f', '?')[:24]} | {x.get('s', 0)}× | {fmt_time(x.get('t', 0))}")
+    return "\n".join(lines)
+
+# ================= CALLBACKS =================
 @app.on_callback_query(filters.regex(r"^b:"))
 async def btn(client, cq):
     global _panel
     if not is_owner(cq.message.chat.id):
         await cq.answer("Private bot!", show_alert=True); return
     parts = cq.data[2:].split(":"); a = parts[0]; v = parts[1] if len(parts) > 1 else ""
-    kb = panel_kb()
+    kb = panel_kb(job_state.get("active", False) and bool(current_job))
     if a == "mmenu": kb = model_kb()
     elif a == "qmenu": kb = q_kb()
     elif a == "pmenu": kb = p_kb()
@@ -343,22 +493,54 @@ async def btn(client, cq):
     elif a == "m":
         settings["model"] = v
         if archive: archive.state["model"] = v
-        await cq.answer(f"Model: {MODELS[v]['label']}")
+        await cq.answer(f"{EMO.one('wow')} {MODELS[v]['label']}")
     elif a == "q":
         settings["scale"] = float(v)
         if archive: archive.state["scale"] = float(v)
-        await cq.answer(f"Scale {v}×")
+        await cq.answer(f"{EMO.one('start')} Scale {v}×")
     elif a == "p":
         settings["preset"] = v
         if archive: archive.state["preset"] = v
-        await cq.answer(f"Preset {v}")
+        await cq.answer(f"{EMO.one('think')} Preset {v}")
     elif a == "a":
         settings["audio"] = v
         if archive: archive.state["audio"] = v
-        await cq.answer(f"Audio {v}")
+        await cq.answer(f"{EMO.one('happy')} Audio {v}")
+    elif a == "go":
+        if job_state.get("active"):
+            await cq.answer("⏳ Job chal rahi hai — panel dekho!")
+        else:
+            await cq.answer(EMO.one("start"))
+            await cq.message.reply_text(f"{EMO.one('start')} **Start karna hai?** Bas video/GIF/photo bhejo — main turant lag jaunga!")
+    elif a == "help":
+        await cq.answer(EMO.one("think"))
+        await cq.message.reply_text(HELP_TEXT)
+    elif a == "stats":
+        await cq.answer(EMO.one("wow"))
+        await cq.message.reply_text(stats_text())
+    elif a == "relearn":
+        if archive:
+            archive.state.setdefault("ai_best", {}).pop(
+                ("sd" if (current_job or {}).get("oh", 0) else "hd"), None)
+            archive.state["ai_best"] = {}
+            asyncio.create_task(archive.save_state())
+        await cq.answer(f"{EMO.one('think')} AI agla job fresh seekhega")
+    elif a == "sendv":
+        await cq.answer(EMO.one("download"))
+        await cq.message.reply_text(f"{EMO.one('download')} Ab **video** bhejo (MP4/MKV/MOV/WEBM/AVI/M4V)!")
+    elif a == "sendp":
+        await cq.answer(EMO.one("download"))
+        await cq.message.reply_text(f"{EMO.one('download')} Ab **photo** bhejo — seconds me upscaled!")
+    elif a == "sendg":
+        await cq.answer(EMO.one("download"))
+        await cq.message.reply_text(f"{EMO.one('download')} Ab **GIF** bhejo — seamless loop video banegi!")
+    elif a == "mood":
+        cur = EMO.state if EMO.state in MOOD_ORDER else "idle"
+        EMO.set(MOOD_ORDER[(MOOD_ORDER.index(cur) + 1) % len(MOOD_ORDER)])
+        await cq.answer(EMO.face())
     elif a == "stop":
         if cancel_event: cancel_event.set()
-        await cq.answer("⛔ Stop request")
+        await cq.answer(f"{EMO.one('error')} Cancel request!")
     elif a == "clean":
         try:
             if _panel: await _panel.delete()
@@ -395,13 +577,13 @@ def probe_video(path: Path) -> Dict:
             "duration": dur, "frames": frames,
             "has_audio": any(s.get("codec_type") == "audio" for s in data["streams"])}
 
-# ================= PIPELINE =================
+# ================= PIPELINE (working, untouched) =================
 def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Governor,
                  cancel: threading.Event, is_gif: bool, prev_dir: Path):
     w, h, fps = info["width"], info["height"], info["fps"]
     ow, oh = job["ow"], job["oh"]
     ff = PRESETS[settings["preset"]]
-    enc_threads = 1 if gov.current[0] >= 2 else 2
+    enc_threads = 1 if gov.workers() >= 2 else 2
     fps_g = fps if fps > 0 else 10.0
     total = min(info["frames"] or max(1, int(info["duration"] * fps)),
                 MAX_GIF_FRAMES if is_gif else 10 ** 9)
@@ -431,7 +613,7 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Gover
         finally:
             in_q.put(None)
 
-    def upscale_one(img, cfg):
+    def upscale_one(img, key):
         t0 = time.time()
         out, _ = ups.enhance(img, outscale=settings["scale"])
         dt = time.time() - t0
@@ -440,13 +622,13 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Gover
             stats["done"] += 1; stats["sum"] += dt
             job["done"] = stats["done"]
             job["spf"] = stats["sum"] / stats["done"]
-            job["eta"] = (total - job["done"]) * job["spf"] / max(1, gov.current[0])
+            job["eta"] = (total - job["done"]) * job["spf"] / max(1, gov.workers())
             job["ai"] = gov.status(job["spf"])
         if first:
             try: cv2.imwrite(str(prev_dir / "prev_out.png"), out)
             except Exception: pass
         del img
-        gov.on_frame(cfg, dt, stats["done"])
+        gov.on_frame(key, dt, stats["done"])
         return out
 
     def encoder():
@@ -495,7 +677,7 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Gover
             for fr in frames_raw:
                 if cancel.is_set(): raise RuntimeError("Cancelled")
                 if time.time() - t_start > MAX_JOB_SEC: raise RuntimeError("Job time-limit cross")
-                outs.append(upscale_one(fr, gov.current))
+                outs.append(upscale_one(fr, gov.key))
             frames_raw.clear(); gc.collect()
             loops = min(max(1, math.ceil(GIF_MIN_SEC / (len(outs) / fps_g))),
                         max(1, 600 // max(1, len(outs))))
@@ -532,8 +714,8 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Gover
                     if cancel.is_set():
                         with futs_cond: futs.append(None); futs_cond.notify_all()
                         raise RuntimeError("Cancelled")
-                cfg = tuple(gov.current)
-                f = POOL.submit(upscale_one, img, cfg)
+                key = gov.key
+                f = POOL.submit(upscale_one, img, key)
                 with futs_cond: futs.append(f); futs_cond.notify_all()
                 i += 1
             with futs_cond: futs.append(None); futs_cond.notify_all()
@@ -573,25 +755,15 @@ async def send_with_retry(fn, desc: str):
             if attempt == 3: raise
             await asyncio.sleep(5 * attempt)
 
-# ================= LOG INCOMING MESSAGES =================
+# ================= DEBUG LOGGER =================
 @app.on_message(filters.all & filters.private, group=-1)
 async def debug_logger(client, message: Message):
     kind = "text" if message.text else "media" if (message.video or message.photo or message.animation or message.document) else "other"
-    log.info("INCOMING MESSAGE | chat_id=%s | kind=%s | content=%r", 
+    log.info("INCOMING MESSAGE | chat_id=%s | kind=%s | content=%r",
              message.chat.id, kind, (message.text or "")[:50])
 
 # ================= JOB =================
 busy_lock = asyncio.Lock()
-
-async def _refresh_loop():
-    hb = 0
-    while True:
-        await refresh_panel()
-        hb += 1
-        if hb % 24 == 0 and job_state.get("active") and current_job:
-            log.info("💓 heartbeat | %s fr | RAM %.1fGB | load %.1f",
-                     current_job.get("done", 0), mem_avail_gb(), load1())
-        await asyncio.sleep(2.5)
 
 @app.on_message((filters.video | filters.document | filters.animation) & filters.private)
 async def media_handler(client, message: Message):
@@ -600,19 +772,23 @@ async def media_handler(client, message: Message):
         await message.reply_text("❌ Private bot."); return
     async with busy_lock:
         if job_state.get("active"):
-            await message.reply_text("⏳ Ek job chal rahi hai."); return
+            await message.reply_text(f"{EMO.one('think')} ⏳ Ek job chal rahi hai — thoda wait!")
+            return
         job_state["active"] = True
         cancel_event = threading.Event()
     job_dir = None; out_path = None
-    refresher = asyncio.create_task(_refresh_loop())
     try:
         media = message.video or message.document or message.animation
         filename = getattr(media, "file_name", None) or f"video_{message.id}.mp4"
         mime = getattr(media, "mime_type", "") or ""
         is_gif = filename.lower().endswith(".gif") or mime == "image/gif"
         if not filename.lower().endswith((".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".gif")):
-            await message.reply_text("❌ Sirf video/GIF bhejo."); return
+            await message.reply_text(f"{EMO.one('error')} ❌ Sirf video/GIF bhejo.")
+            return
+        await react(message, "🔥")
+        EMO.set("download")
         await ensure_panel(message.chat.id)
+        await refresh_panel()
         job_dir = WORK_DIR / f"job_{message.id}_{int(time.time())}"
         job_dir.mkdir(parents=True, exist_ok=True)
         in_path = job_dir / filename
@@ -626,7 +802,7 @@ async def media_handler(client, message: Message):
         current_job["stage"] = "🔍"
         info = await asyncio.to_thread(probe_video, in_path)
         if not is_gif and info["frames"] > MAX_FRAMES:
-            await message.reply_text(f"❌ Video bahut lambi: {info['frames']} frames (max {MAX_FRAMES}).")
+            await message.reply_text(f"{EMO.one('error')} ❌ Video bahut lambi: {info['frames']} frames (max {MAX_FRAMES}).")
             return
         scale = settings["scale"]
         ow = int(info["width"] * scale); ow += ow % 2
@@ -642,6 +818,8 @@ async def media_handler(client, message: Message):
         current_job.update({"ow": ow, "oh": oh, "stage": "🎨", "ai": gov.status(0.0)})
         out_path = OUTPUT_DIR / f"{Path(filename).stem}_up_{message.id}.mp4"
         t0 = time.time()
+        await message.reply_text(f"{EMO.one('work')} **Upscale shuru!** {info['width']}×{info['height']} → {ow}×{oh} • "
+                                 f"{info['frames']} fr • 🤖 {gov.label()}")
 
         await asyncio.to_thread(run_pipeline, current_job, in_path, out_path, info,
                                 ups, gov, cancel_event, is_gif, job_dir)
@@ -650,7 +828,8 @@ async def media_handler(client, message: Message):
         if size_mb > MAX_SEND_MB:
             raise RuntimeError(f"Output {size_mb:.0f}MB > 2GB limit")
 
-        cap = (f"✅ **{filename}**\n{MODELS[model_key]['label']} • {fmt_scale(scale)}× → {ow}×{oh}\n"
+        cap = (f"{EMO.one('happy')} ✅ **{filename}**\n"
+               f"{MODELS[model_key]['label']} • {fmt_scale(scale)}× → {ow}×{oh}\n"
                f"🎞 {current_job.get('frames_done', current_job['done'])} fr"
                + (f" (loop ×{current_job.get('loops', 1)})" if is_gif else "") +
                f" • ⚡ {current_job['spf']:.2f}s/fr • 🕒 {fmt_time(time.time() - t0)}\n"
@@ -662,7 +841,7 @@ async def media_handler(client, message: Message):
         comp = await asyncio.to_thread(make_compare, job_dir)
         if comp:
             try:
-                await app.send_photo(message.chat.id, str(comp), caption="⬅️ Before | ➡️ After")
+                await app.send_photo(message.chat.id, str(comp), caption=f"{EMO.one('wow')} ⬅️ Before | ➡️ After")
             except Exception: pass
 
         if is_gif:
@@ -672,6 +851,8 @@ async def media_handler(client, message: Message):
             await send_with_retry(lambda: app.send_video(
                 message.chat.id, str(out_path), caption=cap,
                 supports_streaming=True, progress=ul_cb), "video")
+        await react(message, "❤️")
+        EMO.set("happy")
         if archive:
             await archive.archive_video(out_path, f"{filename} | {MODELS[model_key]['label']} | "
                                                   f"{fmt_scale(scale)}× | {fmt_time(time.time() - t0)}")
@@ -682,11 +863,11 @@ async def media_handler(client, message: Message):
         current_job["stage"] = "✅"
     except Exception as e:
         log.exception("Job failed")
-        try: await message.reply_text(f"❌ Failed: {str(e)[:250]}")
+        EMO.set("error")
+        try: await message.reply_text(f"{EMO.one('error')} ❌ Failed: {str(e)[:220]}")
         except Exception: pass
         if current_job: current_job["stage"] = "❌"
     finally:
-        refresher.cancel()
         if job_dir: shutil.rmtree(job_dir, ignore_errors=True)
         if out_path and out_path.exists():
             try: out_path.unlink()
@@ -704,9 +885,12 @@ async def photo_handler(client, message: Message):
         await message.reply_text("❌ Private bot."); return
     async with busy_lock:
         if job_state.get("active"):
-            await message.reply_text("⏳ Job chal rahi hai, photo baad me bhejo."); return
+            await message.reply_text(f"{EMO.one('think')} ⏳ Job chal rahi hai, photo baad me.")
+            return
         job_state["active"] = True
     try:
+        await react(message, "🔥")
+        EMO.set("work")
         tmp = WORK_DIR / f"photo_{message.id}.jpg"
         await app.download_media(message, file_name=str(tmp))
         img = cv2.imread(str(tmp))
@@ -720,13 +904,16 @@ async def photo_handler(client, message: Message):
         dt = time.time() - t0
         outp = WORK_DIR / f"photo_{message.id}_up.png"
         cv2.imwrite(str(outp), out)
+        EMO.set("happy")
         await send_with_retry(lambda: app.send_photo(
             message.chat.id, str(outp),
-            caption=f"✅ Photo upscale {MODELS[model_key]['label']} • "
+            caption=f"{EMO.one('happy')} ✅ Photo upscale {MODELS[model_key]['label']} • "
                     f"{fmt_scale(settings['scale'])}× • {w}×{h} → {out.shape[1]}×{out.shape[0]} • {dt:.1f}s"), "photo")
+        await react(message, "❤️")
     except Exception as e:
         log.exception("Photo fail")
-        try: await message.reply_text(f"❌ Photo fail: {str(e)[:200]}")
+        EMO.set("error")
+        try: await message.reply_text(f"{EMO.one('error')} ❌ Photo fail: {str(e)[:200]}")
         except Exception: pass
     finally:
         job_state["active"] = False
@@ -738,66 +925,66 @@ async def photo_handler(client, message: Message):
 @app.on_message(filters.command("stats") & filters.private)
 async def stats_cmd(client, message: Message):
     if not is_owner(message.chat.id): return
-    if not archive:
-        await message.reply_text("ℹ️ Archive channel set nahi hai."); return
-    st = archive.state
-    hist = st.get("history", [])
-    tot_t = sum(x.get("t", 0) for x in hist)
-    lines = [f"📊 **Stats**\n✅ Jobs done: {st.get('jobs_done', 0)}",
-             f"🕒 Total process time: {fmt_time(tot_t)}"]
-    for x in hist[-3:]:
-        lines.append(f"• {x.get('f', '?')[:24]} | {x.get('s', 0)}× | {fmt_time(x.get('t', 0))}")
-    await message.reply_text("\n".join(lines))
+    await message.reply_text(stats_text())
 
 @app.on_message(filters.command("cancel") & filters.private)
 async def cancel_cmd(client, message: Message):
     if not is_owner(message.chat.id): return
     if cancel_event: cancel_event.set()
-    await message.reply_text("🛑 Cancel request bhej di.")
+    await message.reply_text(f"{EMO.one('error')} 🛑 Cancel request bhej di.")
 
 @app.on_message(filters.forwarded & filters.private)
 async def forward_id_handler(client, message: Message):
-    """Channel ki koi post forward karo → bot exact channel ID bata dega."""
     if not is_owner(message.chat.id): return
     src = getattr(message, "forward_from_chat", None)
     if src is not None and getattr(src, "id", None):
-        await message.reply_text(
-            f"📌 Is channel ki exact ID: `{src.id}`\n"
-            "1) GitHub secret ARCHIVE_CHANNEL_ID me yahi paste karo\n"
-            "2) Workflow dobara run karo")
+        if archive:
+            archive.candidates = [src.id]
+            archive.channel_id = src.id
+            archive.state_msg_id = None
+            asyncio.create_task(archive.save_state())
+        await message.reply_text(f"{EMO.one('wow')} 📌 Channel ID set: `{src.id}` — archive ab isi par chalega.")
     else:
-        await message.reply_text("❌ Forward ki hui post se channel ID nahi mili. Ya to channel private hai ya identity hide hai. Seedha GitHub secrets me `-1004383888217` daal do.")
+        await message.reply_text("❌ Forward se channel ID nahi mili. Secret me `-100...` wali ID daalo.")
 
 @app.on_message(filters.text & filters.private & ~filters.command(["start", "stats", "cancel"]))
 async def text_handler(client, message: Message):
     if not is_owner(message.chat.id): return
     t = (message.text or "").lower()
-    if any(k in t for k in ["game", "free fire", "pubg", "bgmi"]):
-        await message.reply_text("🎮 Game videos: panel me model button → Game (Fast) ya Game (HQ).")
+    if any(k in t for k in ["hi", "hello", "hey", "namaste"]):
+        await react(message, "👋")
+        await message.reply_text(f"{EMO.one('happy')} Namaste boss! Panel buttons se sab control hota hai — ya seedha video bhejo!")
+    elif any(k in t for k in ["game", "free fire", "pubg", "bgmi"]):
+        await message.reply_text(f"{EMO.one('wow')} 🎮 Game videos: model button → Game (Fast) ya Game (HQ).")
     elif any(k in t for k in ["ram", "cpu", "load"]):
-        await message.reply_text(f"🛡 RAM free: {mem_avail_gb():.1f}GB • load: {load1():.1f} • cores: {CPU_THREADS}")
+        await message.reply_text(f"{EMO.one('think')} 🛡 RAM free: {mem_avail_gb():.1f}GB • load: {load1():.1f} • cores: {CPU_THREADS}")
+    elif any(k in t for k in ["thank", "shukriya", "thx"]):
+        await message.reply_text(f"{EMO.one('love')} Apna kaam hai boss! Aur videos bhejte raho!")
     else:
-        await message.reply_text("🤖 v8: video/GIF/photo bhejo. Panel se model 🎌/🎮, scale, preset, audio. "
-                                 "/stats dekho, /cancel se roko.")
+        await message.reply_text(f"{EMO.one('think')} 🤖 v11: video/GIF/photo bhejo; panel se model/scale/preset/audio; /stats; /cancel; 🎭 se mood!")
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client, message: Message):
     global _panel
     if not is_owner(message.chat.id):
         await message.reply_text("❌ Private bot."); return
+    await react(message, "👋")
+    EMO.set("start")
     try:
         if _panel: await _panel.delete()
     except Exception: pass
     _panel = None
     await ensure_panel(message.chat.id)
-    await message.reply_text(f"ℹ️ Tumhara chat ID: `{message.chat.id}`")
+    await message.reply_text(f"{EMO.one('start')} **Upscaler v11 • Smooth Motion online!**\n"
+                             f"ℹ️ Chat ID: `{message.chat.id}`\n"
+                             "20-frame faces @25fps engine + cancel-only job mode + AI v3! 🎭")
 
 # ================= BOOT =================
 def notify_owner_startup():
     try:
         r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                           json={"chat_id": OWNER_CHAT_ID_INT or OWNER_CHAT_ID,
-                                "text": "✅ Upscaler v8 online!\n🧠 Governor + photo + retry + self-test.\nPanel se control karo."},
+                                "text": "✅ Upscaler v11 Smooth Motion online!\n🎭 20-frame faces @25fps + ⛔ cancel-only job mode + 🤖 AI v3.\nPanel se control karo."},
                           timeout=15)
         log.info("Startup ping: %s", r.status_code)
     except Exception as e:
@@ -812,7 +999,7 @@ async def _boot():
         settings["preset"] = st.get("preset", settings["preset"])
         settings["audio"] = st.get("audio", settings["audio"])
         settings["model"] = st.get("model", settings["model"])
-        log.info("📚 Archive settings: %s", settings)
+        log.info("📚 Archive settings: %s | ai_best: %s", settings, st.get("ai_best", {}))
         if archive.channel_id:
             try:
                 m = await app.send_message(archive.channel_id, "🧪 Archive self-test...")
@@ -821,8 +1008,9 @@ async def _boot():
             except Exception as e:
                 log.error("❌ Archive channel WRITE FAIL: %s", e)
         else:
-            log.warning("⚠️ Archive channel connect nahi hua — channel post bot ko forward karo, wo ID dega")
-    log.info("🚀 v8 ready (cores=%s)", CPU_THREADS)
+            log.warning("⚠️ Archive connect nahi hua — channel post forward karo")
+    asyncio.create_task(_panel_loop())
+    log.info("🚀 v11 ready (cores=%s)", CPU_THREADS)
 
 async def _main():
     try:
@@ -836,10 +1024,8 @@ async def _main():
 
 if __name__ == "__main__":
     try:
-        # Note: drop_pending_updates=True hata diya gaya hai taki messages delete na hon
         r = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook", timeout=15)
         log.info("🧹 Webhook check: %s", r.text[:120])
     except Exception as e:
         log.warning("Webhook fail: %s", e)
-    
     app.run(_main())
