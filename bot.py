@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """
-Smart Anime/Game/Real Upscaler v10.7 — SPEED + STARTUP FIX
-  - ✅ RRDB models (Anime Image / Real) sirf PHOTOS ke liye; videos par auto-switch
-         to SRVGG (Anime Video / Game) → 83s/fr → ~2-4s/fr
-  - ✅ Colorize High videos par auto → Fast (ref 256); photos par full High (ref 512)
-  - ✅ Boot pre-warm: model pool + DDColor background me load → job turant start
-  - ✅ Instance pool (thread-safe, black-flicker fix) + Governor gate unified
-  - ✅ .copy() / -an -sn -dn / read_exact / rotation / metadata-strip / contiguity intact
+Smart Anime/Game/Real Upscaler v10.8 — QUEUE + LIVE STATUS FIX
+  - ✅ Har video par turant TICK message: "✅ Video mil gayi" (batch ho ya single)
+  - ✅ Usi tick message par LIVE progress (bar %, frames, ETA, speed) har 2.5s update
+  - ✅ Batch queue: multiple videos queue me, har ek ka apna status message
+  - ✅ Panel flood-fix: safe 2.5s refresh; status message text-only edits
+  - ✅ v10.7 ke saare guards intact (RRDB video-switch, colorize guard, pre-warm, pool)
 """
 import asyncio, gc, json, logging, math, os, queue, random, shutil, subprocess, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     sys.stdout.reconfigure(line_buffering=True)
@@ -70,9 +69,11 @@ MAX_FRAMES = 3600
 MAX_GIF_FRAMES = 240
 MAX_OUT_PIXELS = 3840 * 2160
 MAX_SEND_MB = 1900
-MAX_JOB_SEC = int(os.getenv("MAX_JOB_MIN", "330")) * 60   # GitHub 6h timeout se safe
+MAX_JOB_SEC = int(os.getenv("MAX_JOB_MIN", "330")) * 60
 GIF_MIN_SEC = 2.0
 IN_QUEUE = 4
+STATUS_EVERY = 2.5          # live status edit interval
+PANEL_EVERY = 2.5           # panel refresh interval (flood-safe)
 CPU_THREADS = os.cpu_count() or 4
 POOL = ThreadPoolExecutor(max_workers=max(4, CPU_THREADS))
 os.environ["OMP_NUM_THREADS"] = str(CPU_THREADS)
@@ -85,7 +86,7 @@ MODELS = {
     "real":        {"file": "RealESRGAN_x4plus.pth",          "arch": "rrdb",  "label": "📷 Real Photo",  "best_for": "real-world photos",   "video_ok": False},
 }
 LEGACY_MODEL_MAP = {"anime": "anime_video", "gamehq": "real"}
-VIDEO_FALLBACK = {"anime_image": "anime_video", "real": "game"}   # RRDB → SRVGG for videos
+VIDEO_FALLBACK = {"anime_image": "anime_video", "real": "game"}
 
 def normalize_model_key(key) -> str:
     if isinstance(key, str) and key in MODELS: return key
@@ -125,6 +126,8 @@ settings = {"scale": 2.0, "preset": "balanced", "audio": "keep",
 job_state = {"active": False}
 current_job: Optional[Dict[str, Any]] = None
 cancel_event: Optional[threading.Event] = None
+JOB_QUEUE: List[Dict[str, Any]] = []
+_queue_task: Optional[asyncio.Task] = None
 
 # ================= SYSTEM =================
 def mem_avail_gb() -> float:
@@ -146,7 +149,7 @@ def fmt_time(s: float) -> str:
 
 def fmt_scale(s: float) -> str: return f"{s:g}"
 
-def bar(pct: float, n: int = 8) -> str:
+def bar(pct: float, n: int = 12) -> str:
     f = int(n * min(100, max(0, pct)) / 100)
     return "▰" * f + "▱" * (n - f)
 
@@ -161,10 +164,10 @@ FACES = {
     "idle":     ["(˘˘)… zZ", "(¬ᴗ¬) zZ", "(˘▽˘) ♪"],
     "work":     ["(っ⚙_)っ", "(っ⚙_⚙)っ✦", "(っ⚙_⚙)っ✧"],
     "think":    ["(◔_)…", "(◔‿◔)?", "(◕_◕)…"],
-    "happy":    ["(ﾉ◕)ﾉ*:･ﾟ✧", "(◕‿◕)✧", "(＾▽＾)ﾉ★"],
+    "happy":    ["(ﾉ◕)ﾉ*:･ﾟ✧", "(◕‿)✧", "(＾▽＾)ﾉ★"],
     "error":    ["(×_×;)", "(╥_╥)…", "(⊙_)!"],
     "love":     ["(♥‿♥)", "(♡ω♡)", "(⁄⁄•⁄ω•⁄⁄)"],
-    "start":    ["(ò_ó)⚡", "(◉◉)✧", "(ᐛ)و✦"],
+    "start":    ["(ò_ó)⚡", "(◉)✧", "(ᐛ)و"],
     "upload":   ["(⇀↼)", "(_↼)️", "(⇀‿↼)"],
     "download": ["(⇂_⇂)📥", "(⇂_)", "(⇂_⇂)✦"],
     "wow":      ["(✧ω✧)", "(✧▽✧)", "(◍◍)✨"],
@@ -290,7 +293,7 @@ class Governor:
                 f"{self.thr(self.current):.2f} f/s | 🛡 {self.ram_ema:.1f}G | "
                 f"load {self.load_ema:.1f}" + (" | SAFE" if self.safe else ""))
 
-# ================= REAL-ESRGAN INSTANCE POOL (thread-safe) =================
+# ================= REAL-ESRGAN INSTANCE POOL =================
 _ups_pool_queues: Dict[Any, queue.Queue] = {}
 _ups_pool_meta: Dict[Any, Tuple[int, int]] = {}
 _ups_pool_lock = threading.Lock()
@@ -325,7 +328,6 @@ def choose_tile(key: str, out_px: int) -> int:
     return 320
 
 def _instance_count(key: str) -> int:
-    """Kitne parallel upsampler instances RAM/CPU allow karte hain."""
     arch = MODELS[key]["arch"]
     ram = mem_avail_gb()
     if arch == "rrdb":
@@ -469,13 +471,12 @@ def panel_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton(f"🔊 {settings['audio'].title()}", callback_data="b:amenu"),
          InlineKeyboardButton(_color_label(), callback_data="b:colormenu")],
         [InlineKeyboardButton(_core_label(), callback_data="b:cmenu"),
-         InlineKeyboardButton("▶️ Start", callback_data="b:go"),
-         InlineKeyboardButton("📊 Stats", callback_data="b:stats")],
-        [InlineKeyboardButton("🧭 Help", callback_data="b:help"),
-         InlineKeyboardButton("🎥 Video", callback_data="b:sendv"),
-         InlineKeyboardButton("🖼 Photo", callback_data="b:sendp")],
-        [InlineKeyboardButton("🎞 GIF", callback_data="b:sendg"),
-         InlineKeyboardButton("⛔ Stop", callback_data="b:stop"),
+         InlineKeyboardButton("📊 Stats", callback_data="b:stats"),
+         InlineKeyboardButton("🧭 Help", callback_data="b:help")],
+        [InlineKeyboardButton("🎥 Video", callback_data="b:sendv"),
+         InlineKeyboardButton("🖼 Photo", callback_data="b:sendp"),
+         InlineKeyboardButton("🎞 GIF", callback_data="b:sendg")],
+        [InlineKeyboardButton("⛔ Stop", callback_data="b:stop"),
          InlineKeyboardButton("🧹 Clean", callback_data="b:clean")],
     ])
 
@@ -527,41 +528,38 @@ def core_kb() -> InlineKeyboardMarkup:
 SUBMENU_BUTTONS = {"mmenu", "qmenu", "pmenu", "amenu", "colormenu", "cmenu"}
 
 HELP_TEXT = (
-    "🧭 **Help (v10.7)**\n\n"
-    "🎥 Video /  GIF /  Photo bhejo → upscale\n"
-    "🎛 **Models** → Anime Video / Game = videos (fast SRVGG)\n"
-    "   Anime Image / Real = photos (crisp RRDB)\n"
-    "   (video par RRDB auto-switch hota hai — 83s/fr se bachne ke liye!)\n"
-    "🎨 **Color** → OFF / Fast (video+photo) / High (photo only)\n"
-    "⚙️ **Cores** → Auto / Fixed profiles\n"
-    "⚡ Boot par model pre-warm → job turant start\n"
-    "✍️ /start /panel /reset /stats /cancel"
+    "🧭 **Help (v10.8)**\n\n"
+    "🎥 Video/GIF/Photo bhejo → turant ✅ tick message + live progress\n"
+    "📚 Batch: multiple videos queue me, har ek ka apna status\n"
+    "🎛 Models → Anime Video / Game = videos • Anime Image / Real = photos\n"
+    "🎨 Color → OFF / Fast / High(photo) • ⚙️ Cores → Auto / Fixed\n"
+    "✍️ /start /panel /reset /stats /cancel /queue"
 )
 
 def panel_text() -> str:
     m = MODELS.get(settings["model"], MODELS["anime_video"])
-    lines = [_pad(f"{EMO.face()}  UPSCALER v10.7"), "─" * PW,
+    lines = [_pad(f"{EMO.face()}  UPSCALER v10.8"), "─" * PW,
              _pad(f"🧠 {CPU_THREADS}c • 🛡 {mem_avail_gb():.1f}GB free • load {load1():.1f}"),
              _pad(f"{m['label']} {fmt_scale(settings['scale'])}× "
                   f"{settings['preset'][:4]} 🔊{settings['audio'][:4]}"),
              _pad(f"{_color_label()} • ⚙️ {_core_label()}"),
-             _pad(f"💡 {m['best_for'][:30]}"),
              _pad("")]
     if job_state.get("active") and current_job:
         j = current_job
         if j.get("total"):
             pct = j["done"] * 100 / j["total"]
             lines += [_pad(f"{j.get('stage', '🎨')} {j['filename'][:18]}"),
-                      _pad(f"{bar(pct)} {pct:.0f}%"),
+                      _pad(f"{bar(pct, 10)} {pct:.0f}%"),
                       _pad(f"🎞 {j['done']}/{j['total']} • ETA {fmt_time(j.get('eta', 0))}"),
                       _pad(j.get("ai", "")[:PW])]
         else:
             lines += [_pad(f"{j.get('stage', '📥')} {j.get('filename', '')[:18]}")] + [_pad("")] * 2
     else:
-        lines += [_pad("😴 Idle — koi job nahi"),
-                  _pad("🎥 video / 🖼 photo / 🎞 gif"),
-                  _pad("bhejo → pure AI upscale"),
-                  _pad("⚡ model pre-warmed = fast start")]
+        lines += [_pad("😴 Idle — video/photo bhejo"),
+                  _pad("✅ tick + live progress milega"),
+                  _pad("📚 batch = queue system")]
+    if JOB_QUEUE:
+        lines += [_pad(f"📋 Queue me: {len(JOB_QUEUE)} video")]
     lines += ["─" * PW, _pad("🎨 High color = photos only"),
               _pad("🎬 videos = SRVGG fast models")]
     return "\n".join(lines)
@@ -664,16 +662,12 @@ async def btn(client, cq):
             await cq.answer(f"⚙️ {lbl}")
         else:
             kb = panel_kb(); await cq.answer()
-    elif a == "go":
-        await cq.answer("▶️")
-        await cq.message.reply_text(f"▶️ Bas video/GIF/photo bhejo — {_model_label()} upscale!")
-        return
     elif a == "help":
         await cq.answer(); await cq.message.reply_text(HELP_TEXT); return
     elif a == "stats":
         await cq.answer(); await cq.message.reply_text(_stats_text()); return
     elif a == "sendv":
-        await cq.answer(); await cq.message.reply_text("🎥 Ab **video** bhejo!"); return
+        await cq.answer(); await cq.message.reply_text("🎥 Ab **video** bhejo — ✅ tick + live progress milega!"); return
     elif a == "sendp":
         await cq.answer(); await cq.message.reply_text("🖼 Ab **photo** bhejo!"); return
     elif a == "sendg":
@@ -717,7 +711,7 @@ def _stats_text() -> str:
              f"⚙️ Cores: {_core_label()}",
              f"🎽 Model: {m['label']} — {m['best_for']}",
              f"🎨 Colorize: {_color_label()}",
-             f"🧠 Governor: adaptive + instance pool",
+             f"📋 Queue: {len(JOB_QUEUE)} waiting",
              f"🖥 Cores: {CPU_THREADS} • 🛡 RAM: {mem_avail_gb():.1f}GB free",
              f"🎯 Scale: {fmt_scale(settings['scale'])}× • Preset: {settings['preset'].title()}"]
     if archive:
@@ -727,7 +721,7 @@ def _stats_text() -> str:
         lines += [f"✅ Jobs done: {st.get('jobs_done', 0)}", f"🕒 Total: {fmt_time(tot_t)}"]
     return "\n".join(lines)
 
-# ================= PROBE (rotation-aware) =================
+# ================= PROBE =================
 def probe_video(path: Path) -> Dict:
     r = subprocess.run(["ffprobe", "-v", "error", "-print_format", "json",
                         "-show_streams", "-show_format", str(path)],
@@ -799,7 +793,7 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups_queue: queu
     t_start = time.time()
 
     vf_chain = _build_vf_chain(w, h, rot)
-    log.info("📐 Reader: vf='%s' frame=%sx%s (%d B) | gate instances=%d",
+    log.info("📐 Reader: vf='%s' frame=%sx%s (%d B) | instances=%d",
              vf_chain, w, h, w * h * 3, inst_count)
 
     def reader():
@@ -971,9 +965,33 @@ async def send_with_retry(fn, desc: str):
             if attempt == 3: raise
             await asyncio.sleep(5 * attempt)
 
-# ================= REFRESH LOOP =================
-busy_lock = asyncio.Lock()
+# ================= LIVE STATUS LOOP (per-job tick message) =================
+async def _job_status_loop(status_msg: Message, stop_evt: asyncio.Event):
+    """Har 2.5s me tick message par LIVE progress edit karta hai."""
+    while not stop_evt.is_set():
+        try:
+            j = current_job
+            if j and j.get("total"):
+                pct = j["done"] * 100 / j["total"]
+                txt = (f"{j.get('stage', '🎨')} **{j['filename'][:20]}**\n"
+                       f"{bar(pct)} {pct:.0f}%\n"
+                       f"🎞 {j['done']}/{j['total']} fr • ⏱ ETA {fmt_time(j.get('eta', 0))}\n"
+                       f"{j.get('ai', '')}")
+            elif j:
+                txt = f"{j.get('stage', '📥')} **{j.get('filename', '')[:20]}** …"
+            else:
+                txt = "⏳ ..."
+            await status_msg.edit_text(txt)
+        except FloodWait as e:
+            try: await asyncio.wait_for(stop_evt.wait(), timeout=e.value)
+            except asyncio.TimeoutError: pass
+            continue
+        except Exception:
+            pass
+        try: await asyncio.wait_for(stop_evt.wait(), timeout=STATUS_EVERY)
+        except asyncio.TimeoutError: pass
 
+# ================= PANEL REFRESH LOOP =================
 async def _refresh_loop():
     global _panel_mode
     hb = 0
@@ -1002,153 +1020,180 @@ async def _refresh_loop():
                          current_job.get("done", 0), mem_avail_gb(), load1())
         except Exception as e:
             log.warning("refresh_loop err: %s", e)
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(PANEL_EVERY)
 
-# ================= JOB =================
+# ================= INTAKE (tick message + queue) =================
 @app.on_message((filters.video | filters.document | filters.animation) & filters.private)
 async def media_handler(client, message: Message):
-    global cancel_event, current_job, _panel_mode
     if not is_owner(message.chat.id):
         await message.reply_text("❌ Private bot."); return
-    async with busy_lock:
-        if job_state.get("active"):
-            await message.reply_text("⏳ Ek job chal rahi hai."); return
+    media = message.video or message.document or message.animation
+    filename = getattr(media, "file_name", None) or f"video_{message.id}.mp4"
+    mime = getattr(media, "mime_type", "") or ""
+    is_gif = filename.lower().endswith(".gif") or mime == "image/gif"
+    if not filename.lower().endswith((".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".gif")):
+        await message.reply_text("❌ Sirf video/GIF bhejo."); return
+    pos = len(JOB_QUEUE) + (1 if job_state.get("active") else 0) + 1
+    status_msg = await message.reply_text(
+        f"✅ **Video mil gayi!** `{filename}`\n"
+        f"📋 Queue position: {pos}\n"
+        f"⏳ Process start hote hi LIVE progress yahan dikhega...")
+    JOB_QUEUE.append({"message": message, "filename": filename,
+                      "is_gif": is_gif, "status_msg": status_msg})
+    await _ensure_queue_loop()
+    await refresh_panel()
+
+async def _ensure_queue_loop():
+    global _queue_task
+    if _queue_task is None or _queue_task.done():
+        _queue_task = asyncio.create_task(_queue_loop())
+
+# ================= QUEUE PROCESSOR =================
+async def _queue_loop():
+    global current_job, cancel_event, _panel_mode
+    while JOB_QUEUE:
+        job = JOB_QUEUE.pop(0)
+        message = job["message"]; filename = job["filename"]
+        is_gif = job["is_gif"]; status_msg = job["status_msg"]
         job_state["active"] = True
         cancel_event = threading.Event()
         _panel_mode = "job"
-    job_dir = None; out_path = None
-    try:
-        media = message.video or message.document or message.animation
-        filename = getattr(media, "file_name", None) or f"video_{message.id}.mp4"
-        mime = getattr(media, "mime_type", "") or ""
-        is_gif = filename.lower().endswith(".gif") or mime == "image/gif"
-        if not filename.lower().endswith((".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".gif")):
-            await message.reply_text("❌ Sirf video/GIF bhejo."); return
-        if _panel is None: await ensure_panel(message.chat.id)
-        job_dir = WORK_DIR / f"job_{message.id}_{int(time.time())}"
-        job_dir.mkdir(parents=True, exist_ok=True)
-        in_path = job_dir / filename
         current_job = {"filename": filename, "ow": 0, "oh": 0, "done": 0, "total": 0,
                        "spf": 0.0, "eta": 0.0, "ai": "", "stage": "📥", "loops": 1}
+        job_dir = None; out_path = None; refresher = None; stop_evt = None
+        t0 = time.time()
+        try:
+            try: await status_msg.edit_text(f"📥 **Download shuru...** `{filename}`")
+            except Exception: pass
+            job_dir = WORK_DIR / f"job_{message.id}_{int(time.time())}"
+            job_dir.mkdir(parents=True, exist_ok=True)
+            in_path = job_dir / filename
 
-        def dl_cb(cur, tot, *a):
-            current_job["stage"] = f"📥 {cur/1048576:.0f}/{tot/1048576:.0f}MB"
-        await app.download_media(message, file_name=str(in_path), progress=dl_cb)
+            def dl_cb(cur, tot, *a):
+                current_job["stage"] = f"📥 {cur/1048576:.0f}/{tot/1048576:.0f}MB"
+            await app.download_media(message, file_name=str(in_path), progress=dl_cb)
 
-        current_job["stage"] = "🔍"
-        info = await asyncio.to_thread(probe_video, in_path)
-        if not is_gif and info["frames"] > MAX_FRAMES:
-            await message.reply_text(f"❌ Video lambi: {info['frames']} fr (max {MAX_FRAMES}).")
-            return
-        scale = settings["scale"]
-        ow = int(info["width"] * scale); ow += ow % 2
-        oh = int(info["height"] * scale); oh += oh % 2
-        capped = False
-        while scale > 1.0 and ow * oh > MAX_OUT_PIXELS:
-            scale = max(1.0, scale - 0.5); capped = True
+            current_job["stage"] = "🔍"
+            info = await asyncio.to_thread(probe_video, in_path)
+            if not is_gif and info["frames"] > MAX_FRAMES:
+                raise RuntimeError(f"Video lambi: {info['frames']} fr (max {MAX_FRAMES})")
+            scale = settings["scale"]
             ow = int(info["width"] * scale); ow += ow % 2
             oh = int(info["height"] * scale); oh += oh % 2
+            capped = False
+            while scale > 1.0 and ow * oh > MAX_OUT_PIXELS:
+                scale = max(1.0, scale - 0.5); capped = True
+                ow = int(info["width"] * scale); ow += ow % 2
+                oh = int(info["height"] * scale); oh += oh % 2
 
-        # 🚀 SPEED GUARD 1: RRDB models video par nahi (83s/fr!) → SRVGG auto-switch
-        notes = []
-        orig_model = normalize_model_key(settings["model"])
-        model_key = orig_model
-        if not MODELS[model_key]["video_ok"]:
-            model_key = VIDEO_FALLBACK.get(model_key, "anime_video")
-            notes.append(f"🎬 Video ke liye {MODELS[orig_model]['label']} bahut slow hai "
-                         f"(~80s/fr) → auto-switch: {MODELS[model_key]['label']} (~2-4s/fr). "
-                         f"RRDB models photos ke liye best hain.")
+            notes = []
+            orig_model = normalize_model_key(settings["model"])
+            model_key = orig_model
+            if not MODELS[model_key]["video_ok"]:
+                model_key = VIDEO_FALLBACK.get(model_key, "anime_video")
+                notes.append(f"🎬 {MODELS[orig_model]['label']} video par slow hai → auto {MODELS[model_key]['label']}")
+            colorize_mode = normalize_colorize(settings["colorize_mode"])
+            colorize_ref = 512
+            if colorize_mode == "high":
+                colorize_mode = "fast"; colorize_ref = 256
+                notes.append("🎨 High → Fast (video ke liye)")
+            elif colorize_mode == "fast":
+                colorize_ref = 256
 
-        # 🚀 SPEED GUARD 2: High colorize video par → Fast (ref 256)
-        colorize_mode = normalize_colorize(settings["colorize_mode"])
-        colorize_ref = 512
-        if colorize_mode == "high":
-            colorize_mode = "fast"; colorize_ref = 256
-            notes.append("🎨 High colorize videos par bahut slow hai → video ke liye Fast (photo par High milega).")
-        elif colorize_mode == "fast":
-            colorize_ref = 256
-        if notes:
-            try: await message.reply_text("\n".join(notes))
+            fixed = None
+            if settings["core"] != "auto":
+                cm = CORE_MAP.get(settings["core"])
+                if cm and cm[2] > 0: fixed = (cm[2], cm[3])
+            tile = choose_tile(model_key, ow * oh)
+            ups_queue = await asyncio.to_thread(init_ups_pool, model_key, tile, fixed)
+            inst_count = pool_instances(model_key, tile)
+            gov = Governor(ow * oh, fixed=fixed, max_workers=inst_count)
+            current_job.update({"ow": ow, "oh": oh, "stage": "🎨", "ai": gov.status(0.0)})
+            out_path = OUTPUT_DIR / f"{Path(filename).stem}_up_{message.id}.mp4"
+
+            stop_evt = asyncio.Event()
+            refresher = asyncio.create_task(_job_status_loop(status_msg, stop_evt))
+            if notes:
+                try: await status_msg.edit_text("⚙️ " + " • ".join(notes))
+                except Exception: pass
+            await asyncio.to_thread(run_pipeline, current_job, in_path, out_path, info,
+                                    ups_queue, inst_count, gov, cancel_event, is_gif,
+                                    colorize_mode, colorize_ref)
+
+            current_job["stage"] = "⬆️"
+            try: await status_msg.edit_text(f"⬆️ **Upload...** `{filename}`")
+            except Exception: pass
+            size_mb = out_path.stat().st_size / 1048576
+            if size_mb > MAX_SEND_MB:
+                raise RuntimeError(f"Output {size_mb:.0f}MB > 2GB")
+            cap = (f"✅ **{filename}**\n"
+                   f"{MODELS[model_key]['label']} • {fmt_scale(scale)}× → {ow}×{oh}\n"
+                   f"🎨 Colorize: {colorize_mode}\n"
+                   f"🎞 {current_job.get('frames_done', current_job['done'])} fr"
+                   + (f" (loop ×{current_job.get('loops', 1)})" if is_gif else "") +
+                   f" • ⚡ {current_job['spf']:.2f}s/fr • 🕒 {fmt_time(time.time() - t0)}\n"
+                   f"📦 {size_mb:.1f}MB" + (" ⚠️ 4K-cap" if capped else ""))
+
+            def ul_cb(cur, tot, *a):
+                current_job["stage"] = f"⬆️ {cur/1048576:.0f}/{tot/1048576:.0f}MB"
+
+            if is_gif:
+                await send_with_retry(lambda: app.send_animation(
+                    message.chat.id, str(out_path), caption=cap, progress=ul_cb), "animation")
+            else:
+                await send_with_retry(lambda: app.send_video(
+                    message.chat.id, str(out_path), caption=cap,
+                    supports_streaming=True, progress=ul_cb), "video")
+            if archive:
+                try:
+                    await archive.archive_video(out_path, f"{filename} | {MODELS[model_key]['label']} | "
+                                                          f"{fmt_scale(scale)}× | {fmt_time(time.time() - t0)}")
+                    archive.record_job(filename, scale, time.time() - t0, True,
+                                       extra={"scale": settings["scale"], "preset": settings["preset"],
+                                              "audio": settings["audio"], "model": model_key,
+                                              "core": settings["core"], "colorize": colorize_mode})
+                    await archive.save_state()
+                except Exception as e:
+                    log.warning("Archive fail: %s", e)
+            done_txt = (f"✅ **DONE!** `{filename}`\n"
+                        f"{MODELS[model_key]['label']} • {fmt_scale(scale)}× → {ow}×{oh}\n"
+                        f"🎞 {current_job.get('frames_done', current_job['done'])} fr • "
+                        f"⚡ {current_job['spf']:.2f}s/fr\n"
+                        f"🕒 {fmt_time(time.time() - t0)} • 📦 {size_mb:.1f}MB • 🗄 archived")
+            try: await status_msg.edit_text(done_txt)
+            except Exception: pass
+            current_job["stage"] = "✅"
+        except Exception as e:
+            log.exception("Job failed")
+            try: await status_msg.edit_text(f"❌ **FAIL:** `{filename}` — {str(e)[:180]}")
+            except Exception: pass
+            if current_job: current_job["stage"] = "❌"
+        finally:
+            if stop_evt is not None: stop_evt.set()
+            if refresher is not None:
+                try: await refresher
+                except Exception: pass
+            if job_dir: shutil.rmtree(job_dir, ignore_errors=True)
+            if out_path and out_path.exists():
+                try: out_path.unlink()
+                except Exception: pass
+            job_state["active"] = False
+            current_job = None
+            cancel_event = None
+            _panel_mode = "main"
+            gc.collect(); EMO.set("idle")
+            try: await refresh_panel()
             except Exception: pass
 
-        fixed = None
-        if settings["core"] != "auto":
-            cm = CORE_MAP.get(settings["core"])
-            if cm and cm[2] > 0: fixed = (cm[2], cm[3])
-        tile = choose_tile(model_key, ow * oh)
-        ups_queue = await asyncio.to_thread(init_ups_pool, model_key, tile, fixed)
-        inst_count = pool_instances(model_key, tile)
-        gov = Governor(ow * oh, fixed=fixed, max_workers=inst_count)
-        current_job.update({"ow": ow, "oh": oh, "stage": "🎨", "ai": gov.status(0.0)})
-        out_path = OUTPUT_DIR / f"{Path(filename).stem}_up_{message.id}.mp4"
-        t0 = time.time()
-
-        await asyncio.to_thread(run_pipeline, current_job, in_path, out_path, info,
-                                ups_queue, inst_count, gov, cancel_event, is_gif,
-                                colorize_mode, colorize_ref)
-        current_job["stage"] = "⬆️"
-        size_mb = out_path.stat().st_size / 1048576
-        if size_mb > MAX_SEND_MB:
-            raise RuntimeError(f"Output {size_mb:.0f}MB > 2GB")
-        cap = (f"✅ **{filename}**\n"
-               f"{MODELS[model_key]['label']} • {fmt_scale(scale)}× → {ow}×{oh}\n"
-               f"🎨 Colorize: {colorize_mode}\n"
-               f"🎞 {current_job.get('frames_done', current_job['done'])} fr"
-               + (f" (loop ×{current_job.get('loops', 1)})" if is_gif else "") +
-               f" • ⚡ {current_job['spf']:.2f}s/fr • 🕒 {fmt_time(time.time() - t0)}\n"
-               f"📦 {size_mb:.1f}MB" + (" ⚠️ 4K-cap" if capped else ""))
-
-        def ul_cb(cur, tot, *a):
-            current_job["stage"] = f"⬆️ {cur/1048576:.0f}/{tot/1048576:.0f}MB"
-
-        if is_gif:
-            await send_with_retry(lambda: app.send_animation(
-                message.chat.id, str(out_path), caption=cap, progress=ul_cb), "animation")
-        else:
-            await send_with_retry(lambda: app.send_video(
-                message.chat.id, str(out_path), caption=cap,
-                supports_streaming=True, progress=ul_cb), "video")
-        if archive:
-            try:
-                await archive.archive_video(out_path, f"{filename} | {MODELS[model_key]['label']} | "
-                                                      f"{fmt_scale(scale)}× | {fmt_time(time.time() - t0)}")
-                archive.record_job(filename, scale, time.time() - t0, True,
-                                   extra={"scale": settings["scale"], "preset": settings["preset"],
-                                          "audio": settings["audio"], "model": model_key,
-                                          "core": settings["core"], "colorize": colorize_mode})
-                await archive.save_state()
-            except Exception as e:
-                log.warning("Archive fail: %s", e)
-        current_job["stage"] = "✅"
-    except Exception as e:
-        log.exception("Job failed")
-        try: await message.reply_text(f"❌ Failed: {str(e)[:250]}")
-        except Exception: pass
-        if current_job: current_job["stage"] = "❌"
-    finally:
-        if job_dir: shutil.rmtree(job_dir, ignore_errors=True)
-        if out_path and out_path.exists():
-            try: out_path.unlink()
-            except Exception: pass
-        job_state["active"] = False
-        current_job = None
-        cancel_event = None
-        _panel_mode = "main"
-        gc.collect()
-        EMO.set("idle")
-        try: await refresh_panel()
-        except Exception: pass
-
-# ================= PHOTO (RRDB allowed, full quality) =================
+# ================= PHOTO =================
 @app.on_message(filters.photo & filters.private)
 async def photo_handler(client, message: Message):
     if not is_owner(message.chat.id):
         await message.reply_text("❌ Private bot."); return
     async with busy_lock:
-        if job_state.get("active"):
-            await message.reply_text("⏳ Job chal rahi hai."); return
+        if job_state.get("active") or JOB_QUEUE:
+            await message.reply_text("⏳ Videos queue me hain — photo baad me bhejo."); return
         job_state["active"] = True
-    ups = None; ups_q = None
     try:
         EMO.set("work")
         tmp = WORK_DIR / f"photo_{message.id}.jpg"
@@ -1163,14 +1208,13 @@ async def photo_handler(client, message: Message):
         colorize_mode = normalize_colorize(settings["colorize_mode"])
 
         def _do():
-            nonlocal ups
             ups = ups_q.get()
             try:
                 out = ups.enhance(img, outscale=settings["scale"])[0]
             finally:
                 ups_q.put(ups)
             if colorize_mode != "off":
-                out = colorize_frame(out, colorize_mode, 512)   # photos = full ref
+                out = colorize_frame(out, colorize_mode, 512)
             if len(out.shape) == 3 and out.shape[2] == 4: out = out[:, :, :3]
             if out.dtype != np.uint8: out = np.clip(out, 0, 255).astype(np.uint8)
             return np.ascontiguousarray(out)
@@ -1196,6 +1240,8 @@ async def photo_handler(client, message: Message):
         for f in WORK_DIR.glob(f"photo_{message.id}*"):
             try: f.unlink()
             except Exception: pass
+
+busy_lock = asyncio.Lock()
 
 # ================= COMMANDS =================
 @app.on_message(filters.command("panel") & filters.private)
@@ -1223,11 +1269,21 @@ async def stats_cmd(client, message: Message):
     if not is_owner(message.chat.id): return
     await message.reply_text(_stats_text())
 
+@app.on_message(filters.command("queue") & filters.private)
+async def queue_cmd(client, message: Message):
+    if not is_owner(message.chat.id): return
+    if not JOB_QUEUE:
+        await message.reply_text("📋 Queue khali hai."); return
+    lines = [f"📋 **Queue ({len(JOB_QUEUE)}):**"]
+    for i, j in enumerate(JOB_QUEUE, 1):
+        lines.append(f"{i}. `{j['filename']}`")
+    await message.reply_text("\n".join(lines))
+
 @app.on_message(filters.command("cancel") & filters.private)
 async def cancel_cmd(client, message: Message):
     if not is_owner(message.chat.id): return
     if cancel_event: cancel_event.set()
-    await message.reply_text("🛑 Cancel bhej di.")
+    await message.reply_text("🛑 Cancel bhej di (current job).")
 
 @app.on_message(filters.forwarded & filters.private)
 async def forward_id_handler(client, message: Message):
@@ -1238,13 +1294,13 @@ async def forward_id_handler(client, message: Message):
     else:
         await message.reply_text("❌ Forward se ID nahi mili.")
 
-@app.on_message(filters.text & filters.private & ~filters.command(["start", "panel", "reset", "stats", "cancel"]))
+@app.on_message(filters.text & filters.private & ~filters.command(["start", "panel", "reset", "stats", "cancel", "queue"]))
 async def text_handler(client, message: Message):
     if not is_owner(message.chat.id): return
     t = (message.text or "").lower()
     if any(k in t for k in ["hi", "hello", "hey", "namaste"]):
         EMO.set("happy")
-        await message.reply_text(f"{EMO.one('happy')} Namaste boss! Panel se sab control hota hai.")
+        await message.reply_text(f"{EMO.one('happy')} Namaste boss! Video bhejo → ✅ tick + live progress.")
         if _panel is None: await ensure_panel(message.chat.id)
     elif any(k in t for k in ["game", "free fire", "pubg", "bgmi"]):
         await message.reply_text("🎮 Videos ke liye Game (Fast) model best hai.")
@@ -1257,7 +1313,7 @@ async def text_handler(client, message: Message):
     elif any(k in t for k in ["thank", "shukriya", "thx"]):
         await message.reply_text("Apna kaam hai boss!")
     else:
-        await message.reply_text("🤖 v10.7: /panel se panel; videos fast SRVGG se, photos crisp RRDB se.")
+        await message.reply_text("🤖 v10.8: video bhejo → ✅ tick + LIVE progress; batch = queue.")
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client, message: Message):
@@ -1265,21 +1321,20 @@ async def start_handler(client, message: Message):
         await message.reply_text("❌ Private bot."); return
     EMO.set("start")
     await send_panel(message.chat.id)
-    await message.reply_text(f"✅ **v10.7 online!** Chat ID: `{message.chat.id}`")
+    await message.reply_text(f"✅ **v10.8 online!** Chat ID: `{message.chat.id}`")
 
 # ================= BOOT + PRE-WARM =================
 def notify_owner_startup():
     try:
         r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                           json={"chat_id": OWNER_CHAT_ID_INT or OWNER_CHAT_ID,
-                                "text": "✅ Upscaler v10.7 online!\n⚡ Speed guards + pre-warm: videos ab ~2-4s/fr."},
+                                "text": "✅ Upscaler v10.8 online!\n✅ tick message + LIVE progress + batch queue."},
                           timeout=15)
         log.info("Startup ping: %s", r.status_code)
     except Exception as e:
         log.warning("Ping fail: %s", e)
 
 def _prewarm():
-    """Background me model pool + DDColor load → pehli job turant start."""
     try:
         mk = normalize_model_key(settings["model"])
         if not MODELS[mk]["video_ok"]:
@@ -1316,14 +1371,14 @@ async def _boot():
         settings["model"] = normalize_model_key(settings["model"])
         settings["colorize_mode"] = normalize_colorize(settings["colorize_mode"])
 
-    threading.Thread(target=_prewarm, daemon=True).start()   # ⚡ instant-start pre-warm
+    threading.Thread(target=_prewarm, daemon=True).start()
 
     cid = _owner_cid()
     if cid:
         try: await send_panel(cid)
         except Exception as e: log.error("Panel send fail: %s", e)
     asyncio.create_task(_refresh_loop())
-    log.info("🚀 v10.7 ready (cores=%s)", CPU_THREADS)
+    log.info("🚀 v10.8 ready (cores=%s)", CPU_THREADS)
 
 async def _main():
     try:
