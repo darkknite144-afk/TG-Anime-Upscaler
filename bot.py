@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-Smart Anime/Game Upscaler v6
-- 🧠 Governor v2: CPU-load + RAM EMA se khud upgrade/downgrade decisions
-- 💾 RAM-minimal streaming: decode q=2, out backlog=2, frame encode hote hi free
-- ⚙️ Encode threads=1 (jab workers>=2) → CPU poora upscale ko
+Smart Anime/Game Upscaler v7
+- 🧠 Governor v2: CPU-load + RAM EMA se khud upgrade/downgrade
+- 💾 RAM-minimal streaming (decode q=2, backlog=2, frame encode hote hi free)
 - 🎌 Anime / 🎮 Game Fast / 🎮 Game HQ models
-- 📚 Channel archive (settings/history/videos) + panel UI + webhook wipe + HTTP ping
+- 🖼 Photo upscale + ⬅️➡️ Before/After preview
+- 📤 Upload auto-retry (3 attempts, FloodWait-safe)
+- ⏰ Job watchdog + 💓 heartbeat + 🧪 archive self-test + /stats
+- 📚 Channel archive (settings/history/videos) + panel UI
 """
 import asyncio
 import gc
@@ -22,10 +24,12 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import cv2
 import numpy as np
 import requests
 import torch
 from pyrogram import Client, filters
+from pyrogram.errors import FloodWait
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from realesrgan import RealESRGANer
 from realesrgan.archs.srvgg_arch import SRVGGNetCompact
@@ -59,9 +63,10 @@ MAX_FRAMES = 3600
 MAX_GIF_FRAMES = 240
 MAX_OUT_PIXELS = 3840 * 2160
 MAX_SEND_MB = 1900
+MAX_JOB_SEC = int(os.getenv("MAX_JOB_MIN", "300")) * 60
 GIF_MIN_SEC = 2.0
-IN_QUEUE = 2          # decode queue: sirf 2 raw frames RAM me
-OUT_BACKLOG = 2       # encode-waiting: sirf 2 upscaled frames RAM me
+IN_QUEUE = 2
+OUT_BACKLOG = 2
 CPU_THREADS = os.cpu_count() or 4
 POOL = ThreadPoolExecutor(max_workers=4)
 os.environ["OMP_NUM_THREADS"] = str(CPU_THREADS)
@@ -77,9 +82,10 @@ PRESETS = {"fast": {"crf": "23", "preset": "veryfast"},
 
 settings = {"scale": 2.0, "preset": "balanced", "audio": "keep", "model": "anime"}
 job_state = {"active": False}
+current_job: Optional[Dict[str, Any]] = None
 cancel_event: Optional[threading.Event] = None
 
-# ================= SYSTEM MONITOR =================
+# ================= SYSTEM =================
 def mem_avail_gb() -> float:
     try:
         with open("/proc/meminfo") as f:
@@ -106,33 +112,29 @@ def bar(pct: float, n: int = 8) -> str:
     f = int(n * min(100, max(0, pct)) / 100)
     return "▰" * f + "▱" * (n - f)
 
-# ================= GOVERNOR v2 (self-deciding AI) =================
+# ================= GOVERNOR v2 =================
 CONFIGS = [(1, 4), (2, 2), (2, 3), (3, 1), (4, 1)]
 DOWNGRADE = {(4, 1): (3, 1), (3, 1): (2, 2), (2, 3): (2, 2), (2, 2): (1, 2),
              (1, 4): (1, 2), (1, 2): (1, 1), (1, 1): (1, 1)}
 PROBE, EXPLOIT = 6, 12
 
 class Governor:
-    """Frame-time + CPU-load + RAM — teeno ka EMA rakhta hai aur khud
-    upgrade/downgrade/probe decisions leta hai."""
     def __init__(self, out_px: int):
-        self.fp = out_px * 512 / 1e9                     # GB per in-flight frame
+        self.fp = out_px * 512 / 1e9
         self.ema = {c: 0.0 for c in CONFIGS}
         self.cnt = {c: 0 for c in CONFIGS}
-        start = (2, 2)
-        if not self._ram_ok(start[0]):
-            start = (1, 2) if self._ram_ok(1) else (1, 1)
+        start = (2, 2) if self._ram_ok(2) else ((1, 2) if self._ram_ok(1) else (1, 1))
         self.current = start
         self.probe_left, self.exploit = PROBE, 0
         self.load_ema = load1(); self.ram_ema = mem_avail_gb()
         self.press = 0; self.idle = 0; self.safe = False
         self.lock = threading.Lock()
         self.apply()
-        log.info("🧠 Governor v2 start %s | fp %.2fGB/fr | RAM %.1fGB | load %.1f",
+        log.info("🧠 Governor v2 %s | fp %.2fGB/fr | RAM %.1fGB | load %.1f",
                  self.current, self.fp, self.ram_ema, self.load_ema)
 
-    def _ram_ok(self, workers: int) -> bool:
-        return workers * self.fp <= max(1.0, mem_avail_gb() * 0.7)
+    def _ram_ok(self, w: int) -> bool:
+        return w * self.fp <= max(1.0, mem_avail_gb() * 0.7)
 
     def apply(self):
         torch.set_num_threads(self.current[1])
@@ -150,7 +152,6 @@ class Governor:
             self.ram_ema = self.ram_ema * 0.8 + mem_avail_gb() * 0.2
             if done % 20 == 0:
                 gc.collect()
-            # --- pressure: RAM kam ya load bahut zyada → turant downgrade ---
             if self.ram_ema < 1.2 or self.load_ema > CPU_THREADS * 1.5:
                 self.press += 1; self.idle = 0
                 if self.press >= 2:
@@ -158,26 +159,20 @@ class Governor:
                     nxt = DOWNGRADE.get(self.current, self.current)
                     if nxt != self.current:
                         self.current = nxt; self.apply()
-                        log.warning("🛡 DOWNGRADE -> %s (RAM %.1fGB, load %.1f)",
-                                    nxt, self.ram_ema, self.load_ema)
+                        log.warning("🛡 DOWNGRADE -> %s (RAM %.1fGB, load %.1f)", nxt, self.ram_ema, self.load_ema)
                     return
             else:
                 self.press = 0
                 if self.safe and self.ram_ema > 3.0 and self.load_ema < CPU_THREADS * 0.9:
                     self.safe = False
-                    log.info("🛡 safe-mode OFF (RAM %.1fGB, load %.1f)", self.ram_ema, self.load_ema)
-            # --- cores khali padhe hain → khud upgrade probe ---
+                    log.info("🛡 safe-mode OFF (RAM %.1fGB)", self.ram_ema)
             if not self.safe and self.load_ema < CPU_THREADS * 0.55 and self.ram_ema > 4.0:
                 self.idle += 1
                 if self.idle >= 4:
-                    self.idle = 0
-                    self._probe(up=True)
-                    return
+                    self.idle = 0; self._probe(up=True); return
             else:
                 self.idle = 0
-            if self.safe:
-                return
-            # --- normal explore/exploit cycle ---
+            if self.safe: return
             if self.probe_left > 0:
                 self.probe_left -= 1
                 if self.probe_left == 0:
@@ -185,23 +180,20 @@ class Governor:
                 return
             if self.exploit > 0:
                 self.exploit -= 1
-                if self.exploit == 0:
-                    self._probe()
+                if self.exploit == 0: self._probe()
                 return
             self._probe()
 
     def _probe(self, up: bool = False):
         if up:
-            target = next((c for c in CONFIGS
-                           if c[0] == self.current[0] + 1 and self._ram_ok(c[0])), None)
+            target = next((c for c in CONFIGS if c[0] == self.current[0] + 1 and self._ram_ok(c[0])), None)
             if target is None:
                 self.probe_left = PROBE; return
         else:
             cand = [c for c in CONFIGS if self.cnt[c] < 3 and self._ram_ok(c[0])]
             if not cand:
                 cand = [c for c in CONFIGS if self._ram_ok(c[0])]
-            if not cand:
-                return
+            if not cand: return
             target = cand[0]
         if target != self.current:
             self.current = target; self.apply()
@@ -224,19 +216,16 @@ class Governor:
 # ================= MODELS =================
 _ups_cache: Dict[Any, RealESRGANer] = {}
 
-def choose_tile(model_key: str, out_px: int) -> int:
-    if MODELS[model_key]["arch"] == "rrdb":
-        return 256
+def choose_tile(key: str, out_px: int) -> int:
+    if MODELS[key]["arch"] == "rrdb": return 256
     return 0 if out_px <= 2_600_000 else 320
 
-def get_ups(model_key: str, tile: int) -> RealESRGANer:
-    k = (model_key, tile)
+def get_ups(key: str, tile: int) -> RealESRGANer:
+    k = (key, tile)
     if k in _ups_cache: return _ups_cache[k]
-    m = MODELS[model_key]
-    path = MODEL_DIR / m["file"]
-    if not path.exists():
-        raise FileNotFoundError(f"Model missing: {path}")
-    log.info("Loading model %s (tile=%s)...", m["file"], tile)
+    m = MODELS[key]; path = MODEL_DIR / m["file"]
+    if not path.exists(): raise FileNotFoundError(f"Model missing: {path}")
+    log.info("Loading %s (tile=%s)...", m["file"], tile)
     if m["arch"] == "rrdb":
         model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
     else:
@@ -269,8 +258,7 @@ def model_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🎌 Anime (fast)", callback_data="b:m:anime")],
         [InlineKeyboardButton("🎮 Game Fast (FF/PUBG)", callback_data="b:m:game")],
         [InlineKeyboardButton("🎮 Game HQ (best, slow)", callback_data="b:m:gamehq")],
-        [InlineKeyboardButton("🔙 Panel", callback_data="b:back")],
-    ])
+        [InlineKeyboardButton("🔙 Panel", callback_data="b:back")]])
 
 def q_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -293,19 +281,20 @@ def a_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔙 Panel", callback_data="b:back")]])
 
 def panel_text() -> str:
-    lines = [f"🎛 **Upscaler v6** • 🧠 {CPU_THREADS} cores • 🛡 {mem_avail_gb():.1f}GB free • load {load1():.1f}",
+    lines = [f"🎛 **Upscaler v7** • 🧠 {CPU_THREADS} cores • 🛡 {mem_avail_gb():.1f}GB free • load {load1():.1f}",
              f"Model: {MODELS[settings['model']]['label']} • {fmt_scale(settings['scale'])}× • "
              f"{settings['preset'].title()} • 🔊 {settings['audio'].title()}", ""]
-    j = job_state
-    if j.get("active") and j.get("total"):
-        pct = j["done"] * 100 / j["total"] if j["total"] else 0
-        lines += [f"{j.get('stage', '🎨')} **{j['filename'][:22]}** — {bar(pct)} {pct:.0f}%",
-                  f"   {j['done']}/{j['total']} fr • ⏱ ETA {fmt_time(j.get('eta', 0))}",
-                  "   " + j.get("ai", "")]
-    elif j.get("active"):
-        lines += [f"{j.get('stage', '📥')} **{j.get('filename', '')[:22]}**"]
+    if job_state.get("active") and current_job:
+        j = current_job
+        if j.get("total"):
+            pct = j["done"] * 100 / j["total"]
+            lines += [f"{j.get('stage', '🎨')} **{j['filename'][:22]}** — {bar(pct)} {pct:.0f}%",
+                      f"   {j['done']}/{j['total']} fr • ⏱ ETA {fmt_time(j.get('eta', 0))}",
+                      "   " + j.get("ai", "")]
+        else:
+            lines += [f"{j.get('stage', '📥')} **{j.get('filename', '')[:22]}**"]
     else:
-        lines += ["😴 Idle — video/GIF bhejo. Model button se 🎌/🎮 mode chuno."]
+        lines += ["😴 Idle — video/GIF/photo bhejo. Model button se 🎌/🎮 chuno."]
     return "\n".join(lines)
 
 async def ensure_panel(cid: int) -> Message:
@@ -388,13 +377,13 @@ def probe_video(path: Path) -> Dict:
             "duration": dur, "frames": frames,
             "has_audio": any(s.get("codec_type") == "audio" for s in data["streams"])}
 
-# ================= PIPELINE (RAM-minimal streaming) =================
+# ================= PIPELINE =================
 def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Governor,
-                 cancel: threading.Event, is_gif: bool):
+                 cancel: threading.Event, is_gif: bool, prev_dir: Path):
     w, h, fps = info["width"], info["height"], info["fps"]
     ow, oh = job["ow"], job["oh"]
     ff = PRESETS[settings["preset"]]
-    enc_threads = 1 if gov.current[0] >= 2 else 2     # CPU poora upscale ko
+    enc_threads = 1 if gov.current[0] >= 2 else 2
     fps_g = fps if fps > 0 else 10.0
     total = min(info["frames"] or max(1, int(info["duration"] * fps)),
                 MAX_GIF_FRAMES if is_gif else 10 ** 9)
@@ -406,6 +395,7 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Gover
     in_q: queue.Queue = queue.Queue(maxsize=IN_QUEUE)
     futs = []
     futs_cond = threading.Condition()
+    t_start = time.time()
 
     def reader():
         fb = w * h * 3
@@ -427,13 +417,17 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Gover
         t0 = time.time()
         out, _ = ups.enhance(img, outscale=settings["scale"])
         dt = time.time() - t0
-        del img                                   # input frame turant free
         with stats_lock:
+            first = (stats["done"] == 0)
             stats["done"] += 1; stats["sum"] += dt
             job["done"] = stats["done"]
             job["spf"] = stats["sum"] / stats["done"]
             job["eta"] = (total - job["done"]) * job["spf"] / max(1, gov.current[0])
             job["ai"] = gov.status(job["spf"])
+        if first:
+            try: cv2.imwrite(str(prev_dir / "prev_out.png"), out)
+            except Exception: pass
+        del img
         gov.on_frame(cfg, dt, stats["done"])
         return out
 
@@ -462,10 +456,9 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Gover
                 if f is None: break
             arr = f.result()
             enc.stdin.write(arr.tobytes())
-            del arr                               # upscaled frame turant free
+            del arr
             with futs_cond:
-                futs[i] = None                    # reference free → RAM khali
-                encoded[0] += 1
+                futs[i] = None; encoded[0] += 1
             i += 1
         enc.stdin.close(); enc.wait()
 
@@ -477,9 +470,13 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Gover
                 img = in_q.get()
                 if img is None: break
                 frames_raw.append(img)
+            if frames_raw:
+                try: cv2.imwrite(str(prev_dir / "prev_in.png"), frames_raw[0])
+                except Exception: pass
             outs = []
             for fr in frames_raw:
                 if cancel.is_set(): raise RuntimeError("Cancelled")
+                if time.time() - t_start > MAX_JOB_SEC: raise RuntimeError("Job time-limit cross")
                 outs.append(upscale_one(fr, gov.current))
             frames_raw.clear(); gc.collect()
             loops = min(max(1, math.ceil(GIF_MIN_SEC / (len(outs) / fps_g))),
@@ -504,9 +501,15 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Gover
                 if cancel.is_set():
                     with futs_cond: futs.append(None); futs_cond.notify_all()
                     raise RuntimeError("Cancelled")
+                if time.time() - t_start > MAX_JOB_SEC:
+                    with futs_cond: futs.append(None); futs_cond.notify_all()
+                    raise RuntimeError("Job time-limit cross")
                 img = in_q.get()
                 if img is None: break
-                while (i - encoded[0]) >= OUT_BACKLOG:      # RAM cap: max 2 waiting
+                if i == 0:
+                    try: cv2.imwrite(str(prev_dir / "prev_in.png"), img)
+                    except Exception: pass
+                while (i - encoded[0]) >= OUT_BACKLOG:
                     time.sleep(0.01)
                     if cancel.is_set():
                         with futs_cond: futs.append(None); futs_cond.notify_all()
@@ -521,32 +524,61 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Gover
         if enc is not None and enc.returncode not in (0, None):
             raise RuntimeError("FFmpeg encode failed")
         job["frames_done"] = job["done"]
+        job["seconds"] = time.time() - t_start
     finally:
         for p in (dec, enc):
             try:
                 if p and p.poll() is None: p.kill()
             except Exception: pass
 
+def make_compare(prev_dir: Path) -> Optional[Path]:
+    a = cv2.imread(str(prev_dir / "prev_in.png"))
+    b = cv2.imread(str(prev_dir / "prev_out.png"))
+    if a is None or b is None: return None
+    b = cv2.resize(b, (a.shape[1], a.shape[0]))
+    sep = np.full((a.shape[0], 6, 3), 255, np.uint8)
+    comp = np.hstack([a, sep, b])
+    out = prev_dir / "compare.png"
+    cv2.imwrite(str(out), comp)
+    return out
+
+# ================= UPLOAD RETRY =================
+async def send_with_retry(fn, desc: str):
+    for attempt in range(1, 4):
+        try:
+            return await fn()
+        except FloodWait as fw:
+            log.warning("⏳ FloodWait %ss (%s)", fw.value, desc)
+            await asyncio.sleep(fw.value + 2)
+        except Exception as e:
+            log.warning("📤 %s attempt %s fail: %s", desc, attempt, e)
+            if attempt == 3: raise
+            await asyncio.sleep(5 * attempt)
+
 # ================= JOB =================
 busy_lock = asyncio.Lock()
 
 async def _refresh_loop():
+    hb = 0
     while True:
         await refresh_panel()
+        hb += 1
+        if hb % 24 == 0 and job_state.get("active") and current_job:
+            log.info("💓 heartbeat | %s fr | RAM %.1fGB | load %.1f",
+                     current_job.get("done", 0), mem_avail_gb(), load1())
         await asyncio.sleep(2.5)
 
 @app.on_message((filters.video | filters.document | filters.animation) & filters.private)
 async def media_handler(client, message: Message):
-    global cancel_event, _panel
+    global cancel_event, current_job
     if str(message.chat.id) != OWNER_CHAT_ID:
         await message.reply_text("❌ Private bot."); return
-    async with busy_lock:                                  # EK job at a time
+    async with busy_lock:
         if job_state.get("active"):
             await message.reply_text("⏳ Ek job chal rahi hai."); return
-        job_state.update({"active": True, "done": 0, "total": 0, "stage": "📥"})
+        job_state["active"] = True
         cancel_event = threading.Event()
-    job_dir = None
-    out_path = None
+    job_dir = None; out_path = None
     refresher = asyncio.create_task(_refresh_loop())
     try:
         media = message.video or message.document or message.animation
@@ -555,17 +587,18 @@ async def media_handler(client, message: Message):
         is_gif = filename.lower().endswith(".gif") or mime == "image/gif"
         if not filename.lower().endswith((".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".gif")):
             await message.reply_text("❌ Sirf video/GIF bhejo."); return
-        job_state["filename"] = filename
         await ensure_panel(message.chat.id)
         job_dir = WORK_DIR / f"job_{message.id}_{int(time.time())}"
         job_dir.mkdir(parents=True, exist_ok=True)
         in_path = job_dir / filename
+        current_job = {"filename": filename, "ow": 0, "oh": 0, "done": 0, "total": 0,
+                       "spf": 0.0, "eta": 0.0, "ai": "", "stage": "📥", "loops": 1}
 
         def dl_cb(cur, tot, *a):
-            job_state["stage"] = f"📥 {cur/1048576:.0f}/{tot/1048576:.0f}MB"
+            current_job["stage"] = f"📥 {cur/1048576:.0f}/{tot/1048576:.0f}MB"
         await app.download_media(message, file_name=str(in_path), progress=dl_cb)
 
-        job_state["stage"] = "🔍"
+        current_job["stage"] = "🔍"
         info = await asyncio.to_thread(probe_video, in_path)
         if not is_gif and info["frames"] > MAX_FRAMES:
             await message.reply_text(f"❌ Video bahut lambi: {info['frames']} frames (max {MAX_FRAMES}).")
@@ -579,35 +612,41 @@ async def media_handler(client, message: Message):
             ow = int(info["width"] * scale); ow += ow % 2
             oh = int(info["height"] * scale); oh += oh % 2
         model_key = settings["model"]
-        tile = choose_tile(model_key, ow * oh)
-        ups = await asyncio.to_thread(get_ups, model_key, tile)
+        ups = await asyncio.to_thread(get_ups, model_key, choose_tile(model_key, ow * oh))
         gov = Governor(ow * oh)
-        job_state.update({"filename": filename, "ow": ow, "oh": oh, "done": 0,
-                          "total": 0, "spf": 0.0, "eta": 0.0,
-                          "ai": gov.status(0.0), "stage": "🎨", "loops": 1})
+        current_job.update({"ow": ow, "oh": oh, "stage": "🎨", "ai": gov.status(0.0)})
         out_path = OUTPUT_DIR / f"{Path(filename).stem}_up_{message.id}.mp4"
         t0 = time.time()
 
-        await asyncio.to_thread(run_pipeline, job_state, in_path, out_path, info,
-                                ups, gov, cancel_event, is_gif)
-        job_state.update({"stage": "⬆️"})
+        await asyncio.to_thread(run_pipeline, current_job, in_path, out_path, info,
+                                ups, gov, cancel_event, is_gif, job_dir)
+        current_job["stage"] = "⬆️"
         size_mb = out_path.stat().st_size / 1048576
         if size_mb > MAX_SEND_MB:
             raise RuntimeError(f"Output {size_mb:.0f}MB > 2GB limit")
 
         cap = (f"✅ **{filename}**\n{MODELS[model_key]['label']} • {fmt_scale(scale)}× → {ow}×{oh}\n"
-               f"🎞 {job_state.get('frames_done', job_state['done'])} fr"
-               + (f" (loop ×{job_state.get('loops', 1)})" if is_gif else "") +
-               f" • ⚡ {job_state['spf']:.2f}s/fr • 🕒 {fmt_time(time.time() - t0)}\n"
+               f"🎞 {current_job.get('frames_done', current_job['done'])} fr"
+               + (f" (loop ×{current_job.get('loops', 1)})" if is_gif else "") +
+               f" • ⚡ {current_job['spf']:.2f}s/fr • 🕒 {fmt_time(time.time() - t0)}\n"
                f"📦 {size_mb:.1f}MB" + (" ⚠️ 4K-cap" if capped else ""))
 
         def ul_cb(cur, tot, *a):
-            job_state["stage"] = f"⬆️ {cur/1048576:.0f}/{tot/1048576:.0f}MB"
+            current_job["stage"] = f"⬆️ {cur/1048576:.0f}/{tot/1048576:.0f}MB"
+
+        comp = await asyncio.to_thread(make_compare, job_dir)
+        if comp:
+            try:
+                await app.send_photo(message.chat.id, str(comp), caption="⬅️ Before | ➡️ After")
+            except Exception: pass
+
         if is_gif:
-            await app.send_animation(message.chat.id, str(out_path), caption=cap, progress=ul_cb)
+            await send_with_retry(lambda: app.send_animation(
+                message.chat.id, str(out_path), caption=cap, progress=ul_cb), "animation")
         else:
-            await app.send_video(message.chat.id, str(out_path), caption=cap,
-                                 supports_streaming=True, progress=ul_cb)
+            await send_with_retry(lambda: app.send_video(
+                message.chat.id, str(out_path), caption=cap,
+                supports_streaming=True, progress=ul_cb), "video")
         if archive:
             await archive.archive_video(out_path, f"{filename} | {MODELS[model_key]['label']} | "
                                                   f"{fmt_scale(scale)}× | {fmt_time(time.time() - t0)}")
@@ -615,12 +654,12 @@ async def media_handler(client, message: Message):
                                extra={"scale": settings["scale"], "preset": settings["preset"],
                                       "audio": settings["audio"], "model": model_key})
             await archive.save_state()
-        job_state["stage"] = "✅"
+        current_job["stage"] = "✅"
     except Exception as e:
         log.exception("Job failed")
         try: await message.reply_text(f"❌ Failed: {str(e)[:250]}")
         except Exception: pass
-        job_state["stage"] = "❌"
+        if current_job: current_job["stage"] = "❌"
     finally:
         refresher.cancel()
         if job_dir: shutil.rmtree(job_dir, ignore_errors=True)
@@ -628,21 +667,81 @@ async def media_handler(client, message: Message):
             try: out_path.unlink()
             except Exception: pass
         job_state["active"] = False
+        current_job = None
         cancel_event = None
         gc.collect()
         await refresh_panel()
 
-# ================= TEXT / START =================
-@app.on_message(filters.text & filters.private & ~filters.command(["start"]))
+# ================= PHOTO =================
+@app.on_message(filters.photo & filters.private)
+async def photo_handler(client, message: Message):
+    if str(message.chat.id) != OWNER_CHAT_ID:
+        await message.reply_text("❌ Private bot."); return
+    async with busy_lock:
+        if job_state.get("active"):
+            await message.reply_text("⏳ Job chal rahi hai, photo baad me bhejo."); return
+        job_state["active"] = True
+    tmp = None
+    try:
+        tmp = WORK_DIR / f"photo_{message.id}.jpg"
+        await app.download_media(message, file_name=str(tmp))
+        img = cv2.imread(str(tmp))
+        if img is None: raise RuntimeError("Image read fail")
+        model_key = settings["model"]
+        h, w = img.shape[:2]
+        ow = int(w * settings["scale"]); oh = int(h * settings["scale"])
+        ups = await asyncio.to_thread(get_ups, model_key, choose_tile(model_key, ow * oh))
+        t0 = time.time()
+        out = await asyncio.to_thread(lambda: ups.enhance(img, outscale=settings["scale"])[0])
+        dt = time.time() - t0
+        outp = WORK_DIR / f"photo_{message.id}_up.png"
+        cv2.imwrite(str(outp), out)
+        await send_with_retry(lambda: app.send_photo(
+            message.chat.id, str(outp),
+            caption=f"✅ Photo upscale {MODELS[model_key]['label']} • "
+                    f"{fmt_scale(settings['scale'])}× • {w}×{h} → {out.shape[1]}×{out.shape[0]} • {dt:.1f}s"), "photo")
+    except Exception as e:
+        log.exception("Photo fail")
+        try: await message.reply_text(f"❌ Photo fail: {str(e)[:200]}")
+        except Exception: pass
+    finally:
+        job_state["active"] = False
+        for f in WORK_DIR.glob(f"photo_{message.id}*"):
+            try: f.unlink()
+            except Exception: pass
+
+# ================= TEXT / COMMANDS =================
+@app.on_message(filters.command("stats") & filters.private)
+async def stats_cmd(client, message: Message):
+    if str(message.chat.id) != OWNER_CHAT_ID: return
+    if not archive:
+        await message.reply_text("ℹ️ Archive channel set nahi hai."); return
+    st = archive.state
+    hist = st.get("history", [])
+    tot_t = sum(x.get("t", 0) for x in hist)
+    lines = [f"📊 **Stats**\n✅ Jobs done: {st.get('jobs_done', 0)}",
+             f"🕒 Total process time: {fmt_time(tot_t)}"]
+    for x in hist[-3:]:
+        lines.append(f"• {x.get('f', '?')[:24]} | {x.get('s', 0)}× | {fmt_time(x.get('t', 0))}")
+    await message.reply_text("\n".join(lines))
+
+@app.on_message(filters.command("cancel") & filters.private)
+async def cancel_cmd(client, message: Message):
+    if str(message.chat.id) != OWNER_CHAT_ID: return
+    if cancel_event: cancel_event.set()
+    await message.reply_text("🛑 Cancel request bhej di.")
+
+@app.on_message(filters.text & filters.private & ~filters.command(["start", "stats", "cancel"]))
 async def text_handler(client, message: Message):
     if str(message.chat.id) != OWNER_CHAT_ID: return
     t = (message.text or "").lower()
     if any(k in t for k in ["game", "free fire", "pubg", "bgmi"]):
-        await message.reply_text("🎮 Game videos: panel me model button → 'Game (Fast)' ya 'Game (HQ)'.")
+        await message.reply_text("🎮 Game videos: panel me model button → Game (Fast) ya Game (HQ).")
     elif any(k in t for k in ["ram", "cpu", "load"]):
         await message.reply_text(f"🛡 RAM free: {mem_avail_gb():.1f}GB • load: {load1():.1f} • cores: {CPU_THREADS}")
     else:
-        await message.reply_text("🤖 Panel se sab control: model 🎌/🎮, scale, preset, audio. Video/GIF bhejo.")
+        await message.reply_text("🤖 v7: video/GIF/photo bhejo. Panel se model 🎌/🎮, scale, preset, audio. "
+                                 "/stats dekho, /cancel se roko.")
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client, message: Message):
@@ -660,7 +759,7 @@ def notify_owner_startup():
     try:
         r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                           json={"chat_id": OWNER_CHAT_ID,
-                                "text": "✅ Upscaler v6 online!\n🧠 Governor v2 (CPU+RAM self-deciding) + RAM-minimal pipeline.\nPanel ke buttons se control karo."},
+                                "text": "✅ Upscaler v7 online!\n🖼 Photo + ️➡️ Preview + 📤 retry + 🧪 self-test.\nPanel se control karo."},
                           timeout=15)
         log.info("Startup ping: %s", r.status_code)
     except Exception as e:
@@ -676,11 +775,29 @@ async def _boot():
         settings["audio"] = st.get("audio", settings["audio"])
         settings["model"] = st.get("model", settings["model"])
         log.info("📚 Archive settings: %s", settings)
-    log.info("🚀 v6 ready (cores=%s)", CPU_THREADS)
+        if archive.channel_id:
+            try:
+                m = await app.send_message(archive.channel_id, "🧪 Archive self-test...")
+                await m.delete()
+                log.info("✅ Archive channel WRITE test OK")
+            except Exception as e:
+                log.error("❌ Archive channel WRITE FAIL: %s", e)
+    log.info("🚀 v7 ready (cores=%s)", CPU_THREADS)
+
+async def _main():
+    try:
+        await app.start()
+        log.info("🔌 Client started — ab boot...")
+        await _boot()
+        await app.idle()
+    finally:
+        try: await app.stop()
+        except Exception: pass
 
 if __name__ == "__main__":
     try:
         r = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=True", timeout=15)
         log.info("🧹 Webhook: %s", r.text[:120])
-    except Exception: pass
-    app.run(_boot())
+    except Exception as e:
+        log.warning("Webhook delete fail: %s", e)
+    asyncio.run(_main())
