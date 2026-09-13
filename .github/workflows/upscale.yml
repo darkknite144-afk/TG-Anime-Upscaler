@@ -19,7 +19,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: weights
-          key: realesrgan-weights-v5
+          key: realesrgan-weights-v8
 
       - name: Install FFmpeg
         run: |
