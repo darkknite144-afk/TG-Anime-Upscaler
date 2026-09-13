@@ -6,7 +6,6 @@ FIXES:
   - ✅ Black lines / rotation distortion (explicit transpose)
   - ✅ Legacy archive migration (anime → anime_video)
   - ✅ FFMPEG pipe dimension matching (black box fix)
-  - ✅ Real-ESRGAN tile pre_pad fix (grid lines fix)
 """
 import asyncio, gc, json, logging, math, os, queue, random, shutil, subprocess, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor
@@ -320,9 +319,9 @@ def get_ups(key: str, tile: int) -> RealESRGANer:
         log.info("Loading %s (RRDBNet, tile=%s)...", m["file"], tile)
         nb = 6 if "anime_6B" in m["file"] else 23
         model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=nb, num_grow_ch=32, scale=4)
-        # FIX: pre_pad=10 avoids black tile grids at borders
+        # Reverted pre_pad=0 to fix tensor mismatch crash
         ups = RealESRGANer(scale=4, model_path=str(path), model=model, tile=tile,
-                           tile_pad=16, pre_pad=10, half=False, device=torch.device("cpu"))
+                           tile_pad=16, pre_pad=0, half=False, device=torch.device("cpu"))
         _ups_cache[k] = ups; return ups
 
     nconv = _detect_srvgg_num_conv(path)
@@ -332,9 +331,9 @@ def get_ups(key: str, tile: int) -> RealESRGANer:
         try:
             model = SRVGGNetCompact(num_in_ch=3, num_out_ch=3, num_feat=64,
                                     num_conv=nc, upscale=4, act_type="prelu")
-            # FIX: pre_pad=10 avoids black tile grids at borders
+            # Reverted pre_pad=0 to fix tensor mismatch crash
             ups = RealESRGANer(scale=4, model_path=str(path), model=model, tile=tile,
-                               tile_pad=16, pre_pad=10, half=False, device=torch.device("cpu"))
+                               tile_pad=16, pre_pad=0, half=False, device=torch.device("cpu"))
             if nc != nconv: log.info("✅ Fallback num_conv=%s worked!", nc)
             _ups_cache[k] = ups; return ups
         except Exception as e:
@@ -366,7 +365,7 @@ def _load_ddcolor(mode: str):
                         super().__init__(**kwargs)
             except Exception: DDColorHF = DDColor
             log.info("🎨 Loading DDColor %s ...", mode)
-            model = DDColorHF.frompretrained(str(path))
+            model = DDColorHF.from_pretrained(str(path))
             model.eval()
             _ddcolor_cache[mode] = model
             log.info("✅ DDColor %s ready", mode)
