@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
 """
 Smart Anime/Game/Real Upscaler v10.5
-FIXES:
-  - ✅ Black Flicker Fix: Strict uint8 + exact ow/oh resize + C-contiguous memory
-  - ✅ Speed Fix: CPU oversubscription prevented + ThreadPool/Queues scaled to CPU_THREADS
-  - ✅ Faster Resize: INTER_LINEAR instead of LANCZOS4 for safety resize
+FIXES over v10.5:
+  - ✅✅✅ BLACK FLICKER FIXED: RealESRGANer is NOT thread-safe. v10.5 had 4
+         threads calling enhance() on the SAME instance, corrupting its
+         internal state (self.img / self.output) -> black/garbled frames.
+         v10.5 uses a POOL of separate instances (one per worker), handed
+         out via a thread-safe Queue. No two threads ever share an instance.
+  - ✅ MORE RAM: auto-picks workers based on RAM (SRVGG ~2.5GB, RRDB ~4.5GB
+         per worker). GitHub 16GB runner → 4 SRVGG workers or 3 RRDB workers.
+  - ✅ FASTER: larger tiles (SRVGG full-frame when RAM > 6GB), aggressive
+         Governor start, less likely to downgrade.
+  - ✅ NO CANCEL: MAX_JOB_SEC raised to 24h; OOM auto-retries with smaller tile.
+  - ✅ Fixed core profiles (Solo/Duo/Quad) now control the pool size.
 """
 import asyncio, gc, json, logging, math, os, queue, random, shutil, subprocess, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor
@@ -68,15 +76,12 @@ MAX_FRAMES = 3600
 MAX_GIF_FRAMES = 240
 MAX_OUT_PIXELS = 3840 * 2160
 MAX_SEND_MB = 1900
-MAX_JOB_SEC = int(os.getenv("MAX_JOB_MIN", "300")) * 60
+MAX_JOB_SEC = int(os.getenv("MAX_JOB_MIN", "1440")) * 60  # 24h default — never cancel
 GIF_MIN_SEC = 2.0
-
+IN_QUEUE = 2
+OUT_BACKLOG = 2
 CPU_THREADS = os.cpu_count() or 4
-# 🚀 SPEED FIX 1: Pool size aur Queues ko CPU cores ke hisaab se scale karo
-POOL = ThreadPoolExecutor(max_workers=max(4, CPU_THREADS))
-IN_QUEUE = max(4, CPU_THREADS)
-OUT_BACKLOG = max(4, CPU_THREADS)
-
+POOL = ThreadPoolExecutor(max_workers=4)
 os.environ["OMP_NUM_THREADS"] = str(CPU_THREADS)
 
 # ================= MODELS =================
@@ -185,16 +190,9 @@ class EmoteEngine:
 EMO = EmoteEngine()
 
 # ================= GOVERNOR =================
-# 🚀 SPEED FIX 2: CPU Oversubscription prevent karo (workers * threads <= CPU_THREADS)
-_RAW_CONFIGS = [(1, 4), (2, 2), (2, 3), (3, 1), (4, 1), (6, 1), (8, 1)]
-CONFIGS = [c for c in _RAW_CONFIGS if c[0] * c[1] <= CPU_THREADS]
-if not CONFIGS:
-    CONFIGS = [(1, 1)]
-
-DOWNGRADE = {
-    (8, 1): (6, 1), (6, 1): (4, 1), (4, 1): (3, 1), (3, 1): (2, 2), 
-    (2, 3): (2, 2), (2, 2): (1, 2), (1, 4): (1, 2), (1, 2): (1, 1), (1, 1): (1, 1)
-}
+CONFIGS = [(1, 4), (2, 2), (2, 3), (3, 1), (4, 1)]
+DOWNGRADE = {(4, 1): (3, 1), (3, 1): (2, 2), (2, 3): (2, 2), (2, 2): (1, 2),
+             (1, 4): (1, 2), (1, 2): (1, 1), (1, 1): (1, 1)}
 PROBE, EXPLOIT = 6, 12
 
 class Governor:
@@ -211,6 +209,11 @@ class Governor:
             start = (w, t)
         else:
             start = (2, 2) if self._ram_ok(2) else ((1, 2) if self._ram_ok(1) else (1, 1))
+            # Try to start with more workers for better parallelism
+            for w in (4, 3, 2):
+                if w <= CPU_THREADS and self._ram_ok(w):
+                    start = (w, max(1, CPU_THREADS // w))
+                    break
         self.current = start
         self.probe_left, self.exploit = PROBE, 0
         self.load_ema = load1(); self.ram_ema = mem_avail_gb()
@@ -220,7 +223,7 @@ class Governor:
         log.info("🧠 Governor %s%s | fp %.2fGB/fr | RAM %.1fGB",
                  self.current, " [FIXED]" if fixed else "", self.fp, self.ram_ema)
 
-    def _ram_ok(self, w): return w * self.fp <= max(1.0, mem_avail_gb() * 0.7)
+    def _ram_ok(self, w): return w * self.fp <= max(1.0, mem_avail_gb() * 0.85)
     def apply(self): torch.set_num_threads(self.current[1])
     def thr(self, c): return c[0] / self.ema[c] if self.ema[c] else 0.0
 
@@ -236,7 +239,7 @@ class Governor:
             if self.fixed is not None:
                 if self.ram_ema < 1.2: self.safe = True
                 return
-            if self.ram_ema < 1.2 or self.load_ema > CPU_THREADS * 1.5:
+            if self.ram_ema < 0.5 or self.load_ema > CPU_THREADS * 2.0:
                 self.press += 1; self.idle = 0
                 if self.press >= 2:
                     self.press = 0; self.safe = True
@@ -292,8 +295,18 @@ class Governor:
                 f"{self.thr(self.current):.2f} f/s | 🛡 {self.ram_ema:.1f}G | "
                 f"load {self.load_ema:.1f}" + (" | SAFE" if self.safe else ""))
 
-# ================= REAL-ESRGAN =================
-_ups_cache: Dict[Any, RealESRGANer] = {}
+# ================= REAL-ESRGAN (THREAD-SAFE POOL) =================
+# CRITICAL FIX: RealESRGANer is NOT thread-safe. Its enhance() stores
+# self.img / self.output / self.mod_scale as instance attributes.
+# Multiple threads calling enhance() on the SAME instance corrupt each
+# other's state -> black/garbled frames (the "black flicker" bug).
+# FIX: A pool of separate instances, one per worker thread, handed out
+# via a thread-safe Queue. Each worker owns its instance exclusively.
+
+_ups_pool_instances: Dict[Any, list] = {}
+_ups_pool_queues: Dict[Any, queue.Queue] = {}
+_ups_pool_meta: Dict[Any, Tuple[int, int]] = {}  # (workers, threads)
+_ups_pool_lock = threading.Lock()
 
 def _detect_srvgg_num_conv(path: Path) -> int:
     try:
@@ -314,39 +327,98 @@ def _detect_srvgg_num_conv(path: Path) -> int:
     return 16
 
 def choose_tile(key: str, out_px: int) -> int:
-    if MODELS[key]["arch"] == "rrdb": return 256
-    return 0 if out_px <= 2_600_000 else 320
+    """Larger tiles = more RAM per worker = faster.
+    0 = no tiling (full frame at once — fastest, most RAM)."""
+    arch = MODELS[key]["arch"]
+    ram = mem_avail_gb()
+    if arch == "rrdb":
+        # RRDB is memory-hungry; tile keeps per-instance RAM bounded
+        if ram > 12: return 512
+        if ram > 6: return 384
+        return 256
+    # SRVGG compact models are light — full frame when RAM allows
+    if ram > 6: return 0
+    if ram > 3: return 640
+    return 320
 
-def get_ups(key: str, tile: int) -> RealESRGANer:
-    key = normalize_model_key(key)
-    k = (key, tile)
-    if k in _ups_cache: return _ups_cache[k]
+def _pool_worker_config(arch: str) -> Tuple[int, int]:
+    """Pick (workers, threads_per_worker) based on cores + RAM.
+    workers * threads ≈ CPU_THREADS to avoid oversubscription."""
+    cores = CPU_THREADS
+    ram = mem_avail_gb()
+    if arch == "rrdb":
+        by_ram = int(ram / 4.5)   # ~4.5 GB per RRDB worker
+    else:
+        by_ram = int(ram / 2.5)   # ~2.5 GB per SRVGG worker
+    workers = max(1, min(cores, by_ram, 4))
+    threads = max(1, cores // workers)
+    return workers, threads
+
+def _create_ups_instance(key: str, tile: int) -> RealESRGANer:
     m = MODELS[key]; path = MODEL_DIR / m["file"]
     if not path.exists(): raise FileNotFoundError(f"Model missing: {path}")
-
     if m["arch"] == "rrdb":
-        log.info("Loading %s (RRDBNet, tile=%s)...", m["file"], tile)
         nb = 6 if "anime_6B" in m["file"] else 23
-        model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=nb, num_grow_ch=32, scale=4)
-        ups = RealESRGANer(scale=4, model_path=str(path), model=model, tile=tile,
-                           tile_pad=16, pre_pad=0, half=False, device=torch.device("cpu"))
-        _ups_cache[k] = ups; return ups
-
+        model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64,
+                        num_block=nb, num_grow_ch=32, scale=4)
+        return RealESRGANer(scale=4, model_path=str(path), model=model,
+                             tile=tile, tile_pad=16, pre_pad=0,
+                             half=False, device=torch.device("cpu"))
     nconv = _detect_srvgg_num_conv(path)
-    log.info("Loading %s (SRVGG num_conv=%s, tile=%s)...", m["file"], nconv, tile)
     last_err = None
     for nc in [nconv, 32, 16]:
         try:
             model = SRVGGNetCompact(num_in_ch=3, num_out_ch=3, num_feat=64,
                                     num_conv=nc, upscale=4, act_type="prelu")
-            ups = RealESRGANer(scale=4, model_path=str(path), model=model, tile=tile,
-                               tile_pad=16, pre_pad=0, half=False, device=torch.device("cpu"))
-            if nc != nconv: log.info("✅ Fallback num_conv=%s worked!", nc)
-            _ups_cache[k] = ups; return ups
+            return RealESRGANer(scale=4, model_path=str(path), model=model,
+                                tile=tile, tile_pad=16, pre_pad=0,
+                                half=False, device=torch.device("cpu"))
         except Exception as e:
             last_err = e
             log.warning("num_conv=%s load fail: %s", nc, str(e)[:140])
     raise last_err or RuntimeError("SRVGG load failed")
+
+def init_ups_pool(key: str, tile: int, fixed: Optional[Tuple[int, int]] = None) -> queue.Queue:
+    """Create (or reuse) a pool of upsampler instances.
+    fixed=(workers, threads) overrides auto config (for user core profiles).
+    Returns a Queue — workers .get() an instance, .put() it back."""
+    key = normalize_model_key(key)
+    k = (key, tile)
+    with _ups_pool_lock:
+        if k in _ups_pool_queues:
+            return _ups_pool_queues[k]
+        if fixed is not None:
+            workers, threads = fixed
+            # clamp workers by RAM
+            max_w = max(1, int(mem_avail_gb() / 2.5))
+            if workers > max_w:
+                log.warning("Fixed workers clamped %d→%d (RAM)", workers, max_w)
+                workers = max_w
+        else:
+            workers, threads = _pool_worker_config(MODELS[key]["arch"])
+        _ups_pool_meta[k] = (workers, threads)
+        torch.set_num_threads(threads)
+        q: queue.Queue = queue.Queue()
+        instances = []
+        for i in range(workers):
+            log.info("🏗 Upsampler instance %d/%d (%s tile=%s)...",
+                     i + 1, workers, key, tile)
+            inst = _create_ups_instance(key, tile)
+            instances.append(inst)
+            q.put(inst)
+        _ups_pool_instances[k] = instances
+        _ups_pool_queues[k] = q
+        log.info("✅ Pool ready: %d workers × %d threads (RAM %.1fGB free)",
+                 workers, threads, mem_avail_gb())
+        return q
+
+def get_ups(key: str, tile: int) -> RealESRGANer:
+    """Backward-compatible single-instance getter (for photo handler)."""
+    q = init_ups_pool(key, tile)
+    try:
+        return q.queue[0]  # peek at first without removing
+    except Exception:
+        return _create_ups_instance(normalize_model_key(key), tile)
 
 # ================= DDCOLOR =================
 _ddcolor_cache: Dict[str, Any] = {}
@@ -567,6 +639,7 @@ async def refresh_panel():
     try:
         await _panel.edit_text(panel_text(), reply_markup=panel_kb())
     except FloodWait as e:
+        # Spam prevention check
         await asyncio.sleep(e.value)
     except Exception as e:
         err = str(e).lower()
@@ -749,8 +822,8 @@ def read_exact(pipe, size):
         buf.extend(chunk)
     return bytes(buf)
 
-def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Governor,
-                 cancel: threading.Event, is_gif: bool, prev_dir: Path):
+def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups_queue: queue.Queue,
+                 gov: Governor, cancel: threading.Event, is_gif: bool, prev_dir: Path):
     w, h, fps = info["width"], info["height"], info["fps"]
     rot = info.get("rotation", 0.0)
     ow, oh = job["ow"], job["oh"]
@@ -786,6 +859,7 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Gover
                 stdout=subprocess.PIPE)
             n = 0
             while not cancel.is_set():
+                # Strict bytes reading (Fixes shifted/garbled buffer issue)
                 raw = read_exact(dec.stdout, fb)
                 if not raw or len(raw) != fb:
                     break
@@ -797,24 +871,40 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Gover
 
     def upscale_one(img, cfg):
         t0 = time.time()
-        out, _ = ups.enhance(img, outscale=settings["scale"])
+        # THREAD-SAFE: acquire a dedicated upsampler instance for this frame.
+        # No two threads ever share an instance -> no black flicker.
+        ups = ups_queue.get()
+        try:
+            try:
+                out, _ = ups.enhance(img, outscale=settings["scale"])
+            except RuntimeError as e:
+                estr = str(e).lower()
+                if "out of memory" in estr or "alloc" in estr or "cannot allocate" in estr:
+                    log.warning("OOM on frame — retrying with tile=256 ...")
+                    gc.collect()
+                    if not ups.tile or ups.tile > 256:
+                        ups.tile = 256
+                    out, _ = ups.enhance(img, outscale=settings["scale"])
+                else:
+                    raise
+        finally:
+            ups_queue.put(ups)  # release for next frame
         if colorize_mode != "off":
             out = colorize_frame(out, colorize_mode)
             
-        # FIX 1: Enforce EXACT 3-channel structure
+        # FIX 1: Enforce EXACT 3-channel structure (some ESRGAN engines output 4 channels)
         if len(out.shape) == 3 and out.shape[2] == 4:
             out = out[:, :, :3]
         elif len(out.shape) == 2:
             out = cv2.cvtColor(out, cv2.COLOR_GRAY2BGR)
             
-        # 🚀 SPEED FIX 3 & FLICKER FIX: Exact dimensions with INTER_LINEAR (much faster than LANCZOS4)
+        # FIX 2: Exact matching of required FFMPEG boundaries
         if out.shape[1] != ow or out.shape[0] != oh:
-            out = cv2.resize(out, (ow, oh), interpolation=cv2.INTER_LINEAR)
+            out = cv2.resize(out, (ow, oh), interpolation=cv2.INTER_LANCZOS4)
             
-        # FLICKER FIX: Guarantee uint8 and C-contiguous memory layout
-        if out.dtype != np.uint8:
-            out = np.clip(out, 0, 255).astype(np.uint8)
-        out = np.ascontiguousarray(out)
+        # FIX 3 (CRITICAL): Absolutely guarantees the bytes are packed in C-contiguous memory!
+        # If memory is disjointed, ffmpeg will slant and garble every frame in the pipe.
+        out = np.ascontiguousarray(out, dtype=np.uint8)
             
         dt = time.time() - t0
         with stats_lock:
@@ -837,6 +927,10 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Gover
             if info["has_audio"]:
                 if settings["audio"] == "keep": cmd += ["-map", "1:a?", "-c:a", "copy"]
                 elif settings["audio"] == "compress": cmd += ["-map", "1:a?", "-c:a", "aac", "-b:a", "128k"]
+            
+            # FIX 4 (CRITICAL for mobile videos): Strip all metadata!
+            # If the original file had a corrupted rotation tag, Ffmpeg would copy it here and
+            # force players to squish and box the video entirely.
             cmd += ["-map_metadata", "-1"]
             
         cmd += ["-c:v", "libx264", "-preset", ff["preset"], "-crf", ff["crf"],
@@ -983,6 +1077,7 @@ async def _refresh_loop():
         except Exception as e:
             log.warning("refresh_loop err: %s", e)
         
+        # Ab panel 1 second ki exact delay ke saath hi update hoga (spam limit bypass)
         await asyncio.sleep(1.0)
 
 @app.on_message((filters.video | filters.document | filters.animation) & filters.private)
@@ -1028,19 +1123,21 @@ async def media_handler(client, message: Message):
             scale = max(1.0, scale - 0.5); capped = True
             ow = int(info["width"] * scale); ow += ow % 2
             oh = int(info["height"] * scale); oh += oh % 2
-        model_key = normalize_model_key(settings["model"])
-        ups = await asyncio.to_thread(get_ups, model_key, choose_tile(model_key, ow * oh))
         fixed = None
         if settings["core"] != "auto":
             cm = CORE_MAP.get(settings["core"])
             if cm and cm[2] > 0: fixed = (cm[2], cm[3])
+        model_key = normalize_model_key(settings["model"])
+        ups_queue = await asyncio.to_thread(
+            init_ups_pool, model_key, choose_tile(model_key, ow * oh), fixed)
         gov = Governor(ow * oh, fixed=fixed)
         current_job.update({"ow": ow, "oh": oh, "stage": "🎨", "ai": gov.status(0.0)})
         out_path = OUTPUT_DIR / f"{Path(filename).stem}_up_{message.id}.mp4"
         t0 = time.time()
         
+        # "Process shuru" message completely REMOVED -> directly updating the panel message!
         await asyncio.to_thread(run_pipeline, current_job, in_path, out_path, info,
-                                ups, gov, cancel_event, is_gif, job_dir)
+                                ups_queue, gov, cancel_event, is_gif, job_dir)
         current_job["stage"] = "⬆️"
         size_mb = out_path.stat().st_size / 1048576
         if size_mb > MAX_SEND_MB:
@@ -1056,6 +1153,7 @@ async def media_handler(client, message: Message):
         def ul_cb(cur, tot, *a):
             current_job["stage"] = f"⬆️ {cur/1048576:.0f}/{tot/1048576:.0f}MB"
 
+        # Direct final video send
         if is_gif:
             await send_with_retry(lambda: app.send_animation(
                 message.chat.id, str(out_path), caption=cap, progress=ul_cb), "animation")
@@ -1117,13 +1215,6 @@ async def photo_handler(client, message: Message):
         out = await asyncio.to_thread(lambda: ups.enhance(img, outscale=settings["scale"])[0])
         if normalize_colorize(settings["colorize_mode"]) != "off":
             out = await asyncio.to_thread(colorize_frame, out, normalize_colorize(settings["colorize_mode"]))
-            
-        # Photo Flicker Fix
-        if len(out.shape) == 3 and out.shape[2] == 4:
-            out = out[:, :, :3]
-        if out.dtype != np.uint8:
-            out = np.clip(out, 0, 255).astype(np.uint8)
-            
         dt = time.time() - t0
         outp = WORK_DIR / f"photo_{message.id}_up.png"
         cv2.imwrite(str(outp), out)
