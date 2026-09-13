@@ -6,6 +6,10 @@ FIXES:
   - ✅ Black lines / rotation distortion (explicit transpose)
   - ✅ Legacy archive migration (anime → anime_video)
   - ✅ FFMPEG pipe dimension matching (black box fix)
+  - ✅ 1-second strict refresh rate (no panel spamming)
+  - ✅ Removed extra messages during processing
+  - ✅ PyTorch C-Contiguous memory fix (Permanent garbled/black frame fix)
+  - ✅ Strict OS pipe chunk reading (Fixes shifted frame artifacts)
 """
 import asyncio, gc, json, logging, math, os, queue, random, shutil, subprocess, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor
@@ -319,7 +323,6 @@ def get_ups(key: str, tile: int) -> RealESRGANer:
         log.info("Loading %s (RRDBNet, tile=%s)...", m["file"], tile)
         nb = 6 if "anime_6B" in m["file"] else 23
         model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=nb, num_grow_ch=32, scale=4)
-        # Reverted pre_pad=0 to fix tensor mismatch crash
         ups = RealESRGANer(scale=4, model_path=str(path), model=model, tile=tile,
                            tile_pad=16, pre_pad=0, half=False, device=torch.device("cpu"))
         _ups_cache[k] = ups; return ups
@@ -331,7 +334,6 @@ def get_ups(key: str, tile: int) -> RealESRGANer:
         try:
             model = SRVGGNetCompact(num_in_ch=3, num_out_ch=3, num_feat=64,
                                     num_conv=nc, upscale=4, act_type="prelu")
-            # Reverted pre_pad=0 to fix tensor mismatch crash
             ups = RealESRGANer(scale=4, model_path=str(path), model=model, tile=tile,
                                tile_pad=16, pre_pad=0, half=False, device=torch.device("cpu"))
             if nc != nconv: log.info("✅ Fallback num_conv=%s worked!", nc)
@@ -559,11 +561,16 @@ async def refresh_panel():
     if _panel is None: return
     try:
         await _panel.edit_text(panel_text(), reply_markup=panel_kb())
+    except FloodWait as e:
+        # Spam prevention: Telegram bola slow down, toh bot utne seconds ruk jayega
+        await asyncio.sleep(e.value)
     except Exception as e:
         err = str(e).lower()
         if "not modified" in err: return
-        log.warning("Panel edit fail (%s) → will re-send", str(e)[:120])
-        _panel = None
+        # Sirf tab naya panel bhejega jab purana sach mein delete ho gaya ho
+        if "message_id_invalid" in err or "message to edit not found" in err or "deleted" in err:
+            log.warning("Panel msg lost. Will re-send.")
+            _panel = None
 
 # ================= CALLBACK =================
 @app.on_callback_query(filters.regex(r"^b:"))
@@ -726,7 +733,7 @@ def probe_video(path: Path) -> Dict:
             "rotation": rot, "fps": fps, "duration": dur, "frames": frames,
             "has_audio": any(s.get("codec_type") == "audio" for s in data["streams"])}
 
-# ================= PIPELINE (rotation-safe) =================
+# ================= PIPELINE (rotation-safe & strict pipe) =================
 def _build_vf_chain(w: int, h: int, rot: float) -> str:
     """Build ffmpeg filter: transpose (if needed) + exact scale + format."""
     parts = []
@@ -737,6 +744,16 @@ def _build_vf_chain(w: int, h: int, rot: float) -> str:
     parts.append(f"scale={w}:{h}:flags=fast_bilinear")
     parts.append("format=bgr24")
     return ",".join(parts)
+
+def read_exact(pipe, size):
+    """Ensure we read exactly 'size' bytes to prevent FFMPEG pipe shifting!"""
+    buf = bytearray()
+    while len(buf) < size:
+        chunk = pipe.read(size - len(buf))
+        if not chunk:
+            break
+        buf.extend(chunk)
+    return bytes(buf)
 
 def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Governor,
                  cancel: threading.Event, is_gif: bool, prev_dir: Path):
@@ -767,18 +784,17 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Gover
         try:
             dec = subprocess.Popen(
                 ["ffmpeg", "-v", "error",
-                 "-noautorotate",                 # ← FIX: disable ffmpeg auto-rotate
+                 "-noautorotate",
                  "-i", str(in_path),
                  "-vsync", "0",
-                 "-vf", vf_chain,                 # ← FIX: explicit transpose + scale
+                 "-vf", vf_chain,
                  "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"],
                 stdout=subprocess.PIPE)
             n = 0
             while not cancel.is_set():
-                raw = dec.stdout.read(fb)
+                # Strict read ensures FFMPEG doesn't fragment bytes and corrupt frames
+                raw = read_exact(dec.stdout, fb)
                 if not raw or len(raw) != fb:
-                    if raw and len(raw) != fb:
-                        log.warning("⚠️ Short read: got %d expected %d — stopping reader", len(raw), fb)
                     break
                 if is_gif and n >= MAX_GIF_FRAMES: break
                 in_q.put(np.frombuffer(raw, np.uint8).reshape(h, w, 3)); n += 1
@@ -792,21 +808,22 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Gover
         if colorize_mode != "off":
             out = colorize_frame(out, colorize_mode)
             
-        # FIX: Ensure exact dimension match to avoid FFMPEG pipe corruption / black boxes
+        # FIX 1: Exact dimension match
         if out.shape[1] != ow or out.shape[0] != oh:
             out = cv2.resize(out, (ow, oh), interpolation=cv2.INTER_LANCZOS4)
             
+        # FIX 2 (CRITICAL): PyTorch tensor manipulation causes F-contiguous strides.
+        # This scrambles the bytes when sent to FFMPEG, causing garbled/black boxes!
+        # We MUST force it to C-contiguous memory before saving it to a raw pipe.
+        out = np.ascontiguousarray(out, dtype=np.uint8)
+            
         dt = time.time() - t0
         with stats_lock:
-            first = (stats["done"] == 0)
             stats["done"] += 1; stats["sum"] += dt
             job["done"] = stats["done"]
             job["spf"] = stats["sum"] / stats["done"]
             job["eta"] = (total - job["done"]) * job["spf"] / max(1, gov.current[0])
             job["ai"] = gov.status(job["spf"])
-        if first:
-            try: cv2.imwrite(str(prev_dir / "prev_out.png"), out)
-            except Exception: pass
         del img
         gov.on_frame(cfg, dt, stats["done"])
         return out
@@ -850,9 +867,6 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Gover
                 img = in_q.get()
                 if img is None: break
                 frames_raw.append(img)
-            if frames_raw:
-                try: cv2.imwrite(str(prev_dir / "prev_in.png"), frames_raw[0])
-                except Exception: pass
             outs = []
             for fr in frames_raw:
                 if cancel.is_set(): raise RuntimeError("Cancelled")
@@ -885,9 +899,6 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Gover
                     raise RuntimeError("Job time-limit")
                 img = in_q.get()
                 if img is None: break
-                if i == 0:
-                    try: cv2.imwrite(str(prev_dir / "prev_in.png"), img)
-                    except Exception: pass
                 while (i - encoded[0]) >= OUT_BACKLOG:
                     time.sleep(0.01)
                     if cancel.is_set():
@@ -909,17 +920,6 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Gover
             try:
                 if p and p.poll() is None: p.kill()
             except Exception: pass
-
-def make_compare(prev_dir: Path) -> Optional[Path]:
-    a = cv2.imread(str(prev_dir / "prev_in.png"))
-    b = cv2.imread(str(prev_dir / "prev_out.png"))
-    if a is None or b is None: return None
-    b = cv2.resize(b, (a.shape[1], a.shape[0]))
-    sep = np.full((a.shape[0], 6, 3), 255, np.uint8)
-    comp = np.hstack([a, sep, b])
-    out = prev_dir / "compare.png"
-    cv2.imwrite(str(out), comp)
-    return out
 
 # ================= UPLOAD RETRY =================
 async def send_with_retry(fn, desc: str):
@@ -972,7 +972,6 @@ async def _refresh_loop():
             elif _panel_mode in ("main", "job"):
                 # Refresh main panel or job progress — BUT NOT when user is in submenu
                 await refresh_panel()
-            # else: submenu open → leave it alone!
 
             hb += 1
             if hb % 24 == 0 and job_state.get("active") and current_job:
@@ -980,7 +979,9 @@ async def _refresh_loop():
                          current_job.get("done", 0), mem_avail_gb(), load1())
         except Exception as e:
             log.warning("refresh_loop err: %s", e)
-        await asyncio.sleep(2.5)
+        
+        # Ab panel strictly har 1 second mein refresh hoga
+        await asyncio.sleep(1.0)
 
 @app.on_message((filters.video | filters.document | filters.animation) & filters.private)
 async def media_handler(client, message: Message):
@@ -1035,10 +1036,8 @@ async def media_handler(client, message: Message):
         current_job.update({"ow": ow, "oh": oh, "stage": "🎨", "ai": gov.status(0.0)})
         out_path = OUTPUT_DIR / f"{Path(filename).stem}_up_{message.id}.mp4"
         t0 = time.time()
-        await message.reply_text(
-            f"🎬 **Process shuru:** {info['width']}×{info['height']} → {ow}×{oh} • "
-            f"{info['frames']} fr\n"
-            f"{MODELS[model_key]['label']} • 🎨 {_color_label()} • ⚙️ {_core_label()}")
+        
+        # NOTE: "Process shuru..." aur baki unnecessary spam hata diye gaye hain
         await asyncio.to_thread(run_pipeline, current_job, in_path, out_path, info,
                                 ups, gov, cancel_event, is_gif, job_dir)
         current_job["stage"] = "⬆️"
@@ -1055,10 +1054,7 @@ async def media_handler(client, message: Message):
 
         def ul_cb(cur, tot, *a):
             current_job["stage"] = f"⬆️ {cur/1048576:.0f}/{tot/1048576:.0f}MB"
-        comp = await asyncio.to_thread(make_compare, job_dir)
-        if comp:
-            try: await app.send_photo(message.chat.id, str(comp), caption="⬅️ Before | ➡️ After")
-            except Exception: pass
+
         if is_gif:
             await send_with_retry(lambda: app.send_animation(
                 message.chat.id, str(out_path), caption=cap, progress=ul_cb), "animation")
