@@ -35,7 +35,7 @@ import cv2
 import numpy as np
 import requests
 import torch
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.errors import FloodWait
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from realesrgan import RealESRGANer
@@ -57,7 +57,18 @@ log = logging.getLogger("anime-upscaler")
 API_ID = int(os.getenv("API_ID", "0") or 0)
 API_HASH = (os.getenv("API_HASH", "") or "").strip()
 BOT_TOKEN = (os.getenv("BOT_TOKEN", "") or "").strip()
-OWNER_CHAT_ID = (os.getenv("OWNER_CHAT_ID", "") or "").strip()
+
+# Bulletproof Owner ID check
+_raw_owner = (os.getenv("OWNER_CHAT_ID", "") or "").strip()
+OWNER_CHAT_ID = _raw_owner
+try:
+    OWNER_CHAT_ID_INT = int(_raw_owner)
+except ValueError:
+    OWNER_CHAT_ID_INT = 0
+
+def is_owner(chat_id) -> bool:
+    """Safely handles both String and Integer comparisons for Owner check"""
+    return chat_id == OWNER_CHAT_ID_INT or str(chat_id) == OWNER_CHAT_ID
 
 if not API_ID or not API_HASH or not BOT_TOKEN or not OWNER_CHAT_ID:
     raise RuntimeError("Missing GitHub Secrets: API_ID, API_HASH, BOT_TOKEN, OWNER_CHAT_ID")
@@ -321,7 +332,7 @@ async def refresh_panel():
 @app.on_callback_query(filters.regex(r"^b:"))
 async def btn(client, cq):
     global _panel
-    if str(cq.message.chat.id) != OWNER_CHAT_ID:
+    if not is_owner(cq.message.chat.id):
         await cq.answer("Private bot!", show_alert=True); return
     parts = cq.data[2:].split(":"); a = parts[0]; v = parts[1] if len(parts) > 1 else ""
     kb = panel_kb()
@@ -578,7 +589,7 @@ async def _refresh_loop():
 @app.on_message((filters.video | filters.document | filters.animation) & filters.private)
 async def media_handler(client, message: Message):
     global cancel_event, current_job
-    if str(message.chat.id) != OWNER_CHAT_ID:
+    if not is_owner(message.chat.id):
         await message.reply_text("❌ Private bot."); return
     async with busy_lock:
         if job_state.get("active"):
@@ -682,7 +693,7 @@ async def media_handler(client, message: Message):
 # ================= PHOTO =================
 @app.on_message(filters.photo & filters.private)
 async def photo_handler(client, message: Message):
-    if str(message.chat.id) != OWNER_CHAT_ID:
+    if not is_owner(message.chat.id):
         await message.reply_text("❌ Private bot."); return
     async with busy_lock:
         if job_state.get("active"):
@@ -719,7 +730,7 @@ async def photo_handler(client, message: Message):
 # ================= COMMANDS / TEXT =================
 @app.on_message(filters.command("stats") & filters.private)
 async def stats_cmd(client, message: Message):
-    if str(message.chat.id) != OWNER_CHAT_ID: return
+    if not is_owner(message.chat.id): return
     if not archive:
         await message.reply_text("ℹ️ Archive channel set nahi hai."); return
     st = archive.state
@@ -733,14 +744,14 @@ async def stats_cmd(client, message: Message):
 
 @app.on_message(filters.command("cancel") & filters.private)
 async def cancel_cmd(client, message: Message):
-    if str(message.chat.id) != OWNER_CHAT_ID: return
+    if not is_owner(message.chat.id): return
     if cancel_event: cancel_event.set()
     await message.reply_text("🛑 Cancel request bhej di.")
 
 @app.on_message(filters.forwarded & filters.private)
 async def forward_id_handler(client, message: Message):
     """Channel ki koi post forward karo → bot exact channel ID bata dega."""
-    if str(message.chat.id) != OWNER_CHAT_ID: return
+    if not is_owner(message.chat.id): return
     src = getattr(message, "forward_from_chat", None)
     if src is not None and getattr(src, "id", None):
         await message.reply_text(
@@ -750,7 +761,7 @@ async def forward_id_handler(client, message: Message):
 
 @app.on_message(filters.text & filters.private & ~filters.command(["start", "stats", "cancel"]))
 async def text_handler(client, message: Message):
-    if str(message.chat.id) != OWNER_CHAT_ID: return
+    if not is_owner(message.chat.id): return
     t = (message.text or "").lower()
     if any(k in t for k in ["game", "free fire", "pubg", "bgmi"]):
         await message.reply_text("🎮 Game videos: panel me model button → Game (Fast) ya Game (HQ).")
@@ -763,7 +774,7 @@ async def text_handler(client, message: Message):
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client, message: Message):
     global _panel
-    if str(message.chat.id) != OWNER_CHAT_ID:
+    if not is_owner(message.chat.id):
         await message.reply_text("❌ Private bot."); return
     try:
         if _panel: await _panel.delete()
@@ -776,7 +787,7 @@ async def start_handler(client, message: Message):
 def notify_owner_startup():
     try:
         r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                          json={"chat_id": OWNER_CHAT_ID,
+                          json={"chat_id": OWNER_CHAT_ID_INT or OWNER_CHAT_ID,
                                 "text": "✅ Upscaler v8 online!\n🧠 Governor +  photo +  retry +  self-test.\nPanel se control karo."},
                           timeout=15)
         log.info("Startup ping: %s", r.status_code)
@@ -809,7 +820,7 @@ async def _main():
         await app.start()
         log.info("🔌 Client started — ab boot...")
         await _boot()
-        await asyncio.Event().wait()      # ✅ v8 fix: Client.idle() Pyrogram 2.0.106 me hota hi nahi
+        await idle()      # ✅ v8 fix: Properly implemented pyrogram's native idle function
     finally:
         try: await app.stop()
         except Exception: pass
