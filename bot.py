@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Smart Anime/Game/Real Upscaler v9 — MULTI-MODEL + COLORIZE
-- 🎛 Models button → submenu: Anime / Game / Real / HQ
-- 🎨 Colorization toggle (ON/OFF), auto-shifts model per content type
-- 🧠 Governor v2 + streaming + ⚙️ Cores selector
+Smart Anime/Game/Real Upscaler v10 — DDColor Fast+High
+- 🎨 Colorize: OFF / Fast (tiny) / High (modelscope) — button se switch
+- 🎛 Models submenu: Anime Video / Anime Image / Game / Real Photo
+- ⚙️ Cores: Auto (Governor) / Fixed
 - 🚫 No post-process — pure AI output
+- 🛡 Rotation + stride fix (v8.1)
 """
 import asyncio, gc, json, logging, math, os, queue, random, shutil, subprocess, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor
@@ -71,40 +72,23 @@ CPU_THREADS = os.cpu_count() or 4
 POOL = ThreadPoolExecutor(max_workers=4)
 os.environ["OMP_NUM_THREADS"] = str(CPU_THREADS)
 
-# ================= MODELS (Real, verified) =================
+# ================= MODELS =================
 MODELS = {
-    # key: (file, arch, label, best_for)
-    "anime_video": {
-        "file": "realesr-animevideov3.pth", "arch": "srvgg",
-        "label": "🎌 Anime Video", "best_for": "anime video (fast, no flicker)"
-    },
-    "anime_image": {
-        "file": "RealESRGAN_x4plus_anime_6B.pth", "arch": "rrdb",
-        "label": "🎌 Anime Image", "best_for": "anime still/photo (crisp lines)"
-    },
-    "game": {
-        "file": "realesr-general-x4v3.pth", "arch": "srvgg",
-        "label": "🎮 Game (Fast)", "best_for": "gameplay (FF/PUBG)"
-    },
-    "real": {
-        "file": "RealESRGAN_x4plus.pth", "arch": "rrdb",
-        "label": "📷 Real Photo", "best_for": "real-world photos"
-    },
+    "anime_video": {"file": "realesr-animevideov3.pth",         "arch": "srvgg", "label": "🎌 Anime Video",  "best_for": "anime video (fast)"},
+    "anime_image": {"file": "RealESRGAN_x4plus_anime_6B.pth",   "arch": "rrdb",  "label": "🎌 Anime Image",  "best_for": "anime still (crisp)"},
+    "game":        {"file": "realesr-general-x4v3.pth",         "arch": "srvgg", "label": "🎮 Game (Fast)",  "best_for": "gameplay (FF/PUBG)"},
+    "real":        {"file": "RealESRGAN_x4plus.pth",            "arch": "rrdb",  "label": "📷 Real Photo",   "best_for": "real-world photos"},
 }
-
-# Colorization config — auto-shift per content
-COLOR_MODELS = {
-    "anime_video": "artistic",
-    "anime_image": "artistic",
-    "game":        "stable",
-    "real":        "stable",
-}
-
 PRESETS = {"fast": {"crf": "23", "preset": "veryfast"},
            "balanced": {"crf": "19", "preset": "veryfast"},
            "best": {"crf": "16", "preset": "slow"}}
 
-# ⚙️ Core profiles
+# DDColor: Fast (tiny) vs High (modelscope)
+DDCOLOR_MODELS = {
+    "fast": {"file": "ddcolor_tiny.pth", "hf_id": "piddnad/ddcolor_paper_tiny", "label": "🎨 Fast", "size": "~215MB"},
+    "high": {"file": "ddcolor_high.pth", "hf_id": "piddnad/ddcolor_modelscope", "label": "💎 High", "size": "~870MB"},
+}
+
 def _build_core_profiles():
     p = [("auto", "🤖 Auto (Governor)", 0, 0)]
     for n in (1, 2, 3, 4, 6, 8, 12, 16):
@@ -120,12 +104,9 @@ def _build_core_profiles():
 CORE_PROFILES = _build_core_profiles()
 CORE_MAP = {p[0]: p for p in CORE_PROFILES}
 
-settings = {
-    "scale": 2.0, "preset": "balanced", "audio": "keep",
-    "model": "anime_video",   # default anime video
-    "core": "auto",
-    "colorize": False,        # default OFF
-}
+# settings: colorize_mode = "off" | "fast" | "high"
+settings = {"scale": 2.0, "preset": "balanced", "audio": "keep",
+            "model": "anime_video", "core": "auto", "colorize_mode": "off"}
 job_state = {"active": False}
 current_job: Optional[Dict[str, Any]] = None
 cancel_event: Optional[threading.Event] = None
@@ -303,7 +284,7 @@ class Governor:
                 f"{self.thr(self.current):.2f} f/s | 🛡 {self.ram_ema:.1f}G | "
                 f"load {self.load_ema:.1f}" + (" | SAFE" if self.safe else ""))
 
-# ================= MODEL LOADING =================
+# ================= REAL-ESRGAN LOADING =================
 _ups_cache: Dict[Any, RealESRGANer] = {}
 
 def _detect_srvgg_num_conv(path: Path) -> int:
@@ -333,15 +314,12 @@ def get_ups(key: str, tile: int) -> RealESRGANer:
     k = (key, tile)
     if k in _ups_cache: return _ups_cache[k]
     m = MODELS[key]; path = MODEL_DIR / m["file"]
-    if not path.exists():
-        raise FileNotFoundError(f"Model missing: {path}\nDownload from Real-ESRGAN releases.")
+    if not path.exists(): raise FileNotFoundError(f"Model missing: {path}")
 
     if m["arch"] == "rrdb":
         log.info("Loading %s (RRDBNet, tile=%s)...", m["file"], tile)
-        # 6B anime uses num_block=6, x4plus uses num_block=23
         nb = 6 if "anime_6B" in m["file"] else 23
-        model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64,
-                        num_block=nb, num_grow_ch=32, scale=4)
+        model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=nb, num_grow_ch=32, scale=4)
         ups = RealESRGANer(scale=4, model_path=str(path), model=model, tile=tile,
                            tile_pad=10, pre_pad=0, half=False, device=torch.device("cpu"))
         _ups_cache[k] = ups
@@ -364,78 +342,82 @@ def get_ups(key: str, tile: int) -> RealESRGANer:
             log.warning("num_conv=%s load fail: %s", nc, str(e)[:140])
     raise last_err or RuntimeError("SRVGG load failed")
 
-# ================= COLORIZATION (DeOldify-based, toggle) =================
-_color_model_cache = {}
+# ================= DDCOLOR ENGINE (Fast + High) =================
+_ddcolor_cache: Dict[str, Any] = {}
+_ddcolor_lock = threading.Lock()
 
-def get_colorizer(style: str):
-    """Lazy load DeOldify colorizer. style: 'stable' or 'artistic'."""
-    if style in _color_model_cache:
-        return _color_model_cache[style]
-    # Requires: pip install deoldify (or use ONNX runtime)
-    # We use a lightweight fallback: OpenCV DNN colorization if DeOldify unavailable
-    try:
-        from deoldify import visualize
-        from deoldify.visualize import get_image_colorizer
-        # DeOldify artistic model for anime, stable for real/game
-        colorizer = get_image_colorizer(artistic=(style == "artistic"))
-        _color_model_cache[style] = ("deoldify", colorizer)
-        log.info("🎨 DeOldify loaded (%s)", style)
-        return _color_model_cache[style]
-    except Exception as e:
-        log.warning("DeOldify load fail: %s — using OpenCV fallback", e)
-        # Fallback: OpenCV DNN colorization (lighter)
+def _load_ddcolor(mode: str):
+    """Load DDColor model — mode: 'fast' (tiny) or 'high' (modelscope)."""
+    if mode in _ddcolor_cache:
+        return _ddcolor_cache[mode]
+    with _ddcolor_lock:
+        if mode in _ddcolor_cache:
+            return _ddcolor_cache[mode]
+        info = DDCOLOR_MODELS.get(mode)
+        if info is None:
+            return None
+        path = MODEL_DIR / info["file"]
+        if not path.exists():
+            log.warning("🎨 DDColor %s file missing: %s", mode, path)
+            return None
         try:
-            proto = MODEL_DIR / "colorization_deploy_v2.prototxt"
-            model = MODEL_DIR / "colorization_release_v2.caffemodel"
-            pts = MODEL_DIR / "pts_in_hull.npy"
-            if proto.exists() and model.exists():
-                net = cv2.dnn.readNetFromCaffe(str(proto), str(model))
-                pts = np.load(str(pts))
-                # setup (as per OpenCV docs)
-                class8 = net.getLayerId("class8_ab")
-                conv8 = net.getLayerId("conv8_313_rh")
-                pts = pts.transpose().reshape(2, 313, 1, 1)
-                net.getLayer(class8).blobs = [pts.astype("float32")]
-                net.getLayer(conv8).blobs = [np.full([1, 313], 2.606, dtype="float32")]
-                _color_model_cache[style] = ("opencv", net)
-                log.info("🎨 OpenCV colorizer loaded (%s)", style)
-                return _color_model_cache[style]
-        except Exception as e2:
-            log.error("Colorizer fallback fail: %s", e2)
-        return None
+            # add cloned repo to path
+            if "ddcolor-src" not in sys.path:
+                sys.path.insert(0, "ddcolor-src")
 
-def colorize_frame(img: np.ndarray, style: str) -> np.ndarray:
-    """Apply colorization. If grayscale → colorize. If colored → enhance saturation."""
-    cinfo = get_colorizer(style)
-    if cinfo is None:
+            from ddcolor import DDColor
+            try:
+                from huggingface_hub import PyTorchModelHubMixin
+                class DDColorHF(DDColor, PyTorchModelHubMixin):
+                    def __init__(self, config=None, **kwargs):
+                        if isinstance(config, dict):
+                            kwargs = {**config, **kwargs}
+                        super().__init__(**kwargs)
+            except Exception:
+                DDColorHF = DDColor
+
+            log.info("🎨 Loading DDColor %s from %s ...", mode, path.name)
+            model = DDColorHF.from_pretrained(str(path))
+            model.eval()
+            _ddcolor_cache[mode] = model
+            log.info("✅ DDColor %s ready", mode)
+            return model
+        except Exception as e:
+            log.error("DDColor %s load fail: %s", mode, e)
+            _ddcolor_cache[mode] = None
+            return None
+
+
+def colorize_frame(img: np.ndarray, mode: str) -> np.ndarray:
+    """DDColor inference. mode='fast' or 'high'."""
+    if mode == "off" or mode not in DDCOLOR_MODELS:
         return img
-    kind, model = cinfo
+    model = _load_ddcolor(mode)
+    if model is None:
+        return img
     try:
-        if kind == "opencv":
-            # Convert to LAB, colorize L channel
-            lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-            L = lab[:, :, 0]
-            L_rs = cv2.resize(L, (224, 224))
-            L_rs = L_rs - 50  # mean center
-            net = model
-            net.setInput(cv2.dnn.blobFromImage(L_rs))
-            ab = net.forward()[0, :, :, :].transpose((1, 2, 0))
-            ab = cv2.resize(ab, (img.shape[1], img.shape[0]))
-            L_full = lab[:, :, 0]
-            colorized = np.concatenate((L_full[:, :, np.newaxis], ab), axis=2)
-            out = cv2.cvtColor(colorized, cv2.COLOR_LAB2BGR)
-            out = np.clip(out, 0, 255).astype("uint8")
-            return out
-        else:
-            # DeOldify: expects PIL
-            from PIL import Image
-            pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-            colored = model.plot_transformed_image_from_image(pil, render_factor=35)
-            if colored is None: return img
-            arr = cv2.cvtColor(np.array(colored), cv2.COLOR_RGB2BGR)
-            return cv2.resize(arr, (img.shape[1], img.shape[0]))
+        import torchvision.transforms as T
+        from PIL import Image as PILImage
+
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        pil = PILImage.fromarray(rgb)
+        ow, oh = pil.size
+        # DDColor expects 512x512 (multiple of 32)
+        pil_r = pil.resize((512, 512), PILImage.LANCZOS)
+
+        x = T.ToTensor()(pil_r).unsqueeze(0)
+
+        with torch.no_grad():
+            out = model(x)
+            if isinstance(out, (list, tuple)):
+                out = out[0]
+            out = out.squeeze(0).clamp(0, 1)
+            arr = (out.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+
+        arr = cv2.resize(arr, (ow, oh), interpolation=cv2.INTER_LANCZOS4)
+        return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
     except Exception as e:
-        log.warning("Colorize frame fail: %s", e)
+        log.warning("DDColor frame fail: %s", e)
         return img
 
 # ================= CLIENT + ARCHIVE =================
@@ -455,7 +437,11 @@ def _model_label() -> str:
     return MODELS[settings["model"]]["label"]
 
 def _color_label() -> str:
-    return "🎨 ON" if settings["colorize"] else "🎨 OFF"
+    mode = settings["colorize_mode"]
+    if mode == "off":  return "🎨 OFF"
+    if mode == "fast": return "🎨 Fast"
+    if mode == "high": return "💎 High"
+    return "🎨 OFF"
 
 def panel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -464,7 +450,7 @@ def panel_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton(f"🎯 {fmt_scale(settings['scale'])}×", callback_data="b:qmenu")],
         [InlineKeyboardButton(f"⚡ {settings['preset'].title()}", callback_data="b:pmenu"),
          InlineKeyboardButton(f"🔊 {settings['audio'].title()}", callback_data="b:amenu"),
-         InlineKeyboardButton(_color_label(), callback_data="b:colortoggle")],
+         InlineKeyboardButton(_color_label(), callback_data="b:colormenu")],
         [InlineKeyboardButton(_core_label(), callback_data="b:cmenu"),
          InlineKeyboardButton("▶️ Start", callback_data="b:go"),
          InlineKeyboardButton("📊 Stats", callback_data="b:stats")],
@@ -476,17 +462,13 @@ def panel_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("🧹 Clean", callback_data="b:clean")],
     ])
 
-# ===== Models submenu (all-in-one) =====
 def models_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        # Anime group
         [InlineKeyboardButton("🎌 ANIME", callback_data="noop")],
         [InlineKeyboardButton("🎌 Anime Video (fast)", callback_data="b:m:anime_video")],
         [InlineKeyboardButton("🎌 Anime Image (crisp)", callback_data="b:m:anime_image")],
-        # Game group
         [InlineKeyboardButton("🎮 GAME", callback_data="noop")],
         [InlineKeyboardButton("🎮 Game Fast (FF/PUBG)", callback_data="b:m:game")],
-        # Real group
         [InlineKeyboardButton("📷 REAL", callback_data="noop")],
         [InlineKeyboardButton("📷 Real Photo (HQ)", callback_data="b:m:real")],
         [InlineKeyboardButton("🔙 Panel", callback_data="b:back")],
@@ -512,6 +494,13 @@ def a_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("🔇 Remove", callback_data="b:a:remove")],
         [InlineKeyboardButton("🔙 Panel", callback_data="b:back")]])
 
+def color_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚫 OFF (no colorize)", callback_data="b:col:off")],
+        [InlineKeyboardButton("🎨 Fast (tiny, ~215MB)", callback_data="b:col:fast")],
+        [InlineKeyboardButton("💎 High (modelscope, ~870MB)", callback_data="b:col:high")],
+        [InlineKeyboardButton("🔙 Panel", callback_data="b:back")]])
+
 def core_kb() -> InlineKeyboardMarkup:
     rows = []
     row = []
@@ -524,25 +513,24 @@ def core_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 HELP_TEXT = (
-    "🧭 **Help (v9 — Multi-Model)**\n\n"
+    "🧭 **Help (v10)**\n\n"
     "🎥 Video / 🎞 GIF / 🖼 Photo bhejo → upscale\n"
-    "🎛 **Models button** → Anime / Game / Real submenu\n"
-    "🎨 **Color button** → toggle ON/OFF (auto-shifts model per content)\n"
-    "   • Anime selected → DeOldify Artistic\n"
-    "   • Game/Real selected → DeOldify Stable\n"
-    "⚙️ **Cores**: Auto (Governor) ya Fixed\n"
-    "🚫 No post-process — pure AI output\n"
+    "🎛 **Models** → Anime Video / Anime Image / Game / Real\n"
+    "🎨 **Color** → OFF / Fast (tiny) / 💎 High (modelscope DDColor)\n"
+    "⚙️ **Cores** → Auto (Governor) / Fixed (1T..16T, Duo, Quad, Hexa)\n"
+    "🚫 No post-process — pure AI upscale\n"
     "🛡 Rotation + stride fix\n"
+    "💡 DDColor: grayscale/old → vivid color (anime/game/photo)\n"
     "✍️ /start /stats /cancel"
 )
 
 def panel_text() -> str:
     m = MODELS[settings["model"]]
-    lines = [_pad(f"{EMO.face()}  UPSCALER v9"), "─" * PW,
+    lines = [_pad(f"{EMO.face()}  UPSCALER v10"), "─" * PW,
              _pad(f"🧠 {CPU_THREADS}c • 🛡 {mem_avail_gb():.1f}GB free • load {load1():.1f}"),
              _pad(f"{m['label']} {fmt_scale(settings['scale'])}× "
                   f"{settings['preset'][:4]} 🔊{settings['audio'][:4]}"),
-             _pad(f"🎨 Colorize: {_color_label()} • ⚙️ {_core_label()}"),
+             _pad(f"{_color_label()} • ⚙️ {_core_label()}"),
              _pad(f"💡 {m['best_for'][:30]}"),
              _pad("")]
     if job_state.get("active") and current_job:
@@ -559,8 +547,8 @@ def panel_text() -> str:
         lines += [_pad("😴 Idle — koi job nahi"),
                   _pad("🎥 video / 🖼 photo / 🎞 gif"),
                   _pad("bhejo → pure AI upscale"),
-                  _pad("Models button se content chuno")]
-    lines += ["─" * PW, _pad("🎨 Color button se colorize ON/OFF"),
+                  _pad("Models + Color buttons")]
+    lines += ["─" * PW, _pad("🎨 Color: OFF / Fast / High"),
               _pad("🚫 No post-process, pure AI")]
     return "\n".join(lines)
 
@@ -578,7 +566,7 @@ async def refresh_panel():
     except Exception:
         pass
 
-# ================= CALLBACK HANDLER =================
+# ================= CALLBACK =================
 @app.on_callback_query(filters.regex(r"^b:"))
 async def btn(client, cq):
     global _panel
@@ -586,18 +574,13 @@ async def btn(client, cq):
         await cq.answer("Private bot!", show_alert=True); return
     parts = cq.data[2:].split(":"); a = parts[0]; v = parts[1] if len(parts) > 1 else ""
     kb = None
-    if a == "mmenu":
-        kb = models_kb(); await cq.answer("🎽 Model chuno")
-    elif a == "qmenu":
-        kb = q_kb(); await cq.answer("🎯 Scale chuno")
-    elif a == "pmenu":
-        kb = p_kb(); await cq.answer("⚡ Preset chuno")
-    elif a == "amenu":
-        kb = a_kb(); await cq.answer("🔊 Audio chuno")
-    elif a == "cmenu":
-        kb = core_kb(); await cq.answer("⚙️ Cores chuno")
-    elif a == "back":
-        kb = panel_kb(); await cq.answer("🔙")
+    if a == "mmenu": kb = models_kb(); await cq.answer("🎽 Model chuno")
+    elif a == "qmenu": kb = q_kb(); await cq.answer("🎯 Scale chuno")
+    elif a == "pmenu": kb = p_kb(); await cq.answer("⚡ Preset chuno")
+    elif a == "amenu": kb = a_kb(); await cq.answer("🔊 Audio chuno")
+    elif a == "colormenu": kb = color_kb(); await cq.answer("🎨 Colorize mode")
+    elif a == "cmenu": kb = core_kb(); await cq.answer("⚙️ Cores chuno")
+    elif a == "back": kb = panel_kb(); await cq.answer("🔙")
     elif a == "m":
         if v in MODELS:
             settings["model"] = v
@@ -618,12 +601,14 @@ async def btn(client, cq):
         settings["audio"] = v
         if archive: archive.state["audio"] = v
         kb = panel_kb(); await cq.answer(f"{EMO.one('happy')} {v}")
-    elif a == "colortoggle":
-        settings["colorize"] = not settings["colorize"]
-        if archive: archive.state["colorize"] = settings["colorize"]
-        kb = panel_kb()
-        state = "🎨 ON" if settings["colorize"] else "🎨 OFF"
-        await cq.answer(state)
+    elif a == "col":
+        if v in ("off", "fast", "high"):
+            settings["colorize_mode"] = v
+            if archive: archive.state["colorize_mode"] = v
+            kb = color_kb()
+            await cq.answer(f"🎨 {v}")
+        else:
+            kb = color_kb(); await cq.answer()
     elif a == "c":
         if v in CORE_MAP:
             settings["core"] = v
@@ -634,7 +619,7 @@ async def btn(client, cq):
             kb = panel_kb(); await cq.answer()
     elif a == "go":
         await cq.answer(EMO.one("start"))
-        await cq.message.reply_text(f"{EMO.one('start')} Bas video/GIF/photo bhejo — {_model_label()} se upscale!")
+        await cq.message.reply_text(f"{EMO.one('start')} Bas video/GIF/photo bhejo — {_model_label()} upscale!")
     elif a == "help":
         await cq.answer(EMO.one("think")); await cq.message.reply_text(HELP_TEXT)
     elif a == "stats":
@@ -660,6 +645,8 @@ async def btn(client, cq):
         _panel = None
         await ensure_panel(cq.message.chat.id)
         await cq.answer("🧹 Clean"); return
+    elif a == "noop":
+        await cq.answer(); return
     else:
         await cq.answer(); return
     if archive:
@@ -721,14 +708,13 @@ def probe_video(path: Path) -> Dict:
             "duration": dur, "frames": frames,
             "has_audio": any(s.get("codec_type") == "audio" for s in data["streams"])}
 
-# ================= PIPELINE (with optional colorize) =================
+# ================= PIPELINE =================
 def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Governor,
                  cancel: threading.Event, is_gif: bool, prev_dir: Path):
     w, h, fps = info["width"], info["height"], info["fps"]
     ow, oh = job["ow"], job["oh"]
     ff = PRESETS[settings["preset"]]
-    colorize = settings["colorize"]
-    color_style = COLOR_MODELS.get(settings["model"], "stable")
+    colorize_mode = settings["colorize_mode"]
     enc_threads = 1 if gov.current[0] >= 2 else 2
     fps_g = fps if fps > 0 else 10.0
     total = min(info["frames"] or max(1, int(info["duration"] * fps)),
@@ -765,9 +751,9 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Gover
     def upscale_one(img, cfg):
         t0 = time.time()
         out, _ = ups.enhance(img, outscale=settings["scale"])
-        # Optional colorize
-        if colorize:
-            out = colorize_frame(out, color_style)
+        # DDColor colorize (if enabled)
+        if colorize_mode != "off":
+            out = colorize_frame(out, colorize_mode)
         dt = time.time() - t0
         with stats_lock:
             first = (stats["done"] == 0)
@@ -991,11 +977,11 @@ async def media_handler(client, message: Message):
         current_job.update({"ow": ow, "oh": oh, "stage": "🎨", "ai": gov.status(0.0)})
         out_path = OUTPUT_DIR / f"{Path(filename).stem}_up_{message.id}.mp4"
         t0 = time.time()
-        color_txt = f"🎨 {COLOR_MODELS.get(model_key, 'stable')}" if settings["colorize"] else "🚫 off"
+        color_txt = _color_label()
         await message.reply_text(
             f"🎬 **Process shuru:** {info['width']}×{info['height']} → {ow}×{oh} • "
             f"{info['frames']} fr\n"
-            f"{MODELS[model_key]['label']} • Colorize: {color_txt} • ⚙️ {_core_label()}")
+            f"{MODELS[model_key]['label']} • 🎨 {color_txt} • ⚙️ {_core_label()}")
         await asyncio.to_thread(run_pipeline, current_job, in_path, out_path, info,
                                 ups, gov, cancel_event, is_gif, job_dir)
         current_job["stage"] = "⬆️"
@@ -1034,7 +1020,7 @@ async def media_handler(client, message: Message):
             archive.record_job(filename, scale, time.time() - t0, True,
                                extra={"scale": settings["scale"], "preset": settings["preset"],
                                       "audio": settings["audio"], "model": model_key,
-                                      "core": settings["core"], "colorize": settings["colorize"]})
+                                      "core": settings["core"], "colorize": settings["colorize_mode"]})
             await archive.save_state()
         current_job["stage"] = "✅"
     except Exception as e:
@@ -1055,7 +1041,7 @@ async def media_handler(client, message: Message):
         EMO.set("idle")
         await refresh_panel()
 
-# ================= PHOTO (with optional colorize) =================
+# ================= PHOTO =================
 @app.on_message(filters.photo & filters.private)
 async def photo_handler(client, message: Message):
     if not is_owner(message.chat.id):
@@ -1076,17 +1062,17 @@ async def photo_handler(client, message: Message):
         ups = await asyncio.to_thread(get_ups, model_key, choose_tile(model_key, ow * oh))
         t0 = time.time()
         out = await asyncio.to_thread(lambda: ups.enhance(img, outscale=settings["scale"])[0])
-        if settings["colorize"]:
-            out = await asyncio.to_thread(colorize_frame, out, COLOR_MODELS.get(model_key, "stable"))
+        if settings["colorize_mode"] != "off":
+            out = await asyncio.to_thread(colorize_frame, out, settings["colorize_mode"])
         dt = time.time() - t0
         outp = WORK_DIR / f"photo_{message.id}_up.png"
         cv2.imwrite(str(outp), out)
         EMO.set("happy")
-        color_txt = f"🎨 {COLOR_MODELS.get(model_key, 'stable')}" if settings["colorize"] else "🚫 off"
+        color_txt = _color_label()
         await send_with_retry(lambda: app.send_photo(
             message.chat.id, str(outp),
             caption=f"{EMO.one('happy')} ✅ Photo {MODELS[model_key]['label']} • "
-                    f"{fmt_scale(settings['scale'])}× • Colorize: {color_txt}\n"
+                    f"{fmt_scale(settings['scale'])}× • 🎨 {color_txt}\n"
                     f"{w}×{h} → {out.shape[1]}×{out.shape[0]} • {dt:.1f}s"), "photo")
     except Exception as e:
         log.exception("Photo fail")
@@ -1099,7 +1085,7 @@ async def photo_handler(client, message: Message):
             try: f.unlink()
             except Exception: pass
 
-# ================= COMMANDS / TEXT =================
+# ================= COMMANDS =================
 @app.on_message(filters.command("stats") & filters.private)
 async def stats_cmd(client, message: Message):
     if not is_owner(message.chat.id): return
@@ -1128,17 +1114,17 @@ async def text_handler(client, message: Message):
         EMO.set("happy")
         await message.reply_text(f"{EMO.one('happy')} Namaste boss! Panel se sab control.")
     elif any(k in t for k in ["game", "free fire", "pubg", "bgmi"]):
-        await message.reply_text(f"{EMO.one('wow')} 🎮 Models button → Game Fast.")
+        await message.reply_text(f"{EMO.one('wow')} 🎮 Models → Game Fast.")
     elif any(k in t for k in ["anime"]):
-        await message.reply_text(f"{EMO.one('wow')} 🎌 Models button → Anime Video / Anime Image.")
+        await message.reply_text(f"{EMO.one('wow')} 🎌 Models → Anime Video / Anime Image.")
     elif any(k in t for k in ["color", "rang"]):
-        await message.reply_text(f"{EMO.one('wow')} 🎨 Color button se ON/OFF.")
+        await message.reply_text(f"{EMO.one('wow')} 🎨 Color button → OFF / Fast / 💎 High.")
     elif any(k in t for k in ["ram", "cpu", "load"]):
         await message.reply_text(f"{EMO.one('think')} 🛡 RAM {mem_avail_gb():.1f}GB • {CPU_THREADS}c")
     elif any(k in t for k in ["thank", "shukriya", "thx"]):
         await message.reply_text(f"{EMO.one('love')} Apna kaam hai boss!")
     else:
-        await message.reply_text(f"{EMO.one('think')} 🤖 v9: Models button se content chuno, Color toggle se colorize.")
+        await message.reply_text(f"{EMO.one('think')} 🤖 v10: Models + Color (Fast/High) buttons se tune.")
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client, message: Message):
@@ -1153,14 +1139,14 @@ async def start_handler(client, message: Message):
     _panel = None
     await ensure_panel(message.chat.id)
     await refresh_panel()
-    await message.reply_text(f"{EMO.one('start')} **v9 online!** Chat ID: `{message.chat.id}`")
+    await message.reply_text(f"{EMO.one('start')} **v10 online!** Chat ID: `{message.chat.id}`")
 
 # ================= BOOT =================
 def notify_owner_startup():
     try:
         r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                           json={"chat_id": OWNER_CHAT_ID_INT or OWNER_CHAT_ID,
-                                "text": "✅ Upscaler v9 online!\n🎛 Models submenu + 🎨 Colorize toggle."},
+                                "text": "✅ Upscaler v10 online!\n🎛 Models + 🎨 Color (Fast/💎 High DDColor)."},
                           timeout=15)
         log.info("Startup ping: %s", r.status_code)
     except Exception as e:
@@ -1176,7 +1162,7 @@ async def _boot():
         settings["audio"] = st.get("audio", settings["audio"])
         settings["model"] = st.get("model", settings["model"])
         settings["core"] = st.get("core", settings["core"])
-        settings["colorize"] = bool(st.get("colorize", settings["colorize"]))
+        settings["colorize_mode"] = st.get("colorize_mode", settings["colorize_mode"])
         log.info("📚 Archive settings: %s", settings)
         if archive.channel_id:
             try:
@@ -1194,7 +1180,7 @@ async def _boot():
     except Exception as e:
         log.warning("Panel boot fail: %s", e)
     asyncio.create_task(_refresh_loop())
-    log.info("🚀 v9 ready (cores=%s)", CPU_THREADS)
+    log.info("🚀 v10 ready (cores=%s)", CPU_THREADS)
 
 async def _main():
     try:
