@@ -9,7 +9,7 @@ def normalize_channel_id(raw) -> List[Any]:
     raw = (raw or "").strip()
     if not raw: return []
     
-    # Agar username hai (characters hain)
+    # Agar username hai
     if not raw.replace("-", "").isdigit():
         if not raw.startswith("@") and "t.me" not in raw:
             raw = "@" + raw
@@ -40,17 +40,19 @@ class ChannelArchive:
     async def load(self):
         for cid in self.candidates:
             try:
-                found = None
-                async for msg in self.app.get_chat_history(cid, limit=100):
-                    if msg.text and msg.text.startswith(MARKER):
-                        found = msg; break
-                self.channel_id = cid
-                if found:
+                # BOTS CANNOT GET HISTORY! Isliye hum seedha chat aur uski Pinned Message check karenge.
+                chat = await self.app.get_chat(cid)
+                self.channel_id = chat.id  # Sahi numerical ID save kar lo
+                found = chat.pinned_message
+                
+                # Agar pinned message mil jaye aur wo state file ho
+                if found and found.text and found.text.startswith(MARKER):
                     self.state_msg_id = found.id
                     try: self.state.update(json.loads(found.text.split("\n", 1)[1]))
                     except Exception: pass
+                    
                 log.info("📚 Archive ready | channel=%s | state_msg=%s | jobs_done=%s",
-                         cid, self.state_msg_id, self.state.get("jobs_done", 0))
+                         self.channel_id, self.state_msg_id, self.state.get("jobs_done", 0))
                 return
             except Exception as e:
                 log.warning("⚠️ Channel id %s kaam nahi kari: %s", cid, e)
