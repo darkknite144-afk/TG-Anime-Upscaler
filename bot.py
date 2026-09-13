@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
 """
-Smart Anime/Game/Real Upscaler v10.4
+Smart Anime/Game/Real Upscaler v10.5
 FIXES:
-  - ✅ Button submenu overwrite bug (panel_mode tracker)
-  - ✅ Black lines / rotation distortion (explicit transpose)
-  - ✅ Legacy archive migration (anime → anime_video)
-  - ✅ 1-second strict refresh rate (no panel spamming)
-  - ✅ Removed extra messages during processing
-  - ✅ Strip Metadata (-map_metadata -1) to fix mobile rotation squishing
-  - ✅ PyTorch C-Contiguous memory fix (Permanent garbled frame fix)
-  - ✅ Strict OS pipe chunk reading (Fixes shifted frame artifacts)
+  - ✅ Black Flicker Fix: Strict uint8 + exact ow/oh resize + C-contiguous memory
+  - ✅ Speed Fix: CPU oversubscription prevented + ThreadPool/Queues scaled to CPU_THREADS
+  - ✅ Faster Resize: INTER_LINEAR instead of LANCZOS4 for safety resize
 """
 import asyncio, gc, json, logging, math, os, queue, random, shutil, subprocess, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor
@@ -75,10 +70,13 @@ MAX_OUT_PIXELS = 3840 * 2160
 MAX_SEND_MB = 1900
 MAX_JOB_SEC = int(os.getenv("MAX_JOB_MIN", "300")) * 60
 GIF_MIN_SEC = 2.0
-IN_QUEUE = 2
-OUT_BACKLOG = 2
+
 CPU_THREADS = os.cpu_count() or 4
-POOL = ThreadPoolExecutor(max_workers=4)
+# 🚀 SPEED FIX 1: Pool size aur Queues ko CPU cores ke hisaab se scale karo
+POOL = ThreadPoolExecutor(max_workers=max(4, CPU_THREADS))
+IN_QUEUE = max(4, CPU_THREADS)
+OUT_BACKLOG = max(4, CPU_THREADS)
+
 os.environ["OMP_NUM_THREADS"] = str(CPU_THREADS)
 
 # ================= MODELS =================
@@ -187,9 +185,16 @@ class EmoteEngine:
 EMO = EmoteEngine()
 
 # ================= GOVERNOR =================
-CONFIGS = [(1, 4), (2, 2), (2, 3), (3, 1), (4, 1)]
-DOWNGRADE = {(4, 1): (3, 1), (3, 1): (2, 2), (2, 3): (2, 2), (2, 2): (1, 2),
-             (1, 4): (1, 2), (1, 2): (1, 1), (1, 1): (1, 1)}
+# 🚀 SPEED FIX 2: CPU Oversubscription prevent karo (workers * threads <= CPU_THREADS)
+_RAW_CONFIGS = [(1, 4), (2, 2), (2, 3), (3, 1), (4, 1), (6, 1), (8, 1)]
+CONFIGS = [c for c in _RAW_CONFIGS if c[0] * c[1] <= CPU_THREADS]
+if not CONFIGS:
+    CONFIGS = [(1, 1)]
+
+DOWNGRADE = {
+    (8, 1): (6, 1), (6, 1): (4, 1), (4, 1): (3, 1), (3, 1): (2, 2), 
+    (2, 3): (2, 2), (2, 2): (1, 2), (1, 4): (1, 2), (1, 2): (1, 1), (1, 1): (1, 1)
+}
 PROBE, EXPLOIT = 6, 12
 
 class Governor:
@@ -488,7 +493,7 @@ SUBMENU_BUTTONS = {"mmenu", "qmenu", "pmenu", "amenu", "colormenu", "cmenu"}
 VALUE_BUTTONS   = {"m", "q", "p", "a", "col", "c", "back"}
 
 HELP_TEXT = (
-    "🧭 **Help (v10.4)**\n\n"
+    "🧭 **Help (v10.5)**\n\n"
     "🎥 Video / 🎞 GIF / 🖼 Photo bhejo → upscale\n"
     "🎛 **Models** → Anime Video / Anime Image / Game / Real\n"
     "🎨 **Color** → OFF / Fast (tiny) / 💎 High (DDColor)\n"
@@ -500,7 +505,7 @@ HELP_TEXT = (
 
 def panel_text() -> str:
     m = MODELS.get(settings["model"], MODELS["anime_video"])
-    lines = [_pad(f"{EMO.face()}  UPSCALER v10.4"), "─" * PW,
+    lines = [_pad(f"{EMO.face()}  UPSCALER v10.5"), "─" * PW,
              _pad(f"🧠 {CPU_THREADS}c • 🛡 {mem_avail_gb():.1f}GB free • load {load1():.1f}"),
              _pad(f"{m['label']} {fmt_scale(settings['scale'])}× "
                   f"{settings['preset'][:4]} 🔊{settings['audio'][:4]}"),
@@ -562,7 +567,6 @@ async def refresh_panel():
     try:
         await _panel.edit_text(panel_text(), reply_markup=panel_kb())
     except FloodWait as e:
-        # Spam prevention check
         await asyncio.sleep(e.value)
     except Exception as e:
         err = str(e).lower()
@@ -782,7 +786,6 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Gover
                 stdout=subprocess.PIPE)
             n = 0
             while not cancel.is_set():
-                # Strict bytes reading (Fixes shifted/garbled buffer issue)
                 raw = read_exact(dec.stdout, fb)
                 if not raw or len(raw) != fb:
                     break
@@ -798,19 +801,20 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Gover
         if colorize_mode != "off":
             out = colorize_frame(out, colorize_mode)
             
-        # FIX 1: Enforce EXACT 3-channel structure (some ESRGAN engines output 4 channels)
+        # FIX 1: Enforce EXACT 3-channel structure
         if len(out.shape) == 3 and out.shape[2] == 4:
             out = out[:, :, :3]
         elif len(out.shape) == 2:
             out = cv2.cvtColor(out, cv2.COLOR_GRAY2BGR)
             
-        # FIX 2: Exact matching of required FFMPEG boundaries
+        # 🚀 SPEED FIX 3 & FLICKER FIX: Exact dimensions with INTER_LINEAR (much faster than LANCZOS4)
         if out.shape[1] != ow or out.shape[0] != oh:
-            out = cv2.resize(out, (ow, oh), interpolation=cv2.INTER_LANCZOS4)
+            out = cv2.resize(out, (ow, oh), interpolation=cv2.INTER_LINEAR)
             
-        # FIX 3 (CRITICAL): Absolutely guarantees the bytes are packed in C-contiguous memory!
-        # If memory is disjointed, ffmpeg will slant and garble every frame in the pipe.
-        out = np.ascontiguousarray(out, dtype=np.uint8)
+        # FLICKER FIX: Guarantee uint8 and C-contiguous memory layout
+        if out.dtype != np.uint8:
+            out = np.clip(out, 0, 255).astype(np.uint8)
+        out = np.ascontiguousarray(out)
             
         dt = time.time() - t0
         with stats_lock:
@@ -833,10 +837,6 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Gover
             if info["has_audio"]:
                 if settings["audio"] == "keep": cmd += ["-map", "1:a?", "-c:a", "copy"]
                 elif settings["audio"] == "compress": cmd += ["-map", "1:a?", "-c:a", "aac", "-b:a", "128k"]
-            
-            # FIX 4 (CRITICAL for mobile videos): Strip all metadata!
-            # If the original file had a corrupted rotation tag, Ffmpeg would copy it here and
-            # force players to squish and box the video entirely.
             cmd += ["-map_metadata", "-1"]
             
         cmd += ["-c:v", "libx264", "-preset", ff["preset"], "-crf", ff["crf"],
@@ -983,7 +983,6 @@ async def _refresh_loop():
         except Exception as e:
             log.warning("refresh_loop err: %s", e)
         
-        # Ab panel 1 second ki exact delay ke saath hi update hoga (spam limit bypass)
         await asyncio.sleep(1.0)
 
 @app.on_message((filters.video | filters.document | filters.animation) & filters.private)
@@ -1040,7 +1039,6 @@ async def media_handler(client, message: Message):
         out_path = OUTPUT_DIR / f"{Path(filename).stem}_up_{message.id}.mp4"
         t0 = time.time()
         
-        # "Process shuru" message completely REMOVED -> directly updating the panel message!
         await asyncio.to_thread(run_pipeline, current_job, in_path, out_path, info,
                                 ups, gov, cancel_event, is_gif, job_dir)
         current_job["stage"] = "⬆️"
@@ -1058,7 +1056,6 @@ async def media_handler(client, message: Message):
         def ul_cb(cur, tot, *a):
             current_job["stage"] = f"⬆️ {cur/1048576:.0f}/{tot/1048576:.0f}MB"
 
-        # Direct final video send
         if is_gif:
             await send_with_retry(lambda: app.send_animation(
                 message.chat.id, str(out_path), caption=cap, progress=ul_cb), "animation")
@@ -1120,6 +1117,13 @@ async def photo_handler(client, message: Message):
         out = await asyncio.to_thread(lambda: ups.enhance(img, outscale=settings["scale"])[0])
         if normalize_colorize(settings["colorize_mode"]) != "off":
             out = await asyncio.to_thread(colorize_frame, out, normalize_colorize(settings["colorize_mode"]))
+            
+        # Photo Flicker Fix
+        if len(out.shape) == 3 and out.shape[2] == 4:
+            out = out[:, :, :3]
+        if out.dtype != np.uint8:
+            out = np.clip(out, 0, 255).astype(np.uint8)
+            
         dt = time.time() - t0
         outp = WORK_DIR / f"photo_{message.id}_up.png"
         cv2.imwrite(str(outp), out)
@@ -1200,7 +1204,7 @@ async def text_handler(client, message: Message):
     elif any(k in t for k in ["thank", "shukriya", "thx"]):
         await message.reply_text("Apna kaam hai boss!")
     else:
-        await message.reply_text("🤖 v10.4: /panel se panel; Models + Color buttons se tune.")
+        await message.reply_text("🤖 v10.5: /panel se panel; Models + Color buttons se tune.")
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client, message: Message):
@@ -1208,14 +1212,14 @@ async def start_handler(client, message: Message):
         await message.reply_text("❌ Private bot."); return
     EMO.set("start")
     await send_panel(message.chat.id)
-    await message.reply_text(f"✅ **v10.4 online!** Chat ID: `{message.chat.id}`")
+    await message.reply_text(f"✅ **v10.5 online!** Chat ID: `{message.chat.id}`")
 
 # ================= BOOT =================
 def notify_owner_startup():
     try:
         r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                           json={"chat_id": OWNER_CHAT_ID_INT or OWNER_CHAT_ID,
-                                "text": "✅ Upscaler v10.4 online!\n🎛 Panel bhej raha hoon..."},
+                                "text": "✅ Upscaler v10.5 online!\n🎛 Panel bhej raha hoon..."},
                           timeout=15)
         log.info("Startup ping: %s", r.status_code)
     except Exception as e:
@@ -1248,7 +1252,7 @@ async def _boot():
         except Exception as e: log.error("Panel send fail: %s", e)
 
     asyncio.create_task(_refresh_loop())
-    log.info("🚀 v10.4 ready (cores=%s)", CPU_THREADS)
+    log.info("🚀 v10.5 ready (cores=%s)", CPU_THREADS)
 
 async def _main():
     try:
