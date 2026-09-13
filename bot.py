@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Smart Anime/Game Upscaler v8.1 — ROTATION/STRIDE FIX
-- 🛠 Shear/tilt/black-bands fix: rotation metadata detect + exact raw frame size (-vf scale)
-- 🧠 Governor v2, 💾 RAM-minimal streaming, 🎌/🎮 models, 🖼 photo, ⬅️➡️ preview,
-  📤 retry, ⏰ watchdog, 💓 heartbeat, 📚 archive — sab v8 jaisa intact
+Smart Anime/Game Upscaler v8.2 — FULL-UI + QUALITY
+- 🎛 v13-style full panel: mood/model/scale/preset/audio/quality/cores/stats/help/start/sendv/sendp/sendg/stop/clean
+- ✨ Quality boost: Standard / High / Ultra (post-process sharpen + detail enhance)
+- ⚙️ Cores: Auto (governor) / Fixed 1T..16T / Duo / Quad
+- 🧠 Governor v2 + 💾 streaming + rotation/stride fix — v8.1 jaisa intact
 """
 import asyncio
 import gc
@@ -12,6 +13,7 @@ import logging
 import math
 import os
 import queue
+import random
 import shutil
 import subprocess
 import sys
@@ -90,7 +92,31 @@ PRESETS = {"fast": {"crf": "23", "preset": "veryfast"},
            "balanced": {"crf": "19", "preset": "veryfast"},
            "best": {"crf": "16", "preset": "slow"}}
 
-settings = {"scale": 2.0, "preset": "balanced", "audio": "keep", "model": "anime"}
+# ✨ Quality modes — post-process sharpen + detail boost
+QUALITY = {
+    "standard": {"label": "⚡ Standard", "sharpen": 0.0, "detail": False},
+    "high":     {"label": "✨ High",     "sharpen": 0.35, "detail": False},
+    "ultra":    {"label": "💎 Ultra",    "sharpen": 0.55, "detail": True},
+}
+
+# ⚙️ Core profiles — (key, label, workers, threads); "auto" = governor decides
+def _build_core_profiles():
+    p = [("auto", "🤖 Auto (Governor)", 0, 0)]
+    for n in (1, 2, 3, 4, 6, 8, 12, 16):
+        if n <= CPU_THREADS:
+            p.append((f"solo{n}", f"🐢 Solo {n}T", 1, n))
+    for w, t, lbl in [(2, 2, "⚡ Duo 2×2"), (2, 3, "⚡ Duo 2×3"),
+                      (3, 1, "🔥 Trio 3×1"), (4, 1, "🔥 Quad 4×1"),
+                      (6, 1, "🔥🔥 Hexa 6×1")]:
+        if w * t <= CPU_THREADS:
+            p.append((f"m{w}x{t}", lbl, w, t))
+    return p
+
+CORE_PROFILES = _build_core_profiles()
+CORE_MAP = {p[0]: p for p in CORE_PROFILES}
+
+settings = {"scale": 2.0, "preset": "balanced", "audio": "keep",
+            "model": "anime", "quality": "high", "core": "auto"}
 job_state = {"active": False}
 current_job: Optional[Dict[str, Any]] = None
 cancel_event: Optional[threading.Event] = None
@@ -122,6 +148,41 @@ def bar(pct: float, n: int = 8) -> str:
     f = int(n * min(100, max(0, pct)) / 100)
     return "▰" * f + "▱" * (n - f)
 
+PW = 34
+def _pad(s: str) -> str:
+    s = (s or "").replace("\n", " ")
+    return s if len(s) >= PW else s + " " * (PW - len(s))
+
+# ================= EMOTE ENGINE =================
+FACE_TICK = 0.85
+FACES = {
+    "idle":     ["(˘˘)… zZ", "(¬ᴗ¬) zZ", "(˘▽˘) ♪"],
+    "work":     ["(っ⚙️_⚙️)っ⚡", "(っ⚙️_⚙️)っ✦", "(っ⚙️_⚙️)っ✧"],
+    "think":    ["(◔_)…", "(◔‿◔)?", "(◕_◕)…"],
+    "happy":    ["(ﾉ◕)ﾉ*:･ﾟ✧", "(◕‿◕)✧", "(＾▽＾)ﾉ★"],
+    "error":    ["(×_×;)", "(╥_╥)…", "(⊙_)!"],
+    "love":     ["(♥‿♥)", "(♡ω♡)", "(⁄⁄•⁄ω•⁄⁄)"],
+    "start":    ["(ò_ó)⚡", "(◉◉)✧", "(ᐛ)و✦"],
+    "upload":   ["(⇀↼)", "(_↼)️", "(⇀‿↼)🚀"],
+    "download": ["(⇂_⇂)📥", "(⇂_)", "(⇂_⇂)✦"],
+    "wow":      ["(✧ω✧)", "(✧▽✧)", "(◍◍)✨"],
+}
+MOOD_ORDER = ["idle", "happy", "wow", "love", "think", "work", "start"]
+
+class EmoteEngine:
+    def __init__(self):
+        self.state = "idle"; self.t0 = time.time()
+    def set(self, s: str):
+        if s != self.state:
+            self.state = s; self.t0 = time.time()
+    def face(self) -> str:
+        fr = FACES.get(self.state, FACES["idle"])
+        return fr[int((time.time() - self.t0) / FACE_TICK) % len(fr)]
+    def one(self, s: str) -> str:
+        return random.choice(FACES.get(s, FACES["idle"]))
+
+EMO = EmoteEngine()
+
 # ================= GOVERNOR v2 =================
 CONFIGS = [(1, 4), (2, 2), (2, 3), (3, 1), (4, 1)]
 DOWNGRADE = {(4, 1): (3, 1), (3, 1): (2, 2), (2, 3): (2, 2), (2, 2): (1, 2),
@@ -129,19 +190,31 @@ DOWNGRADE = {(4, 1): (3, 1), (3, 1): (2, 2), (2, 3): (2, 2), (2, 2): (1, 2),
 PROBE, EXPLOIT = 6, 12
 
 class Governor:
-    def __init__(self, out_px: int):
+    """v8.1 Governor + fixed override support."""
+    def __init__(self, out_px: int, fixed: Optional[tuple] = None):
         self.fp = out_px * 512 / 1e9
+        self.fixed = fixed
         self.ema = {c: 0.0 for c in CONFIGS}
         self.cnt = {c: 0 for c in CONFIGS}
-        start = (2, 2) if self._ram_ok(2) else ((1, 2) if self._ram_ok(1) else (1, 1))
+        if fixed is not None:
+            # RAM-safe clamp
+            w, t = fixed
+            fp = self.fp
+            max_w = max(1, int(mem_avail_gb() * 0.6 / max(fp, 0.1)))
+            if w > max_w:
+                log.warning("⚙️ Fixed core clamped %d→%d (RAM)", w, max_w)
+                w = max_w
+            start = (w, t)
+        else:
+            start = (2, 2) if self._ram_ok(2) else ((1, 2) if self._ram_ok(1) else (1, 1))
         self.current = start
         self.probe_left, self.exploit = PROBE, 0
         self.load_ema = load1(); self.ram_ema = mem_avail_gb()
         self.press = 0; self.idle = 0; self.safe = False
         self.lock = threading.Lock()
         self.apply()
-        log.info("🧠 Governor v2 %s | fp %.2fGB/fr | RAM %.1fGB | load %.1f",
-                 self.current, self.fp, self.ram_ema, self.load_ema)
+        log.info("🧠 Governor v2 %s%s | fp %.2fGB/fr | RAM %.1fGB",
+                 self.current, " [FIXED]" if fixed else "", self.fp, self.ram_ema)
 
     def _ram_ok(self, w: int) -> bool:
         return w * self.fp <= max(1.0, mem_avail_gb() * 0.7)
@@ -162,6 +235,12 @@ class Governor:
             self.ram_ema = self.ram_ema * 0.8 + mem_avail_gb() * 0.2
             if done % 20 == 0:
                 gc.collect()
+            # Fixed mode: sirf RAM safety check, koi probing nahi
+            if self.fixed is not None:
+                if self.ram_ema < 1.2:
+                    self.safe = True
+                return
+            # Auto mode: same as v8.1
             if self.ram_ema < 1.2 or self.load_ema > CPU_THREADS * 1.5:
                 self.press += 1; self.idle = 0
                 if self.press >= 2:
@@ -169,13 +248,12 @@ class Governor:
                     nxt = DOWNGRADE.get(self.current, self.current)
                     if nxt != self.current:
                         self.current = nxt; self.apply()
-                        log.warning("🛡 DOWNGRADE -> %s (RAM %.1fGB, load %.1f)", nxt, self.ram_ema, self.load_ema)
+                        log.warning("🛡 DOWNGRADE -> %s", nxt)
                     return
             else:
                 self.press = 0
                 if self.safe and self.ram_ema > 3.0 and self.load_ema < CPU_THREADS * 0.9:
                     self.safe = False
-                    log.info("🛡 safe-mode OFF (RAM %.1fGB)", self.ram_ema)
             if not self.safe and self.load_ema < CPU_THREADS * 0.55 and self.ram_ema > 4.0:
                 self.idle += 1
                 if self.idle >= 4:
@@ -207,7 +285,6 @@ class Governor:
             target = cand[0]
         if target != self.current:
             self.current = target; self.apply()
-            log.info("🤖 AI probe -> %s%s", target, " (UPGRADE)" if up else "")
         self.probe_left = PROBE
 
     def _pick_best(self):
@@ -216,15 +293,35 @@ class Governor:
         b = max(tested, key=self.thr)
         if b != self.current:
             self.current = b; self.apply()
-            log.info("🤖 AI best -> %s (%.2f f/s)", b, self.thr(b))
 
     def status(self, spf: float) -> str:
-        return (f"🤖 {self.current[0]}W×{self.current[1]}T | {spf:.2f}s/fr | "
-                f"{self.thr(self.current):.2f} f/s | 🛡 RAM {self.ram_ema:.1f}GB | "
+        fixed_lbl = " [FIXED]" if self.fixed else ""
+        return (f"🤖 {self.current[0]}W×{self.current[1]}T{fixed_lbl} | {spf:.2f}s/fr | "
+                f"{self.thr(self.current):.2f} f/s | 🛡 {self.ram_ema:.1f}G | "
                 f"load {self.load_ema:.1f}" + (" | SAFE" if self.safe else ""))
 
 # ================= MODELS =================
 _ups_cache: Dict[Any, RealESRGANer] = {}
+
+def _detect_srvgg_num_conv(path: Path) -> int:
+    """Auto-detect SRVGGNetCompact num_conv from state_dict (16 or 32)."""
+    try:
+        sd = torch.load(str(path), map_location="cpu", weights_only=False)
+        if isinstance(sd, dict):
+            for k in ("params_ema", "params", "state_dict"):
+                if k in sd and isinstance(sd[k], dict):
+                    sd = sd[k]; break
+        max_idx = -1
+        for k in sd.keys():
+            if k.startswith("body.") and k.endswith(".weight"):
+                parts = k.split(".")
+                if len(parts) >= 3 and parts[1].isdigit():
+                    max_idx = max(max_idx, int(parts[1]))
+        if max_idx >= 2:
+            return max(16, (max_idx - 2) // 2)
+    except Exception as e:
+        log.warning("num_conv detect fail: %s", e)
+    return 16
 
 def choose_tile(key: str, out_px: int) -> int:
     if MODELS[key]["arch"] == "rrdb": return 256
@@ -235,31 +332,91 @@ def get_ups(key: str, tile: int) -> RealESRGANer:
     if k in _ups_cache: return _ups_cache[k]
     m = MODELS[key]; path = MODEL_DIR / m["file"]
     if not path.exists(): raise FileNotFoundError(f"Model missing: {path}")
-    log.info("Loading %s (tile=%s)...", m["file"], tile)
+
     if m["arch"] == "rrdb":
+        log.info("Loading %s (RRDBNet, tile=%s)...", m["file"], tile)
         model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
-    else:
-        model = SRVGGNetCompact(num_in_ch=3, num_out_ch=3, num_feat=64, num_conv=16, upscale=4, act_type="prelu")
-    ups = RealESRGANer(scale=4, model_path=str(path), model=model, tile=tile,
-                       tile_pad=10, pre_pad=0, half=False, device=torch.device("cpu"))
-    _ups_cache[k] = ups
-    return ups
+        ups = RealESRGANer(scale=4, model_path=str(path), model=model, tile=tile,
+                           tile_pad=10, pre_pad=0, half=False, device=torch.device("cpu"))
+        _ups_cache[k] = ups
+        return ups
+
+    nconv = _detect_srvgg_num_conv(path)
+    log.info("Loading %s (SRVGG num_conv=%s, tile=%s)...", m["file"], nconv, tile)
+    last_err = None
+    for nc in [nconv, 32, 16]:
+        try:
+            model = SRVGGNetCompact(num_in_ch=3, num_out_ch=3, num_feat=64,
+                                    num_conv=nc, upscale=4, act_type="prelu")
+            ups = RealESRGANer(scale=4, model_path=str(path), model=model, tile=tile,
+                               tile_pad=10, pre_pad=0, half=False, device=torch.device("cpu"))
+            if nc != nconv: log.info("✅ Fallback num_conv=%s worked!", nc)
+            _ups_cache[k] = ups
+            return ups
+        except Exception as e:
+            last_err = e
+            log.warning("num_conv=%s load fail: %s", nc, str(e)[:140])
+    raise last_err or RuntimeError("SRVGG load failed")
+
+# ================= IMAGE QUALITY POST-PROCESS =================
+def post_process_quality(img: np.ndarray, quality_key: str) -> np.ndarray:
+    """Sharpen + detail enhance based on selected quality mode."""
+    q = QUALITY.get(quality_key, QUALITY["standard"])
+    if q["detail"]:
+        try:
+            # Ultra: contrast-limited detail enhance (mild)
+            img = cv2.detailEnhance(img, sigma_s=10, sigma_r=0.15)
+        except Exception:
+            pass
+    if q["sharpen"] > 0:
+        try:
+            blur = cv2.GaussianBlur(img, (0, 0), 1.2)
+            img = cv2.addWeighted(img, 1 + q["sharpen"], blur, -q["sharpen"], 0)
+        except Exception:
+            pass
+    return img
 
 # ================= CLIENT + ARCHIVE =================
 app = Client("anime_upscaler_bot", api_id=API_ID, api_hash=API_HASH,
              bot_token=BOT_TOKEN, in_memory=True)
 archive = ChannelArchive(app, (os.getenv("ARCHIVE_CHANNEL_ID", "") or "").strip()) if ChannelArchive else None
 
-# ================= PANEL =================
+# ================= PANEL (v13 FULL UI) =================
 _panel: Optional[Message] = None
+
+HELP_TEXT = (
+    "🧭 **Help (v8.2)**\n\n"
+    "🎥 Video / 🎞 GIF / 🖼 Photo bhejo → upscale\n"
+    "🎛 Panel boot par hi — Model / Scale / Preset / Audio / Quality / Cores\n"
+    "✨ **Quality**: Standard / High / Ultra — Ultra me sharpen + detail boost\n"
+    "⚙️ **Cores**: Auto (Governor) ya Fixed (1T..16T, Duo, Quad, Hexa)\n"
+    "🧠 Auto mode: RAM+CPU dekh kar workers/threads khud tune karta hai\n"
+    "🛡 Rotation fix + stride fix — tedhi videos bhi seedhi upscale hongi\n"
+    "📚 Queue: 3 parallel (baki scheduler)\n"
+    "✍️ /start /stats /cancel"
+)
+
+def _core_label() -> str:
+    if settings["core"] == "auto": return "🤖 Auto"
+    cm = CORE_MAP.get(settings["core"])
+    return cm[1] if cm else "🤖 Auto"
 
 def panel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(MODELS[settings["model"]]["label"], callback_data="b:mmenu"),
-         InlineKeyboardButton(f"🎯 {fmt_scale(settings['scale'])}×", callback_data="b:qmenu"),
-         InlineKeyboardButton(f"⚡ {settings['preset'].title()}", callback_data="b:pmenu"),
-         InlineKeyboardButton(f"🔊 {settings['audio'].title()}", callback_data="b:amenu")],
-        [InlineKeyboardButton("⛔ Stop", callback_data="b:stop"),
+        [InlineKeyboardButton(f"{EMO.face()}", callback_data="b:mood"),
+         InlineKeyboardButton(MODELS[settings["model"]]["label"], callback_data="b:mmenu"),
+         InlineKeyboardButton(f"🎯 {fmt_scale(settings['scale'])}×", callback_data="b:qmenu")],
+        [InlineKeyboardButton(f"⚡ {settings['preset'].title()}", callback_data="b:pmenu"),
+         InlineKeyboardButton(f"🔊 {settings['audio'].title()}", callback_data="b:amenu"),
+         InlineKeyboardButton(QUALITY[settings["quality"]]["label"], callback_data="b:hmenu")],
+        [InlineKeyboardButton(_core_label(), callback_data="b:cmenu"),
+         InlineKeyboardButton("▶️ Start", callback_data="b:go"),
+         InlineKeyboardButton("📊 Stats", callback_data="b:stats")],
+        [InlineKeyboardButton("🧭 Help", callback_data="b:help"),
+         InlineKeyboardButton("🎥 Video", callback_data="b:sendv"),
+         InlineKeyboardButton("🖼 Photo", callback_data="b:sendp")],
+        [InlineKeyboardButton("🎞 GIF", callback_data="b:sendg"),
+         InlineKeyboardButton("⛔ Stop", callback_data="b:stop"),
          InlineKeyboardButton("🧹 Clean", callback_data="b:clean")],
     ])
 
@@ -290,21 +447,48 @@ def a_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("🔇 Remove", callback_data="b:a:remove")],
         [InlineKeyboardButton("🔙 Panel", callback_data="b:back")]])
 
+def h_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚡ Standard (fastest)", callback_data="b:h:standard")],
+        [InlineKeyboardButton("✨ High (sharp)", callback_data="b:h:high")],
+        [InlineKeyboardButton("💎 Ultra (best)", callback_data="b:h:ultra")],
+        [InlineKeyboardButton("🔙 Panel", callback_data="b:back")]])
+
+def core_kb() -> InlineKeyboardMarkup:
+    rows = []
+    row = []
+    for key, label, w, t in CORE_PROFILES:
+        row.append(InlineKeyboardButton(label, callback_data=f"b:c:{key}"))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row: rows.append(row)
+    rows.append([InlineKeyboardButton("🔙 Panel", callback_data="b:back")])
+    return InlineKeyboardMarkup(rows)
+
 def panel_text() -> str:
-    lines = [f"🎛 **Upscaler v8.1** • 🧠 {CPU_THREADS} cores • 🛡 {mem_avail_gb():.1f}GB free • load {load1():.1f}",
-             f"Model: {MODELS[settings['model']]['label']} • {fmt_scale(settings['scale'])}× • "
-             f"{settings['preset'].title()} • 🔊 {settings['audio'].title()}", ""]
+    lines = [_pad(f"{EMO.face()}  UPSCALER v8.2"), "─" * PW,
+             _pad(f"🧠 {CPU_THREADS}c • 🛡 {mem_avail_gb():.1f}GB free • load {load1():.1f}"),
+             _pad(f"{MODELS[settings['model']]['label']} {fmt_scale(settings['scale'])}× "
+                  f"{settings['preset'][:4]} 🔊{settings['audio'][:4]}"),
+             _pad(f"{QUALITY[settings['quality']]['label']} • ⚙️ {_core_label()}"),
+             _pad("")]
     if job_state.get("active") and current_job:
         j = current_job
         if j.get("total"):
             pct = j["done"] * 100 / j["total"]
-            lines += [f"{j.get('stage', '🎨')} **{j['filename'][:22]}** — {bar(pct)} {pct:.0f}%",
-                      f"   {j['done']}/{j['total']} fr • ⏱ ETA {fmt_time(j.get('eta', 0))}",
-                      "   " + j.get("ai", "")]
+            lines += [_pad(f"{j.get('stage', '🎨')} {j['filename'][:18]}"),
+                      _pad(f"{bar(pct)} {pct:.0f}%"),
+                      _pad(f"🎞 {j['done']}/{j['total']} • ETA {fmt_time(j.get('eta', 0))}"),
+                      _pad(j.get("ai", "")[:PW])]
         else:
-            lines += [f"{j.get('stage', '📥')} **{j.get('filename', '')[:22]}**"]
+            lines += [_pad(f"{j.get('stage', '📥')} {j.get('filename', '')[:18]}")] + [_pad("")] * 2
     else:
-        lines += ["😴 Idle — video/GIF/photo bhejo. Model button se 🎌/🎮 chuno."]
+        lines += [_pad("😴 Idle — koi job nahi"),
+                  _pad("🎥 video / 🖼 photo / 🎞 gif"),
+                  _pad("bhejo → MAX speed + quality"),
+                  _pad("buttons se settings")]
+    lines += ["─" * PW, _pad("✨ Quality button se sharpness"),
+              _pad("⚙️ Cores button se workers")]
     return "\n".join(lines)
 
 async def ensure_panel(cid: int) -> Message:
@@ -327,30 +511,65 @@ async def btn(client, cq):
     if not is_owner(cq.message.chat.id):
         await cq.answer("Private bot!", show_alert=True); return
     parts = cq.data[2:].split(":"); a = parts[0]; v = parts[1] if len(parts) > 1 else ""
-    kb = panel_kb()
-    if a == "mmenu": kb = model_kb()
-    elif a == "qmenu": kb = q_kb()
-    elif a == "pmenu": kb = p_kb()
-    elif a == "amenu": kb = a_kb()
+    kb = None
+    if a == "mmenu": kb = model_kb(); await cq.answer("🎽 Model chuno")
+    elif a == "qmenu": kb = q_kb(); await cq.answer("🎯 Scale chuno")
+    elif a == "pmenu": kb = p_kb(); await cq.answer("⚡ Preset chuno")
+    elif a == "amenu": kb = a_kb(); await cq.answer("🔊 Audio chuno")
+    elif a == "hmenu": kb = h_kb(); await cq.answer("✨ Quality chuno")
+    elif a == "cmenu": kb = core_kb(); await cq.answer("⚙️ Cores chuno")
+    elif a == "back": kb = panel_kb(); await cq.answer("🔙")
     elif a == "m":
         settings["model"] = v
         if archive: archive.state["model"] = v
-        await cq.answer(f"Model: {MODELS[v]['label']}")
+        kb = panel_kb(); await cq.answer(f"{EMO.one('wow')} {MODELS[v]['label']}")
     elif a == "q":
         settings["scale"] = float(v)
         if archive: archive.state["scale"] = float(v)
-        await cq.answer(f"Scale {v}×")
+        kb = panel_kb(); await cq.answer(f"{EMO.one('start')} {v}×")
     elif a == "p":
         settings["preset"] = v
         if archive: archive.state["preset"] = v
-        await cq.answer(f"Preset {v}")
+        kb = panel_kb(); await cq.answer(f"{EMO.one('think')} {v}")
     elif a == "a":
         settings["audio"] = v
         if archive: archive.state["audio"] = v
-        await cq.answer(f"Audio {v}")
+        kb = panel_kb(); await cq.answer(f"{EMO.one('happy')} {v}")
+    elif a == "h":
+        if v in QUALITY:
+            settings["quality"] = v
+            kb = h_kb()
+            await cq.answer(f"{QUALITY[v]['label']}")
+        else:
+            kb = panel_kb(); await cq.answer()
+    elif a == "c":
+        if v in CORE_MAP:
+            settings["core"] = v
+            kb = core_kb()
+            lbl = "Auto (Governor)" if v == "auto" else CORE_MAP[v][1]
+            await cq.answer(f"⚙️ {lbl}")
+        else:
+            kb = panel_kb(); await cq.answer()
+    elif a == "go":
+        await cq.answer(EMO.one("start"))
+        await cq.message.reply_text(f"{EMO.one('start')} Bas video/GIF/photo bhejo — upscale shuru!")
+    elif a == "help":
+        await cq.answer(EMO.one("think")); await cq.message.reply_text(HELP_TEXT)
+    elif a == "stats":
+        await cq.answer(EMO.one("wow")); await cq.message.reply_text(_stats_text())
+    elif a == "sendv":
+        await cq.answer(EMO.one("download")); await cq.message.reply_text(f"{EMO.one('download')} Ab **video** bhejo!")
+    elif a == "sendp":
+        await cq.answer(EMO.one("download")); await cq.message.reply_text(f"{EMO.one('download')} Ab **photo** bhejo!")
+    elif a == "sendg":
+        await cq.answer(EMO.one("download")); await cq.message.reply_text(f"{EMO.one('download')} Ab **GIF** bhejo!")
+    elif a == "mood":
+        cur = EMO.state if EMO.state in MOOD_ORDER else "idle"
+        EMO.set(MOOD_ORDER[(MOOD_ORDER.index(cur) + 1) % len(MOOD_ORDER)])
+        kb = panel_kb(); await cq.answer(EMO.face())
     elif a == "stop":
         if cancel_event: cancel_event.set()
-        await cq.answer("⛔ Stop request")
+        await cq.answer(f"{EMO.one('error')} Cancel!")
     elif a == "clean":
         try:
             if _panel: await _panel.delete()
@@ -363,17 +582,34 @@ async def btn(client, cq):
         await cq.answer(); return
     if archive:
         asyncio.create_task(archive.save_state())
-    try:
-        if _panel and cq.message.id == _panel.id:
-            await _panel.edit_text(panel_text(), reply_markup=kb)
-        else:
-            await cq.message.edit_text(panel_text(), reply_markup=kb)
-            _panel = cq.message
-    except Exception:
-        pass
-    await cq.answer()
+    if kb is not None:
+        try:
+            if _panel and cq.message.id == _panel.id:
+                await _panel.edit_text(panel_text(), reply_markup=kb)
+            else:
+                await cq.message.edit_text(panel_text(), reply_markup=kb)
+                _panel = cq.message
+        except Exception:
+            pass
 
-# ================= PROBE (v8.1: rotation-aware) =================
+def _stats_text() -> str:
+    lines = [f"📊 **Stats** {EMO.one('wow')}",
+             f"⚙️ Cores: {_core_label()}",
+             f"✨ Quality: {QUALITY[settings['quality']]['label']}",
+             f"🧠 Governor v2: adaptive",
+             f"🖥 Cores: {CPU_THREADS} • 🛡 RAM: {mem_avail_gb():.1f}GB free",
+             f"🎽 Model: {MODELS[settings['model']]['label']} • 🎯 {fmt_scale(settings['scale'])}×"]
+    if archive:
+        st = archive.state
+        hist = st.get("history", [])
+        tot_t = sum(x.get("t", 0) for x in hist)
+        lines += [f"✅ Jobs done: {st.get('jobs_done', 0)}",
+                  f"🕒 Total: {fmt_time(tot_t)}"]
+        for x in hist[-3:]:
+            lines.append(f"• {x.get('f', '?')[:20]} | {x.get('s', 0)}× | {fmt_time(x.get('t', 0))}")
+    return "\n".join(lines)
+
+# ================= PROBE (rotation-aware) =================
 def probe_video(path: Path) -> Dict:
     r = subprocess.run(["ffprobe", "-v", "error", "-print_format", "json",
                         "-show_streams", "-show_format", str(path)],
@@ -385,7 +621,6 @@ def probe_video(path: Path) -> Dict:
     dur = float(vid.get("duration") or data.get("format", {}).get("duration") or 0)
     frames = int(float(vid.get("nb_frames") or max(1, dur * fps)))
 
-    # 🛠 v8.1 FIX: rotation metadata detect karo → effective dims use karo
     w = int(vid["width"]); h = int(vid["height"])
     rot = 0.0
     for sd in (vid.get("side_data_list") or []):
@@ -403,12 +638,13 @@ def probe_video(path: Path) -> Dict:
             "duration": dur, "frames": frames,
             "has_audio": any(s.get("codec_type") == "audio" for s in data["streams"])}
 
-# ================= PIPELINE (v8.1: exact frame size guarantee) =================
+# ================= PIPELINE (unchanged structure + quality post-process) =================
 def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Governor,
                  cancel: threading.Event, is_gif: bool, prev_dir: Path):
     w, h, fps = info["width"], info["height"], info["fps"]
     ow, oh = job["ow"], job["oh"]
     ff = PRESETS[settings["preset"]]
+    quality = settings["quality"]
     enc_threads = 1 if gov.current[0] >= 2 else 2
     fps_g = fps if fps > 0 else 10.0
     total = min(info["frames"] or max(1, int(info["duration"] * fps)),
@@ -429,7 +665,6 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Gover
         try:
             dec = subprocess.Popen(
                 ["ffmpeg", "-v", "error", "-i", str(in_path), "-vsync", "0",
-                 # 🛠 v8.1 FIX: exact output size force karo → stride mismatch/shear impossible
                  "-vf", f"scale={w}:{h}:flags=fast_bilinear",
                  "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"],
                 stdout=subprocess.PIPE)
@@ -446,6 +681,8 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups, gov: Gover
     def upscale_one(img, cfg):
         t0 = time.time()
         out, _ = ups.enhance(img, outscale=settings["scale"])
+        # ✨ Quality post-process
+        out = post_process_quality(out, quality)
         dt = time.time() - t0
         with stats_lock:
             first = (stats["done"] == 0)
@@ -589,7 +826,7 @@ async def send_with_retry(fn, desc: str):
 @app.on_message(filters.all & filters.private, group=-1)
 async def debug_logger(client, message: Message):
     kind = "text" if message.text else "media" if (message.video or message.photo or message.animation or message.document) else "other"
-    log.info("INCOMING MESSAGE | chat_id=%s | kind=%s | content=%r",
+    log.info("INCOMING | chat_id=%s | kind=%s | content=%r",
              message.chat.id, kind, (message.text or "")[:50])
 
 # ================= JOB =================
@@ -598,6 +835,16 @@ busy_lock = asyncio.Lock()
 async def _refresh_loop():
     hb = 0
     while True:
+        if job_state.get("active") and current_job:
+            st = current_job.get("stage", "")
+            if st.startswith("📥"): EMO.set("download")
+            elif st.startswith("🔍"): EMO.set("think")
+            elif st.startswith("⬆️"): EMO.set("upload")
+            elif st.startswith("✅"): EMO.set("happy")
+            elif st.startswith("❌"): EMO.set("error")
+            else: EMO.set("work")
+        else:
+            EMO.set("idle")
         await refresh_panel()
         hb += 1
         if hb % 24 == 0 and job_state.get("active") and current_job:
@@ -650,12 +897,21 @@ async def media_handler(client, message: Message):
             oh = int(info["height"] * scale); oh += oh % 2
         model_key = settings["model"]
         ups = await asyncio.to_thread(get_ups, model_key, choose_tile(model_key, ow * oh))
-        gov = Governor(ow * oh)
+
+        # ⚙️ Fixed core override support
+        fixed = None
+        if settings["core"] != "auto":
+            cm = CORE_MAP.get(settings["core"])
+            if cm and cm[2] > 0:
+                fixed = (cm[2], cm[3])
+        gov = Governor(ow * oh, fixed=fixed)
         current_job.update({"ow": ow, "oh": oh, "stage": "🎨", "ai": gov.status(0.0)})
         out_path = OUTPUT_DIR / f"{Path(filename).stem}_up_{message.id}.mp4"
         t0 = time.time()
-        await message.reply_text(f"🎬 **Process shuru:** {info['width']}×{info['height']} → {ow}×{oh} • "
-                                 f"{info['frames']} fr • 🧠 {gov.label() if hasattr(gov, 'label') else gov.status(0.0)}")
+        await message.reply_text(
+            f"🎬 **Process shuru:** {info['width']}×{info['height']} → {ow}×{oh} • "
+            f"{info['frames']} fr\n"
+            f"✨ Quality: {QUALITY[settings['quality']]['label']} • ⚙️ {_core_label()}")
         await asyncio.to_thread(run_pipeline, current_job, in_path, out_path, info,
                                 ups, gov, cancel_event, is_gif, job_dir)
         current_job["stage"] = "⬆️"
@@ -665,6 +921,7 @@ async def media_handler(client, message: Message):
 
         cap = (f"✅ **{filename}**\n"
                f"{MODELS[model_key]['label']} • {fmt_scale(scale)}× → {ow}×{oh}\n"
+               f"✨ {QUALITY[settings['quality']]['label']}\n"
                f"🎞 {current_job.get('frames_done', current_job['done'])} fr"
                + (f" (loop ×{current_job.get('loops', 1)})" if is_gif else "") +
                f" • ⚡ {current_job['spf']:.2f}s/fr • 🕒 {fmt_time(time.time() - t0)}\n"
@@ -676,7 +933,7 @@ async def media_handler(client, message: Message):
         comp = await asyncio.to_thread(make_compare, job_dir)
         if comp:
             try:
-                await app.send_photo(message.chat.id, str(comp), caption="⬅️ Before | ➡️ After")
+                await app.send_photo(message.chat.id, str(comp), caption=f"{EMO.one('wow')} ⬅️ Before | ➡️ After")
             except Exception:
                 pass
         if is_gif:
@@ -691,12 +948,13 @@ async def media_handler(client, message: Message):
                                                   f"{fmt_scale(scale)}× | {fmt_time(time.time() - t0)}")
             archive.record_job(filename, scale, time.time() - t0, True,
                                extra={"scale": settings["scale"], "preset": settings["preset"],
-                                      "audio": settings["audio"], "model": model_key})
+                                      "audio": settings["audio"], "model": model_key,
+                                      "quality": settings["quality"], "core": settings["core"]})
             await archive.save_state()
         current_job["stage"] = "✅"
     except Exception as e:
         log.exception("Job failed")
-        try: await message.reply_text(f"❌ Failed: {str(e)[:250]}")
+        try: await message.reply_text(f"{EMO.one('error')} ❌ Failed: {str(e)[:250]}")
         except Exception: pass
         if current_job: current_job["stage"] = "❌"
     finally:
@@ -709,9 +967,10 @@ async def media_handler(client, message: Message):
         current_job = None
         cancel_event = None
         gc.collect()
+        EMO.set("idle")
         await refresh_panel()
 
-# ================= PHOTO =================
+# ================= PHOTO (with quality post-process) =================
 @app.on_message(filters.photo & filters.private)
 async def photo_handler(client, message: Message):
     if not is_owner(message.chat.id):
@@ -721,6 +980,7 @@ async def photo_handler(client, message: Message):
             await message.reply_text("⏳ Job chal rahi hai, photo baad me bhejo."); return
         job_state["active"] = True
     try:
+        EMO.set("work")
         tmp = WORK_DIR / f"photo_{message.id}.jpg"
         await app.download_media(message, file_name=str(tmp))
         img = cv2.imread(str(tmp))
@@ -731,16 +991,21 @@ async def photo_handler(client, message: Message):
         ups = await asyncio.to_thread(get_ups, model_key, choose_tile(model_key, ow * oh))
         t0 = time.time()
         out = await asyncio.to_thread(lambda: ups.enhance(img, outscale=settings["scale"])[0])
+        # ✨ Quality post-process
+        out = await asyncio.to_thread(post_process_quality, out, settings["quality"])
         dt = time.time() - t0
         outp = WORK_DIR / f"photo_{message.id}_up.png"
         cv2.imwrite(str(outp), out)
+        EMO.set("happy")
         await send_with_retry(lambda: app.send_photo(
             message.chat.id, str(outp),
-            caption=f"✅ Photo upscale {MODELS[model_key]['label']} • "
-                    f"{fmt_scale(settings['scale'])}× • {w}×{h} → {out.shape[1]}×{out.shape[0]} • {dt:.1f}s"), "photo")
+            caption=f"{EMO.one('happy')} ✅ Photo {MODELS[model_key]['label']} • "
+                    f"{fmt_scale(settings['scale'])}× • ✨ {QUALITY[settings['quality']]['label']}\n"
+                    f"{w}×{h} → {out.shape[1]}×{out.shape[0]} • {dt:.1f}s"), "photo")
     except Exception as e:
         log.exception("Photo fail")
-        try: await message.reply_text(f"❌ Photo fail: {str(e)[:200]}")
+        EMO.set("error")
+        try: await message.reply_text(f"{EMO.one('error')} ❌ Photo fail: {str(e)[:200]}")
         except Exception: pass
     finally:
         job_state["active"] = False
@@ -752,22 +1017,13 @@ async def photo_handler(client, message: Message):
 @app.on_message(filters.command("stats") & filters.private)
 async def stats_cmd(client, message: Message):
     if not is_owner(message.chat.id): return
-    if not archive:
-        await message.reply_text("ℹ️ Archive channel set nahi hai."); return
-    st = archive.state
-    hist = st.get("history", [])
-    tot_t = sum(x.get("t", 0) for x in hist)
-    lines = [f"📊 **Stats**\n✅ Jobs done: {st.get('jobs_done', 0)}",
-             f"🕒 Total process time: {fmt_time(tot_t)}"]
-    for x in hist[-3:]:
-        lines.append(f"• {x.get('f', '?')[:24]} | {x.get('s', 0)}× | {fmt_time(x.get('t', 0))}")
-    await message.reply_text("\n".join(lines))
+    await message.reply_text(_stats_text())
 
 @app.on_message(filters.command("cancel") & filters.private)
 async def cancel_cmd(client, message: Message):
     if not is_owner(message.chat.id): return
     if cancel_event: cancel_event.set()
-    await message.reply_text("🛑 Cancel request bhej di.")
+    await message.reply_text(f"{EMO.one('error')} 🛑 Cancel bhej di.")
 
 @app.on_message(filters.forwarded & filters.private)
 async def forward_id_handler(client, message: Message):
@@ -785,33 +1041,39 @@ async def forward_id_handler(client, message: Message):
 async def text_handler(client, message: Message):
     if not is_owner(message.chat.id): return
     t = (message.text or "").lower()
-    if any(k in t for k in ["game", "free fire", "pubg", "bgmi"]):
-        await message.reply_text("🎮 Game videos: panel me model button → Game (Fast) ya Game (HQ).")
+    if any(k in t for k in ["hi", "hello", "hey", "namaste"]):
+        EMO.set("happy")
+        await message.reply_text(f"{EMO.one('happy')} Namaste boss! Panel buttons se sab control hota hai.")
+    elif any(k in t for k in ["game", "free fire", "pubg", "bgmi"]):
+        await message.reply_text(f"{EMO.one('wow')} 🎮 Panel me model button → Game (Fast) ya Game (HQ).")
     elif any(k in t for k in ["ram", "cpu", "load"]):
-        await message.reply_text(f"🛡 RAM free: {mem_avail_gb():.1f}GB • load: {load1():.1f} • cores: {CPU_THREADS}")
+        await message.reply_text(f"{EMO.one('think')} 🛡 RAM {mem_avail_gb():.1f}GB • load {load1():.1f} • {CPU_THREADS}c")
+    elif any(k in t for k in ["thank", "shukriya", "thx"]):
+        await message.reply_text(f"{EMO.one('love')} Apna kaam hai boss!")
     else:
-        await message.reply_text("🤖 v8.1: video/GIF/photo bhejo. Rotation-fix lag gaya hai — "
-                                 "tedhi-medhi videos ab seedhi banengi! Panel se settings.")
+        await message.reply_text(f"{EMO.one('think')} 🤖 v8.2: video/GIF/photo bhejo; quality + cores buttons se tuning.")
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client, message: Message):
     global _panel
     if not is_owner(message.chat.id):
         await message.reply_text("❌ Private bot."); return
+    EMO.set("start")
     try:
         if _panel: await _panel.delete()
     except Exception:
         pass
     _panel = None
     await ensure_panel(message.chat.id)
-    await message.reply_text(f"ℹ️ Tumhara chat ID: `{message.chat.id}`")
+    await refresh_panel()
+    await message.reply_text(f"{EMO.one('start')} **v8.2 online!** Chat ID: `{message.chat.id}`")
 
 # ================= BOOT =================
 def notify_owner_startup():
     try:
         r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                           json={"chat_id": OWNER_CHAT_ID_INT or OWNER_CHAT_ID,
-                                "text": "✅ Upscaler v8.1 online!\n🛠 Rotation/stride fix — tedhi videos ab seedhi banengi."},
+                                "text": "✅ Upscaler v8.2 online!\n🎛 Full buttons + ✨ Quality boost + ⚙️ Cores selector."},
                           timeout=15)
         log.info("Startup ping: %s", r.status_code)
     except Exception as e:
@@ -826,6 +1088,8 @@ async def _boot():
         settings["preset"] = st.get("preset", settings["preset"])
         settings["audio"] = st.get("audio", settings["audio"])
         settings["model"] = st.get("model", settings["model"])
+        settings["quality"] = st.get("quality", settings["quality"])
+        settings["core"] = st.get("core", settings["core"])
         log.info("📚 Archive settings: %s", settings)
         if archive.channel_id:
             try:
@@ -835,13 +1099,23 @@ async def _boot():
             except Exception as e:
                 log.error("❌ Archive channel WRITE FAIL: %s", e)
         else:
-            log.warning("⚠️ Archive channel connect nahi hua — channel post bot ko forward karo")
-    log.info("🚀 v8.1 ready (cores=%s)", CPU_THREADS)
+            log.warning("⚠️ Archive channel connect nahi hua")
+    # 🎛 Panel boot par hi
+    try:
+        cid = OWNER_CHAT_ID_INT or (int(OWNER_CHAT_ID) if OWNER_CHAT_ID.lstrip("-").isdigit() else 0)
+        if cid:
+            await ensure_panel(cid)
+            await refresh_panel()
+            log.info("🎛 Panel + buttons boot par bhej diye")
+    except Exception as e:
+        log.warning("Panel boot fail: %s", e)
+    asyncio.create_task(_refresh_loop())
+    log.info("🚀 v8.2 ready (cores=%s)", CPU_THREADS)
 
 async def _main():
     try:
         await app.start()
-        log.info("🔌 Client started — ab boot...")
+        log.info("🔌 Client started — boot...")
         await _boot()
         await idle()
     finally:
