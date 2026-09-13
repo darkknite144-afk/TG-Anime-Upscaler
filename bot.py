@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Smart Anime/Game Upscaler v7
-- 🧠 Governor v2: CPU-load + RAM EMA se khud upgrade/downgrade
+Smart Anime/Game Upscaler v8
+- 🧠 Governor v2: CPU-load + RAM EMA se khud upgrade/downgrade decisions
 - 💾 RAM-minimal streaming (decode q=2, backlog=2, frame encode hote hi free)
 - 🎌 Anime / 🎮 Game Fast / 🎮 Game HQ models
 - 🖼 Photo upscale + ⬅️➡️ Before/After preview
 - 📤 Upload auto-retry (3 attempts, FloodWait-safe)
-- ⏰ Job watchdog + 💓 heartbeat + 🧪 archive self-test + /stats
+- ⏰ Job watchdog + 💓 heartbeat +  archive self-test + /stats
 - 📚 Channel archive (settings/history/videos) + panel UI
+- v8 fixes: idle crash, channel-id normalize, forward-ID, unbuffered logs
 """
 import asyncio
 import gc
@@ -18,11 +19,17 @@ import os
 import queue
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+try:
+    sys.stdout.reconfigure(line_buffering=True)   # Actions me logs turant dikhein
+except Exception:
+    pass
 
 import cv2
 import numpy as np
@@ -281,7 +288,7 @@ def a_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔙 Panel", callback_data="b:back")]])
 
 def panel_text() -> str:
-    lines = [f"🎛 **Upscaler v7** • 🧠 {CPU_THREADS} cores • 🛡 {mem_avail_gb():.1f}GB free • load {load1():.1f}",
+    lines = [f"🎛 **Upscaler v8** • 🧠 {CPU_THREADS} cores • 🛡 {mem_avail_gb():.1f}GB free • load {load1():.1f}",
              f"Model: {MODELS[settings['model']]['label']} • {fmt_scale(settings['scale'])}× • "
              f"{settings['preset'].title()} • 🔊 {settings['audio'].title()}", ""]
     if job_state.get("active") and current_job:
@@ -681,7 +688,6 @@ async def photo_handler(client, message: Message):
         if job_state.get("active"):
             await message.reply_text("⏳ Job chal rahi hai, photo baad me bhejo."); return
         job_state["active"] = True
-    tmp = None
     try:
         tmp = WORK_DIR / f"photo_{message.id}.jpg"
         await app.download_media(message, file_name=str(tmp))
@@ -710,7 +716,7 @@ async def photo_handler(client, message: Message):
             try: f.unlink()
             except Exception: pass
 
-# ================= TEXT / COMMANDS =================
+# ================= COMMANDS / TEXT =================
 @app.on_message(filters.command("stats") & filters.private)
 async def stats_cmd(client, message: Message):
     if str(message.chat.id) != OWNER_CHAT_ID: return
@@ -731,6 +737,17 @@ async def cancel_cmd(client, message: Message):
     if cancel_event: cancel_event.set()
     await message.reply_text("🛑 Cancel request bhej di.")
 
+@app.on_message(filters.forwarded & filters.private)
+async def forward_id_handler(client, message: Message):
+    """Channel ki koi post forward karo → bot exact channel ID bata dega."""
+    if str(message.chat.id) != OWNER_CHAT_ID: return
+    src = getattr(message, "forward_from_chat", None)
+    if src is not None and getattr(src, "id", None):
+        await message.reply_text(
+            f"📌 Is channel ki exact ID: `{src.id}`\n"
+            "1) GitHub secret ARCHIVE_CHANNEL_ID me yahi paste karo\n"
+            "2) Workflow dobara run karo")
+
 @app.on_message(filters.text & filters.private & ~filters.command(["start", "stats", "cancel"]))
 async def text_handler(client, message: Message):
     if str(message.chat.id) != OWNER_CHAT_ID: return
@@ -740,8 +757,8 @@ async def text_handler(client, message: Message):
     elif any(k in t for k in ["ram", "cpu", "load"]):
         await message.reply_text(f"🛡 RAM free: {mem_avail_gb():.1f}GB • load: {load1():.1f} • cores: {CPU_THREADS}")
     else:
-        await message.reply_text("🤖 v7: video/GIF/photo bhejo. Panel se model 🎌/🎮, scale, preset, audio. "
-                                 "/stats dekho, /cancel se roko.")
+        await message.reply_text("🤖 v8: video/GIF/photo bhejo. Panel se model 🎌/🎮, scale, preset, audio. "
+                                 "/stats dekho, /cancel se roko. Channel post forward karo → ID milegi.")
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client, message: Message):
@@ -753,13 +770,14 @@ async def start_handler(client, message: Message):
     except Exception: pass
     _panel = None
     await ensure_panel(message.chat.id)
+    await message.reply_text(f"ℹ️ Tumhara chat ID: `{message.chat.id}` (OWNER_CHAT_ID secret verify karne ke liye)")
 
 # ================= BOOT =================
 def notify_owner_startup():
     try:
         r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                           json={"chat_id": OWNER_CHAT_ID,
-                                "text": "✅ Upscaler v7 online!\n🖼 Photo + ️➡️ Preview + 📤 retry + 🧪 self-test.\nPanel se control karo."},
+                                "text": "✅ Upscaler v8 online!\n🧠 Governor +  photo +  retry +  self-test.\nPanel se control karo."},
                           timeout=15)
         log.info("Startup ping: %s", r.status_code)
     except Exception as e:
@@ -782,14 +800,16 @@ async def _boot():
                 log.info("✅ Archive channel WRITE test OK")
             except Exception as e:
                 log.error("❌ Archive channel WRITE FAIL: %s", e)
-    log.info("🚀 v7 ready (cores=%s)", CPU_THREADS)
+        else:
+            log.warning("⚠️ Archive channel connect nahi hua — channel post bot ko forward karo, wo ID dega")
+    log.info("🚀 v8 ready (cores=%s)", CPU_THREADS)
 
 async def _main():
     try:
         await app.start()
         log.info("🔌 Client started — ab boot...")
         await _boot()
-        await app.idle()
+        await asyncio.Event().wait()      # ✅ v8 fix: Client.idle() Pyrogram 2.0.106 me hota hi nahi
     finally:
         try: await app.stop()
         except Exception: pass
