@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Smart Anime/Game/Real Upscaler v10.8 — QUEUE + LIVE STATUS FIX
-  - ✅ Har video par turant TICK message: "✅ Video mil gayi" (batch ho ya single)
-  - ✅ Usi tick message par LIVE progress (bar %, frames, ETA, speed) har 2.5s update
-  - ✅ Batch queue: multiple videos queue me, har ek ka apna status message
-  - ✅ Panel flood-fix: safe 2.5s refresh; status message text-only edits
-  - ✅ v10.7 ke saare guards intact (RRDB video-switch, colorize guard, pre-warm, pool)
+Smart Anime/Game/Real Upscaler v11.0 — SERVER STABLE PIPELINE
+  - ✅ Bounded queues & strictly ordered futures (RAM safe)
+  - ✅ FFmpeg deadlock prevention (stderr routed to temp files)
+  - ✅ True cancellation safety (threads & subprocesses cleanly die)
+  - ✅ Smoothed ETA (Exponential Moving Average)
+  - ✅ GitHub Actions optimized (No global torch thread shifting during jobs)
 """
-import asyncio, gc, json, logging, math, os, queue, random, shutil, subprocess, sys, threading, time
+import asyncio, concurrent.futures, gc, json, logging, math, os, queue, random, shutil, subprocess, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -20,6 +20,8 @@ except Exception:
 import cv2
 import numpy as np
 import requests
+os.environ.setdefault("OMP_NUM_THREADS", str(os.cpu_count() or 4))
+os.environ.setdefault("MKL_NUM_THREADS", str(os.cpu_count() or 4))
 import torch
 from pyrogram import Client, filters, idle
 from pyrogram.errors import FloodWait
@@ -71,12 +73,14 @@ MAX_OUT_PIXELS = 3840 * 2160
 MAX_SEND_MB = 1900
 MAX_JOB_SEC = int(os.getenv("MAX_JOB_MIN", "330")) * 60
 GIF_MIN_SEC = 2.0
-IN_QUEUE = 4
-STATUS_EVERY = 2.5          # live status edit interval
-PANEL_EVERY = 2.5           # panel refresh interval (flood-safe)
+STATUS_EVERY = 2.5          
+PANEL_EVERY = 2.5           
 CPU_THREADS = os.cpu_count() or 4
 POOL = ThreadPoolExecutor(max_workers=max(4, CPU_THREADS))
-os.environ["OMP_NUM_THREADS"] = str(CPU_THREADS)
+try:
+    torch.set_num_threads(max(1, CPU_THREADS))
+except Exception:
+    pass
 
 # ================= MODELS =================
 MODELS = {
@@ -144,12 +148,14 @@ def load1() -> float:
     except Exception: return 0.0
 
 def fmt_time(s: float) -> str:
+    if s < 0 or math.isnan(s): return "0s"
     s = max(0, int(s)); h, r = divmod(s, 3600); m, sec = divmod(r, 60)
     return f"{h}h {m}m {sec}s" if h else (f"{m}m {sec}s" if m else f"{sec}s")
 
 def fmt_scale(s: float) -> str: return f"{s:g}"
 
 def bar(pct: float, n: int = 12) -> str:
+    if math.isnan(pct): pct = 0
     f = int(n * min(100, max(0, pct)) / 100)
     return "▰" * f + "▱" * (n - f)
 
@@ -188,9 +194,6 @@ EMO = EmoteEngine()
 
 # ================= GOVERNOR =================
 CONFIGS = [(1, 4), (2, 2), (2, 3), (3, 1), (4, 1)]
-DOWNGRADE = {(4, 1): (3, 1), (3, 1): (2, 2), (2, 3): (2, 2), (2, 2): (1, 2),
-             (1, 4): (1, 2), (1, 2): (1, 1), (1, 1): (1, 1)}
-PROBE, EXPLOIT = 6, 12
 
 class Governor:
     def __init__(self, out_px: int, fixed: Optional[tuple] = None, max_workers: int = 4):
@@ -210,9 +213,8 @@ class Governor:
                 if w >= 1 and w <= CPU_THREADS and self._ram_ok(w):
                     start = (w, max(1, CPU_THREADS // w)); break
         self.current = start
-        self.probe_left, self.exploit = PROBE, 0
         self.load_ema = load1(); self.ram_ema = mem_avail_gb()
-        self.press = 0; self.idle = 0; self.safe = False
+        self.safe = False
         self.lock = threading.Lock()
         self.apply()
         log.info("🧠 Governor %s%s | fp %.2fGB/fr | RAM %.1fGB",
@@ -221,8 +223,7 @@ class Governor:
     def _ram_ok(self, w): return w * self.fp <= max(1.0, mem_avail_gb() * 0.85)
     def apply(self): torch.set_num_threads(self.current[1])
     def thr(self, c): return c[0] / self.ema[c] if self.ema[c] else 0.0
-    def gate(self, instances: int) -> int:
-        return max(1, min(self.current[0], instances))
+    def gate(self, instances: int) -> int: return max(1, min(self.current[0], instances))
 
     def on_frame(self, cfg, dt: float, done: int):
         with self.lock:
@@ -232,60 +233,12 @@ class Governor:
                 self.cnt[c] += 1
             self.load_ema = self.load_ema * 0.8 + load1() * 0.2
             self.ram_ema = self.ram_ema * 0.8 + mem_avail_gb() * 0.2
-            if done % 20 == 0: gc.collect()
-            if self.fixed is not None:
-                if self.ram_ema < 1.2: self.safe = True
-                return
+            if done % 20 == 0:
+                gc.collect()
             if self.ram_ema < 0.5 or self.load_ema > CPU_THREADS * 2.0:
-                self.press += 1; self.idle = 0
-                if self.press >= 2:
-                    self.press = 0; self.safe = True
-                    nxt = DOWNGRADE.get(self.current, self.current)
-                    if nxt != self.current:
-                        self.current = nxt; self.apply()
-                        log.warning("🛡 DOWNGRADE -> %s", nxt)
-                    return
-            else:
-                self.press = 0
-                if self.safe and self.ram_ema > 3.0 and self.load_ema < CPU_THREADS * 0.9:
-                    self.safe = False
-            if not self.safe and self.load_ema < CPU_THREADS * 0.55 and self.ram_ema > 4.0:
-                self.idle += 1
-                if self.idle >= 4:
-                    self.idle = 0; self._probe(up=True); return
-            else: self.idle = 0
-            if self.safe: return
-            if self.probe_left > 0:
-                self.probe_left -= 1
-                if self.probe_left == 0:
-                    self._pick_best(); self.exploit = EXPLOIT
-                return
-            if self.exploit > 0:
-                self.exploit -= 1
-                if self.exploit == 0: self._probe()
-                return
-            self._probe()
-
-    def _probe(self, up: bool = False):
-        if up:
-            target = next((c for c in CONFIGS
-                           if c[0] == self.current[0] + 1 and c[0] <= self.max_workers and self._ram_ok(c[0])), None)
-            if target is None: self.probe_left = PROBE; return
-        else:
-            cand = [c for c in CONFIGS if self.cnt[c] < 3 and self._ram_ok(c[0])]
-            if not cand: cand = [c for c in CONFIGS if self._ram_ok(c[0])]
-            if not cand: return
-            target = cand[0]
-        if target != self.current:
-            self.current = target; self.apply()
-        self.probe_left = PROBE
-
-    def _pick_best(self):
-        tested = [c for c in CONFIGS if self.cnt[c] >= 3 and self._ram_ok(c[0])]
-        if not tested: return
-        b = max(tested, key=self.thr)
-        if b != self.current:
-            self.current = b; self.apply()
+                self.safe = True
+            elif self.safe and self.ram_ema > 3.0 and self.load_ema < CPU_THREADS * 0.9:
+                self.safe = False
 
     def status(self, spf: float) -> str:
         fx = " [FIXED]" if self.fixed else ""
@@ -441,12 +394,11 @@ def colorize_frame(img: np.ndarray, mode: str, ref: int = 512) -> np.ndarray:
         log.warning("DDColor frame fail: %s", e)
         return img
 
-# ================= CLIENT =================
+# ================= CLIENT & PANEL UI =================
 app = Client("anime_upscaler_bot", api_id=API_ID, api_hash=API_HASH,
              bot_token=BOT_TOKEN, in_memory=True)
 archive = ChannelArchive(app, (os.getenv("ARCHIVE_CHANNEL_ID", "") or "").strip()) if ChannelArchive else None
 
-# ================= PANEL =================
 _panel: Optional[Message] = None
 _panel_lock = asyncio.Lock()
 _panel_mode = "main"
@@ -528,7 +480,7 @@ def core_kb() -> InlineKeyboardMarkup:
 SUBMENU_BUTTONS = {"mmenu", "qmenu", "pmenu", "amenu", "colormenu", "cmenu"}
 
 HELP_TEXT = (
-    "🧭 **Help (v10.8)**\n\n"
+    "🧭 **Help (v11.0)**\n\n"
     "🎥 Video/GIF/Photo bhejo → turant ✅ tick message + live progress\n"
     "📚 Batch: multiple videos queue me, har ek ka apna status\n"
     "🎛 Models → Anime Video / Game = videos • Anime Image / Real = photos\n"
@@ -538,7 +490,7 @@ HELP_TEXT = (
 
 def panel_text() -> str:
     m = MODELS.get(settings["model"], MODELS["anime_video"])
-    lines = [_pad(f"{EMO.face()}  UPSCALER v10.8"), "─" * PW,
+    lines = [_pad(f"{EMO.face()}  UPSCALER v11.0"), "─" * PW,
              _pad(f"🧠 {CPU_THREADS}c • 🛡 {mem_avail_gb():.1f}GB free • load {load1():.1f}"),
              _pad(f"{m['label']} {fmt_scale(settings['scale'])}× "
                   f"{settings['preset'][:4]} 🔊{settings['audio'][:4]}"),
@@ -547,10 +499,11 @@ def panel_text() -> str:
     if job_state.get("active") and current_job:
         j = current_job
         if j.get("total"):
-            pct = j["done"] * 100 / j["total"]
+            done = j.get("encoded", j.get("done", 0))
+            pct = done * 100 / j["total"] if j["total"] > 0 else 0
             lines += [_pad(f"{j.get('stage', '🎨')} {j['filename'][:18]}"),
                       _pad(f"{bar(pct, 10)} {pct:.0f}%"),
-                      _pad(f"🎞 {j['done']}/{j['total']} • ETA {fmt_time(j.get('eta', 0))}"),
+                      _pad(f"🎞 {done}/{j['total']} • ETA {fmt_time(j.get('eta', 0))}"),
                       _pad(j.get("ai", "")[:PW])]
         else:
             lines += [_pad(f"{j.get('stage', '📥')} {j.get('filename', '')[:18]}")] + [_pad("")] * 2
@@ -584,11 +537,13 @@ async def send_panel(cid: int) -> Optional[Message]:
 async def ensure_panel(cid: int) -> Optional[Message]:
     global _panel
     if _panel is not None: return _panel
-    try:
-        _panel = await app.send_message(cid, panel_text(), reply_markup=panel_kb())
-        return _panel
-    except Exception:
-        return None
+    async with _panel_lock:
+        if _panel is not None: return _panel
+        try:
+            _panel = await app.send_message(cid, panel_text(), reply_markup=panel_kb())
+            return _panel
+        except Exception:
+            return None
 
 async def refresh_panel():
     global _panel
@@ -603,7 +558,6 @@ async def refresh_panel():
         if "message_id_invalid" in err or "message to edit not found" in err or "deleted" in err:
             _panel = None
 
-# ================= CALLBACK =================
 @app.on_callback_query(filters.regex(r"^b:"))
 async def btn(client, cq):
     global _panel, _panel_mode
@@ -731,7 +685,16 @@ def probe_video(path: Path) -> Dict:
     fs = vid.get("avg_frame_rate") or vid.get("r_frame_rate") or "30/1"
     n, d = fs.split("/"); fps = float(n) / float(d) if float(d) else 30.0
     dur = float(vid.get("duration") or data.get("format", {}).get("duration") or 0)
-    frames = int(float(vid.get("nb_frames") or max(1, dur * fps)))
+    
+    raw_frames = vid.get("nb_frames")
+    frames = 0
+    if raw_frames not in (None, "", "N/A"):
+        try: frames = int(float(raw_frames))
+        except (TypeError, ValueError): pass
+    
+    if frames <= 0 and dur > 0 and fps > 0:
+        frames = max(1, int(round(dur * fps)))
+    frames = max(0, frames)
 
     raw_w = int(vid["width"]); raw_h = int(vid["height"])
     rot = 0.0
@@ -773,64 +736,133 @@ def read_exact(pipe, size):
 
 def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups_queue: queue.Queue,
                  inst_count: int, gov: Governor, cancel: threading.Event, is_gif: bool,
-                 colorize_mode: str, colorize_ref: int):
+                 colorize_mode: str, colorize_ref: int, cfg_snapshot: Dict[str, Any], job_dir: Path):
+    """
+    v11.0: Safe bounding, detached stderr logging to prevent deadlock, EMA ETA, 
+    strict future ordering by index, and robust cancellation.
+    """
     w, h, fps = info["width"], info["height"], info["fps"]
     rot = info.get("rotation", 0.0)
     ow, oh = job["ow"], job["oh"]
-    ff = PRESETS[settings["preset"]]
-    enc_threads = 1 if gov.current[0] >= 2 else 2
+    scale = float(cfg_snapshot.get("scale", 2.0))
+    ff = PRESETS.get(cfg_snapshot.get("preset", "balanced"), PRESETS["balanced"])
+    audio_mode = cfg_snapshot.get("audio", "keep")
+    enc_threads = 1 if inst_count >= 2 else max(1, min(2, CPU_THREADS))
     fps_g = fps if fps > 0 else 10.0
-    total = min(info["frames"] or max(1, int(info["duration"] * fps)),
-                MAX_GIF_FRAMES if is_gif else 10 ** 9)
+    source_total = int(info.get("frames") or 0)
+    total = min(source_total if source_total > 0 else max(1, int(round(info.get("duration", 0) * fps_g))),
+                MAX_GIF_FRAMES if is_gif else MAX_FRAMES)
+    total = max(1, total)
     job["total"] = total
-    stats = {"done": 0, "sum": 0.0}
+    
     stats_lock = threading.Lock()
     encoded = [0]
+    encoded_lock = threading.Lock()
+    
+    # ETA smoothing trackers
+    eta_tracker = {"last_time": time.time(), "last_done": 0, "ema_fps": 0.0}
+    
     dec = enc = None
-    in_q: queue.Queue = queue.Queue(maxsize=IN_QUEUE)
-    futs = []
+    in_q = queue.Queue(maxsize=max(2, inst_count))
+    
+    pending_futs = {}  # Index-based strict ordering dict
     futs_cond = threading.Condition()
+    
     t_start = time.time()
+    err_flags = {"reader": None, "encoder": None}
 
     vf_chain = _build_vf_chain(w, h, rot)
-    log.info("📐 Reader: vf='%s' frame=%sx%s (%d B) | instances=%d",
-             vf_chain, w, h, w * h * 3, inst_count)
+    log.info("📐 Reader: vf='%s' frame=%sx%s | instances=%d", vf_chain, w, h, inst_count)
+
+    def safe_put(item):
+        while True:
+            if cancel.is_set(): return False
+            try:
+                in_q.put(item, timeout=0.2)
+                return True
+            except queue.Full:
+                pass
 
     def reader():
+        nonlocal dec
         fb = w * h * 3
+        log_path = job_dir / "dec_err.log"
         try:
-            dec = subprocess.Popen(
-                ["ffmpeg", "-v", "error", "-noautorotate", "-i", str(in_path),
-                 "-an", "-sn", "-dn", "-vsync", "0", "-vf", vf_chain,
-                 "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"],
-                stdout=subprocess.PIPE)
-            n = 0
-            while not cancel.is_set():
-                raw = read_exact(dec.stdout, fb)
-                if not raw or len(raw) != fb: break
-                if is_gif and n >= MAX_GIF_FRAMES: break
-                in_q.put(np.frombuffer(raw, np.uint8).reshape(h, w, 3).copy()); n += 1
-            dec.wait()
+            with open(log_path, "w+") as err_out:
+                dec = subprocess.Popen(
+                    ["ffmpeg", "-v", "error", "-noautorotate", "-i", str(in_path),
+                     "-an", "-sn", "-dn", "-vsync", "0", "-vf", vf_chain,
+                     "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"],
+                    stdout=subprocess.PIPE, stderr=err_out, bufsize=0)
+                n = 0
+                while not cancel.is_set():
+                    raw = read_exact(dec.stdout, fb)
+                    if not raw or len(raw) != fb: break
+                    if is_gif and n >= MAX_GIF_FRAMES: break
+                    
+                    frame = np.frombuffer(raw, np.uint8).reshape(h, w, 3).copy()
+                    if not safe_put(frame):
+                        del frame; break
+                    n += 1
+                    
+                if dec.poll() is None:
+                    try: dec.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        dec.kill(); dec.wait(timeout=1)
+                
+                if dec.returncode not in (0, None) and not cancel.is_set():
+                    err_out.seek(0)
+                    err_txt = err_out.read()
+                    err_flags["reader"] = f"Decoder failed ({dec.returncode}): {err_txt[-300:]}"
+                    
+                # Fix progress stuck at 99% if original estimate was too high
+                if not cancel.is_set():
+                    job["total"] = n
+        except Exception as e:
+            err_flags["reader"] = str(e)
         finally:
-            in_q.put(None)
+            safe_put(None)
+            cancel.set() if err_flags["reader"] else None
 
-    def upscale_one(img, cfg):
+    def upscale_one(img, cfg, idx):
+        if cancel.is_set():
+            del img; return None
         t0 = time.time()
         ups = ups_queue.get()
+        out = None
+        fail_err = None
         try:
             try:
-                out, _ = ups.enhance(img, outscale=settings["scale"])
+                out, _ = ups.enhance(img, outscale=scale)
             except RuntimeError as e:
                 estr = str(e).lower()
-                if "out of memory" in estr or "alloc" in estr or "cannot allocate" in estr:
-                    log.warning("OOM on frame — retrying with tile=256 ...")
+                if "out of memory" in estr or "alloc" in estr:
+                    log.warning("OOM on frame %d — retrying tile=256...", idx)
                     gc.collect()
                     if not ups.tile or ups.tile > 256: ups.tile = 256
-                    out, _ = ups.enhance(img, outscale=settings["scale"])
+                    try:
+                        out, _ = ups.enhance(img, outscale=scale)
+                    except Exception as e2:
+                        fail_err = e2
                 else:
-                    raise
+                    fail_err = e
+        except Exception as e:
+            fail_err = e
         finally:
             ups_queue.put(ups)
+            del img
+
+        if cancel.is_set():
+            return None
+        if out is None:
+            # IMPORTANT: previously a single failed frame was swallowed here and
+            # upscale_one returned None. The encoder treated that None as "end of
+            # stream" and quietly stopped writing frames -> ffmpeg produced a
+            # truncated video and the job still reported SUCCESS to the user.
+            # Now we fail loudly instead of silently shipping a broken video.
+            log.error("Upscale frame %d fail (after retry): %s", idx, fail_err)
+            raise RuntimeError(f"Frame {idx} upscale failed: {fail_err}")
+            
         if colorize_mode != "off":
             out = colorize_frame(out, colorize_mode, colorize_ref)
         if len(out.shape) == 3 and out.shape[2] == 4:
@@ -841,117 +873,200 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups_queue: queu
             out = cv2.resize(out, (ow, oh), interpolation=cv2.INTER_LINEAR)
         if out.dtype != np.uint8:
             out = np.clip(out, 0, 255).astype(np.uint8)
-        out = np.ascontiguousarray(out)
+        
         dt = time.time() - t0
         with stats_lock:
-            stats["done"] += 1; stats["sum"] += dt
-            job["done"] = stats["done"]
-            job["spf"] = stats["sum"] / stats["done"]
-            job["eta"] = (total - job["done"]) * job["spf"] / max(1, gov.gate(inst_count))
+            job["processed"] = job.get("processed", 0) + 1
+            processed = job["processed"]
+            job["spf"] = dt if processed == 1 else (job.get("spf", dt) * 0.9 + dt * 0.1)
             job["ai"] = gov.status(job["spf"])
-        del img
-        gov.on_frame(cfg, dt, stats["done"])
-        return out
+        gov.on_frame(cfg, dt, processed)
+        return np.ascontiguousarray(out)
 
     def encoder():
         nonlocal enc
-        cmd = ["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "bgr24",
-               "-s", f"{ow}x{oh}", "-r", f"{(fps_g if is_gif else fps):.6f}", "-i", "pipe:0"]
-        if not is_gif:
-            cmd += ["-i", str(in_path), "-map", "0:v:0"]
-            if info["has_audio"]:
-                if settings["audio"] == "keep": cmd += ["-map", "1:a?", "-c:a", "copy"]
-                elif settings["audio"] == "compress": cmd += ["-map", "1:a?", "-c:a", "aac", "-b:a", "128k"]
-            cmd += ["-map_metadata", "-1"]
-        cmd += ["-c:v", "libx264", "-preset", ff["preset"], "-crf", ff["crf"],
-                "-threads", str(enc_threads), "-pix_fmt", "yuv420p"]
-        if not is_gif and info["has_audio"] and settings["audio"] != "remove":
-            cmd += ["-shortest"]
-        cmd += ["-movflags", "+faststart", str(out_path)]
-        enc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-        i = 0
-        while True:
-            with futs_cond:
-                while i >= len(futs):
-                    futs_cond.wait(0.2)
-                    if cancel.is_set() and i >= len(futs): return
-                f = futs[i]
-                if f is None: break
-            try:
-                arr = f.result()
-            except Exception as e:
-                log.error("Frame upscale fail: %s", e)
-                raise RuntimeError(f"Frame upscale fail: {e}")
-            enc.stdin.write(arr.tobytes())
-            del arr
-            with futs_cond:
-                futs[i] = None; encoded[0] += 1
-            i += 1
-        enc.stdin.close(); enc.wait()
+        log_path = job_dir / "enc_err.log"
+        try:
+            with open(log_path, "w+") as err_out:
+                cmd = ["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "bgr24",
+                       "-s", f"{ow}x{oh}", "-r", f"{fps_g:.6f}", "-i", "pipe:0"]
+                if not is_gif:
+                    cmd += ["-i", str(in_path), "-map", "0:v:0"]
+                    if info["has_audio"]:
+                        if audio_mode == "keep": cmd += ["-map", "1:a?", "-c:a", "copy"]
+                        elif audio_mode == "compress": cmd += ["-map", "1:a?", "-c:a", "aac", "-b:a", "128k"]
+                    cmd += ["-map_metadata", "-1"]
+                
+                cmd += ["-c:v", "libx264", "-preset", ff["preset"], "-crf", ff["crf"],
+                        "-threads", str(enc_threads), "-pix_fmt", "yuv420p"]
+                
+                if not is_gif and info["has_audio"] and audio_mode != "remove":
+                    cmd += ["-shortest"]
+                    
+                cmd += ["-movflags", "+faststart", str(out_path)]
+                enc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=err_out)
+                
+                i = 0
+                while not cancel.is_set():
+                    f = None
+                    with futs_cond:
+                        while i not in pending_futs and not cancel.is_set():
+                            futs_cond.wait(0.2)
+                        if cancel.is_set(): break
+                        f = pending_futs.pop(i)
+                        
+                    if f is None: # Sentinel
+                        break
+                        
+                    arr = None
+                    while not cancel.is_set():
+                        try:
+                            arr = f.result(timeout=0.2)
+                            break
+                        except concurrent.futures.TimeoutError:
+                            continue
+                            
+                    if cancel.is_set() or arr is None: break
+                    
+                    enc.stdin.write(arr.tobytes())
+                    del arr
+                    
+                    with encoded_lock:
+                        encoded[0] += 1
+                        enc_count = encoded[0]
+                    
+                    job["encoded"] = enc_count
+                    
+                    # Update Smoothed ETA
+                    now = time.time()
+                    dt = now - eta_tracker["last_time"]
+                    if dt >= 1.0:
+                        df = enc_count - eta_tracker["last_done"]
+                        inst_fps = df / dt
+                        ema = eta_tracker["ema_fps"]
+                        eta_tracker["ema_fps"] = inst_fps if ema == 0 else (ema * 0.8 + inst_fps * 0.2)
+                        eta_tracker["last_time"] = now
+                        eta_tracker["last_done"] = enc_count
+                        
+                    tp = eta_tracker["ema_fps"]
+                    job["throughput"] = tp
+                    tot = job.get("total", total)
+                    job["eta"] = max(0, tot - enc_count) / tp if tp > 0 else 0
+                    i += 1
 
-    th_read = threading.Thread(target=reader, daemon=True); th_read.start()
+                if enc.stdin: enc.stdin.close()
+                rc = enc.wait(timeout=7200)
+                if rc != 0 and not cancel.is_set():
+                    err_out.seek(0)
+                    err_txt = err_out.read()
+                    err_flags["encoder"] = f"FFmpeg encode failed ({rc}): {err_txt[-300:]}"
+                    
+        except Exception as e:
+            err_flags["encoder"] = str(e)
+            cancel.set()
+        finally:
+            with futs_cond: futs_cond.notify_all()
+
+    th_read = threading.Thread(target=reader, name="decoder", daemon=True)
+    th_read.start()
+    th_enc = threading.Thread(target=encoder, name="encoder", daemon=True)
+    th_enc.start()
+    
     try:
-        if is_gif:
-            frames_raw = []
-            while True:
-                img = in_q.get()
-                if img is None: break
-                frames_raw.append(img)
-            outs = []
-            for fr in frames_raw:
-                if cancel.is_set(): raise RuntimeError("Cancelled")
-                if time.time() - t_start > MAX_JOB_SEC: raise RuntimeError("Job time-limit")
-                outs.append(upscale_one(fr, gov.current))
-            frames_raw.clear(); gc.collect()
-            loops = min(max(1, math.ceil(GIF_MIN_SEC / (len(outs) / fps_g))),
-                        max(1, 600 // max(1, len(outs))))
-            job["loops"] = loops
-            job["stage"] = "📦"
-            cmd_gif = ["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "bgr24",
-                       "-s", f"{ow}x{oh}", "-r", f"{fps_g:.6f}", "-i", "pipe:0",
-                       "-c:v", "libx264", "-preset", ff["preset"], "-crf", ff["crf"],
-                       "-pix_fmt", "yuv420p", "-map_metadata", "-1",
-                       "-movflags", "+faststart", str(out_path)]
-            enc = subprocess.Popen(cmd_gif, stdin=subprocess.PIPE)
-            for _ in range(loops):
-                for arr in outs: enc.stdin.write(arr.tobytes())
-            enc.stdin.close(); enc.wait()
-            outs.clear(); gc.collect()
-        else:
-            th_enc = threading.Thread(target=encoder, daemon=True); th_enc.start()
-            job["stage"] = "🎨"
-            i = 0
-            while True:
-                if cancel.is_set():
-                    with futs_cond: futs.append(None); futs_cond.notify_all()
-                    raise RuntimeError("Cancelled")
-                if time.time() - t_start > MAX_JOB_SEC:
-                    with futs_cond: futs.append(None); futs_cond.notify_all()
-                    raise RuntimeError("Job time-limit")
-                img = in_q.get()
-                if img is None: break
-                gate = gov.gate(inst_count)
-                while (i - encoded[0]) >= gate:
-                    time.sleep(0.01)
-                    if cancel.is_set():
-                        with futs_cond: futs.append(None); futs_cond.notify_all()
-                        raise RuntimeError("Cancelled")
-                cfg = tuple(gov.current)
-                f = POOL.submit(upscale_one, img, cfg)
-                with futs_cond: futs.append(f); futs_cond.notify_all()
-                i += 1
-            with futs_cond: futs.append(None); futs_cond.notify_all()
-            th_enc.join(timeout=7200)
-        th_read.join()
-        if enc is not None and enc.returncode not in (0, None):
-            raise RuntimeError("FFmpeg encode failed")
-        job["frames_done"] = job["done"]
+        job["stage"] = "🎨"
+        i = 0
+        while not cancel.is_set():
+            if time.time() - t_start > MAX_JOB_SEC:
+                raise RuntimeError("Job time-limit exceeded")
+                
+            try: img = in_q.get(timeout=0.2)
+            except queue.Empty:
+                if not th_read.is_alive() and in_q.empty(): break
+                continue
+                
+            if img is None: break
+            
+            # RAM Guard: Restrict un-encoded frame accumulation
+            while not cancel.is_set():
+                with encoded_lock: enc_now = encoded[0]
+                gate = max(1, min(inst_count, gov.current[0]))
+                if (i - enc_now) < (gate + 1):
+                    break
+                time.sleep(0.01)
+                
+            if cancel.is_set():
+                del img; break
+                
+            cfg = tuple(gov.current)
+            f = POOL.submit(upscale_one, img, cfg, i)
+            with futs_cond:
+                pending_futs[i] = f
+                futs_cond.notify_all()
+            i += 1
+
+        with futs_cond:
+            pending_futs[i] = None
+            futs_cond.notify_all()
+
+        th_enc.join(timeout=7200)
+        if th_enc.is_alive(): raise RuntimeError("Encoder timeout/hung")
+        
+        th_read.join(timeout=30)
+        if th_read.is_alive(): raise RuntimeError("Decoder hung")
+
+        if err_flags["reader"]: raise RuntimeError(err_flags["reader"])
+        if err_flags["encoder"]: raise RuntimeError(err_flags["encoder"])
+        if cancel.is_set(): raise RuntimeError("Job Cancelled")
+        
+        job["frames_done"] = encoded[0]
+        job["done"] = encoded[0]
         job["seconds"] = time.time() - t_start
+        job["eta"] = 0
+        
     finally:
+        cancel.set()
+        with futs_cond: futs_cond.notify_all()
         for p in (dec, enc):
             try:
                 if p and p.poll() is None: p.kill()
             except Exception: pass
+        for th in (th_read, th_enc):
+            try:
+                if th and th.is_alive(): th.join(timeout=2)
+            except Exception: pass
+
+def loop_short_clip_if_needed(job: Dict[str, Any], out_path: Path, is_gif: bool,
+                              fps_hint: float, job_dir: Optional[Path]) -> Path:
+    """For short GIFs, loop the already-encoded output file up to GIF_MIN_SEC.
+    Uses ffmpeg -stream_loop + -c copy on the finished file (no frame buffering,
+    no re-encode) so this stays RAM-safe even for high-res/long GIFs."""
+    if not is_gif:
+        return out_path
+    frames_done = job.get("frames_done", job.get("done", 0))
+    fps_g = fps_hint if fps_hint and fps_hint > 0 else 10.0
+    if frames_done <= 0:
+        return out_path
+    duration = frames_done / fps_g
+    if duration >= GIF_MIN_SEC:
+        return out_path
+    loops = min(max(1, math.ceil(GIF_MIN_SEC / duration)), max(1, 600 // max(1, frames_done)))
+    if loops <= 1:
+        return out_path
+    looped_path = (job_dir / f"looped_{out_path.name}") if job_dir else out_path.with_name(f"looped_{out_path.name}")
+    cmd = ["ffmpeg", "-y", "-v", "error", "-stream_loop", str(loops - 1),
+           "-i", str(out_path), "-c", "copy", "-movflags", "+faststart", str(looped_path)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if r.returncode == 0 and looped_path.exists() and looped_path.stat().st_size > 0:
+            out_path.unlink(missing_ok=True)
+            looped_path.rename(out_path)
+            job["loops"] = loops
+            log.info("🔁 GIF looped ×%d to reach %.1fs", loops, GIF_MIN_SEC)
+        else:
+            log.warning("GIF loop pass failed (rc=%s): %s", r.returncode, (r.stderr or "")[-300:])
+    except Exception as e:
+        log.warning("GIF loop pass error: %s", e)
+    return out_path
 
 # ================= UPLOAD RETRY =================
 async def send_with_retry(fn, desc: str):
@@ -965,17 +1080,18 @@ async def send_with_retry(fn, desc: str):
             if attempt == 3: raise
             await asyncio.sleep(5 * attempt)
 
-# ================= LIVE STATUS LOOP (per-job tick message) =================
+# ================= LIVE STATUS LOOP =================
 async def _job_status_loop(status_msg: Message, stop_evt: asyncio.Event):
-    """Har 2.5s me tick message par LIVE progress edit karta hai."""
     while not stop_evt.is_set():
         try:
             j = current_job
             if j and j.get("total"):
-                pct = j["done"] * 100 / j["total"]
+                done = j.get("encoded", j.get("done", 0))
+                pct = done * 100 / j["total"] if j["total"] > 0 else 0
                 txt = (f"{j.get('stage', '🎨')} **{j['filename'][:20]}**\n"
                        f"{bar(pct)} {pct:.0f}%\n"
-                       f"🎞 {j['done']}/{j['total']} fr • ⏱ ETA {fmt_time(j.get('eta', 0))}\n"
+                       f"🎞 {done}/{j['total']} fr • ⏱ ETA {fmt_time(j.get('eta', 0))}\n"
+                       f"⚙️ processed {j.get('processed', j.get('done', 0))} • {j.get('throughput', 0):.2f} fr/s\n"
                        f"{j.get('ai', '')}")
             elif j:
                 txt = f"{j.get('stage', '📥')} **{j.get('filename', '')[:20]}** …"
@@ -1053,13 +1169,15 @@ async def _queue_loop():
     global current_job, cancel_event, _panel_mode
     while JOB_QUEUE:
         job = JOB_QUEUE.pop(0)
+        job_cfg = dict(settings) 
         message = job["message"]; filename = job["filename"]
         is_gif = job["is_gif"]; status_msg = job["status_msg"]
         job_state["active"] = True
         cancel_event = threading.Event()
         _panel_mode = "job"
         current_job = {"filename": filename, "ow": 0, "oh": 0, "done": 0, "total": 0,
-                       "spf": 0.0, "eta": 0.0, "ai": "", "stage": "📥", "loops": 1}
+                       "spf": 0.0, "eta": 0.0, "throughput": 0.0, "processed": 0, "encoded": 0,
+                       "ai": "", "stage": "📥", "loops": 1}
         job_dir = None; out_path = None; refresher = None; stop_evt = None
         t0 = time.time()
         try:
@@ -1077,7 +1195,7 @@ async def _queue_loop():
             info = await asyncio.to_thread(probe_video, in_path)
             if not is_gif and info["frames"] > MAX_FRAMES:
                 raise RuntimeError(f"Video lambi: {info['frames']} fr (max {MAX_FRAMES})")
-            scale = settings["scale"]
+            scale = job_cfg["scale"]
             ow = int(info["width"] * scale); ow += ow % 2
             oh = int(info["height"] * scale); oh += oh % 2
             capped = False
@@ -1087,12 +1205,12 @@ async def _queue_loop():
                 oh = int(info["height"] * scale); oh += oh % 2
 
             notes = []
-            orig_model = normalize_model_key(settings["model"])
+            orig_model = normalize_model_key(job_cfg["model"])
             model_key = orig_model
             if not MODELS[model_key]["video_ok"]:
                 model_key = VIDEO_FALLBACK.get(model_key, "anime_video")
                 notes.append(f"🎬 {MODELS[orig_model]['label']} video par slow hai → auto {MODELS[model_key]['label']}")
-            colorize_mode = normalize_colorize(settings["colorize_mode"])
+            colorize_mode = normalize_colorize(job_cfg["colorize_mode"])
             colorize_ref = 512
             if colorize_mode == "high":
                 colorize_mode = "fast"; colorize_ref = 256
@@ -1101,13 +1219,14 @@ async def _queue_loop():
                 colorize_ref = 256
 
             fixed = None
-            if settings["core"] != "auto":
-                cm = CORE_MAP.get(settings["core"])
+            if job_cfg["core"] != "auto":
+                cm = CORE_MAP.get(job_cfg["core"])
                 if cm and cm[2] > 0: fixed = (cm[2], cm[3])
             tile = choose_tile(model_key, ow * oh)
             ups_queue = await asyncio.to_thread(init_ups_pool, model_key, tile, fixed)
             inst_count = pool_instances(model_key, tile)
-            gov = Governor(ow * oh, fixed=fixed, max_workers=inst_count)
+            gov_fixed = (min(fixed[0], inst_count), fixed[1]) if fixed is not None else None
+            gov = Governor(ow * oh, fixed=gov_fixed, max_workers=inst_count)
             current_job.update({"ow": ow, "oh": oh, "stage": "🎨", "ai": gov.status(0.0)})
             out_path = OUTPUT_DIR / f"{Path(filename).stem}_up_{message.id}.mp4"
 
@@ -1116,16 +1235,22 @@ async def _queue_loop():
             if notes:
                 try: await status_msg.edit_text("⚙️ " + " • ".join(notes))
                 except Exception: pass
+                
             await asyncio.to_thread(run_pipeline, current_job, in_path, out_path, info,
                                     ups_queue, inst_count, gov, cancel_event, is_gif,
-                                    colorize_mode, colorize_ref)
+                                    colorize_mode, colorize_ref, job_cfg, job_dir)
+
+            if is_gif:
+                current_job["stage"] = "📦"
+                await asyncio.to_thread(loop_short_clip_if_needed, current_job, out_path,
+                                        is_gif, info.get("fps", 0.0), job_dir)
 
             current_job["stage"] = "⬆️"
             try: await status_msg.edit_text(f"⬆️ **Upload...** `{filename}`")
             except Exception: pass
             size_mb = out_path.stat().st_size / 1048576
             if size_mb > MAX_SEND_MB:
-                raise RuntimeError(f"Output {size_mb:.0f}MB > 2GB")
+                raise RuntimeError(f"Output {size_mb:.0f}MB exceeds configured send limit")
             cap = (f"✅ **{filename}**\n"
                    f"{MODELS[model_key]['label']} • {fmt_scale(scale)}× → {ow}×{oh}\n"
                    f"🎨 Colorize: {colorize_mode}\n"
@@ -1149,9 +1274,9 @@ async def _queue_loop():
                     await archive.archive_video(out_path, f"{filename} | {MODELS[model_key]['label']} | "
                                                           f"{fmt_scale(scale)}× | {fmt_time(time.time() - t0)}")
                     archive.record_job(filename, scale, time.time() - t0, True,
-                                       extra={"scale": settings["scale"], "preset": settings["preset"],
-                                              "audio": settings["audio"], "model": model_key,
-                                              "core": settings["core"], "colorize": colorize_mode})
+                                       extra={"scale": job_cfg["scale"], "preset": job_cfg["preset"],
+                                              "audio": job_cfg["audio"], "model": model_key,
+                                              "core": job_cfg["core"], "colorize": colorize_mode})
                     await archive.save_state()
                 except Exception as e:
                     log.warning("Archive fail: %s", e)
@@ -1165,7 +1290,7 @@ async def _queue_loop():
             current_job["stage"] = "✅"
         except Exception as e:
             log.exception("Job failed")
-            try: await status_msg.edit_text(f"❌ **FAIL:** `{filename}` — {str(e)[:180]}")
+            try: await status_msg.edit_text(f"❌ **FAIL:** `{filename}`\n{str(e)[:180]}")
             except Exception: pass
             if current_job: current_job["stage"] = "❌"
         finally:
@@ -1173,7 +1298,8 @@ async def _queue_loop():
             if refresher is not None:
                 try: await refresher
                 except Exception: pass
-            if job_dir: shutil.rmtree(job_dir, ignore_errors=True)
+            if job_dir and job_dir.exists():
+                shutil.rmtree(job_dir, ignore_errors=True)
             if out_path and out_path.exists():
                 try: out_path.unlink()
                 except Exception: pass
@@ -1186,6 +1312,7 @@ async def _queue_loop():
             except Exception: pass
 
 # ================= PHOTO =================
+busy_lock = asyncio.Lock()
 @app.on_message(filters.photo & filters.private)
 async def photo_handler(client, message: Message):
     if not is_owner(message.chat.id):
@@ -1194,23 +1321,34 @@ async def photo_handler(client, message: Message):
         if job_state.get("active") or JOB_QUEUE:
             await message.reply_text("⏳ Videos queue me hain — photo baad me bhejo."); return
         job_state["active"] = True
+    job_cfg = dict(settings)
     try:
         EMO.set("work")
         tmp = WORK_DIR / f"photo_{message.id}.jpg"
         await app.download_media(message, file_name=str(tmp))
         img = cv2.imread(str(tmp))
         if img is None: raise RuntimeError("Image read fail")
-        model_key = normalize_model_key(settings["model"])
+        model_key = normalize_model_key(job_cfg["model"])
+        if not MODELS[model_key]["video_ok"]:
+            photo_model = model_key
+        else:
+            photo_model = {"anime_video": "anime_image", "game": "real"}.get(model_key, model_key)
+            if (MODEL_DIR / MODELS[photo_model]["file"]).exists():
+                model_key = photo_model
         h, w = img.shape[:2]
-        ow = int(w * settings["scale"]); oh = int(h * settings["scale"])
+        photo_scale = float(job_cfg["scale"])
+        ow = int(w * photo_scale); oh = int(h * photo_scale)
+        while photo_scale > 1.0 and ow * oh > MAX_OUT_PIXELS:
+            photo_scale = max(1.0, photo_scale - 0.5)
+            ow = int(w * photo_scale); oh = int(h * photo_scale)
         tile = choose_tile(model_key, ow * oh)
         ups_q = await asyncio.to_thread(init_ups_pool, model_key, tile)
-        colorize_mode = normalize_colorize(settings["colorize_mode"])
+        colorize_mode = normalize_colorize(job_cfg["colorize_mode"])
 
         def _do():
             ups = ups_q.get()
             try:
-                out = ups.enhance(img, outscale=settings["scale"])[0]
+                out = ups.enhance(img, outscale=photo_scale)[0]
             finally:
                 ups_q.put(ups)
             if colorize_mode != "off":
@@ -1241,7 +1379,6 @@ async def photo_handler(client, message: Message):
             try: f.unlink()
             except Exception: pass
 
-busy_lock = asyncio.Lock()
 
 # ================= COMMANDS =================
 @app.on_message(filters.command("panel") & filters.private)
@@ -1313,7 +1450,7 @@ async def text_handler(client, message: Message):
     elif any(k in t for k in ["thank", "shukriya", "thx"]):
         await message.reply_text("Apna kaam hai boss!")
     else:
-        await message.reply_text("🤖 v10.8: video bhejo → ✅ tick + LIVE progress; batch = queue.")
+        await message.reply_text("🤖 v11.0: video bhejo → ✅ tick + LIVE progress; batch = queue.")
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client, message: Message):
@@ -1321,14 +1458,14 @@ async def start_handler(client, message: Message):
         await message.reply_text("❌ Private bot."); return
     EMO.set("start")
     await send_panel(message.chat.id)
-    await message.reply_text(f"✅ **v10.8 online!** Chat ID: `{message.chat.id}`")
+    await message.reply_text(f"✅ **v11.0 online!** Chat ID: `{message.chat.id}`")
 
 # ================= BOOT + PRE-WARM =================
 def notify_owner_startup():
     try:
         r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                           json={"chat_id": OWNER_CHAT_ID_INT or OWNER_CHAT_ID,
-                                "text": "✅ Upscaler v10.8 online!\n✅ tick message + LIVE progress + batch queue."},
+                                "text": "✅ Upscaler v11.0 online!\n✅ tick message + LIVE progress + batch queue."},
                           timeout=15)
         log.info("Startup ping: %s", r.status_code)
     except Exception as e:
@@ -1353,7 +1490,7 @@ def _prewarm():
         log.warning("Pre-warm ddcolor fail: %s", e)
 
 async def _boot():
-    try: notify_owner_startup()
+    try: await asyncio.to_thread(notify_owner_startup)
     except Exception as e: log.warning("notify fail: %s", e)
     try:
         if archive:
@@ -1378,7 +1515,7 @@ async def _boot():
         try: await send_panel(cid)
         except Exception as e: log.error("Panel send fail: %s", e)
     asyncio.create_task(_refresh_loop())
-    log.info("🚀 v10.8 ready (cores=%s)", CPU_THREADS)
+    log.info("🚀 v11.0 ready (cores=%s)", CPU_THREADS)
 
 async def _main():
     try:
