@@ -5,6 +5,7 @@ Smart Anime/Game/Real Upscaler v11.0 — SERVER STABLE PIPELINE
   - ✅ FFmpeg deadlock prevention (stderr routed to temp files)
   - ✅ True cancellation safety (threads & subprocesses cleanly die)
   - ✅ Smoothed ETA (Exponential Moving Average)
+  - ✅ Milestone-based status updates (anti-flood)
   - ✅ GitHub Actions optimized (No global torch thread shifting during jobs)
 """
 import asyncio, concurrent.futures, gc, json, logging, math, os, queue, random, shutil, subprocess, sys, threading, time
@@ -73,8 +74,16 @@ MAX_OUT_PIXELS = 3840 * 2160
 MAX_SEND_MB = 1900
 MAX_JOB_SEC = int(os.getenv("MAX_JOB_MIN", "330")) * 60
 GIF_MIN_SEC = 2.0
-STATUS_EVERY = 2.5          
-PANEL_EVERY = 2.5           
+
+# ===== Status message: sirf milestone par edit =====
+STATUS_POLL_EVERY       = 3.0                              # internal tick (no edit)
+STATUS_MILESTONES       = [5, 15, 25, 35, 45, 55, 65, 75, 85, 95, 100]
+STATUS_STUCK_SEC        = 60.0                             # heartbeat if stuck
+
+# ===== Panel: bahut slow =====
+PANEL_EVERY             = 15.0                             # was 2.5
+PANEL_MIN_EDIT_INTERVAL = 12.0                             # min gap between panel edits
+
 CPU_THREADS = os.cpu_count() or 4
 POOL = ThreadPoolExecutor(max_workers=max(4, CPU_THREADS))
 try:
@@ -402,6 +411,8 @@ archive = ChannelArchive(app, (os.getenv("ARCHIVE_CHANNEL_ID", "") or "").strip(
 _panel: Optional[Message] = None
 _panel_lock = asyncio.Lock()
 _panel_mode = "main"
+_panel_last_edit_time = 0.0        # NEW: rate-limit tracker
+_panel_last_text      = ""         # NEW: same-text skip
 
 def _core_label() -> str:
     if settings["core"] == "auto": return "🤖 Auto"
@@ -518,7 +529,7 @@ def panel_text() -> str:
     return "\n".join(lines)
 
 async def send_panel(cid: int) -> Optional[Message]:
-    global _panel, _panel_mode
+    global _panel, _panel_mode, _panel_last_edit_time, _panel_last_text
     async with _panel_lock:
         if _panel is not None:
             try: await _panel.delete()
@@ -526,8 +537,11 @@ async def send_panel(cid: int) -> Optional[Message]:
             _panel = None
         for attempt in range(1, 4):
             try:
-                msg = await app.send_message(cid, panel_text(), reply_markup=panel_kb())
+                txt = panel_text()
+                msg = await app.send_message(cid, txt, reply_markup=panel_kb())
                 _panel = msg; _panel_mode = "main"
+                _panel_last_text = txt
+                _panel_last_edit_time = time.time()
                 return msg
             except Exception as e:
                 log.warning("Panel send attempt %d fail: %s", attempt, e)
@@ -535,32 +549,51 @@ async def send_panel(cid: int) -> Optional[Message]:
         return None
 
 async def ensure_panel(cid: int) -> Optional[Message]:
-    global _panel
+    global _panel, _panel_last_edit_time, _panel_last_text
     if _panel is not None: return _panel
     async with _panel_lock:
         if _panel is not None: return _panel
         try:
-            _panel = await app.send_message(cid, panel_text(), reply_markup=panel_kb())
+            txt = panel_text()
+            _panel = await app.send_message(cid, txt, reply_markup=panel_kb())
+            _panel_last_text = txt
+            _panel_last_edit_time = time.time()
             return _panel
         except Exception:
             return None
 
 async def refresh_panel():
-    global _panel
+    global _panel, _panel_last_edit_time, _panel_last_text
     if _panel is None: return
+    now = time.time()
+    # Rate-limit: minimum gap between two panel edits
+    if (now - _panel_last_edit_time) < PANEL_MIN_EDIT_INTERVAL:
+        return
+    txt = panel_text()
+    # Same text = skip (prevents MESSAGE_NOT_MODIFIED)
+    if txt == _panel_last_text:
+        _panel_last_edit_time = now
+        return
     try:
-        await _panel.edit_text(panel_text(), reply_markup=panel_kb())
+        await _panel.edit_text(txt, reply_markup=panel_kb())
+        _panel_last_text = txt
+        _panel_last_edit_time = now
     except FloodWait as e:
-        await asyncio.sleep(e.value)
+        log.warning("⏳ panel FloodWait %ss", e.value)
+        _panel_last_edit_time = now + e.value
     except Exception as e:
         err = str(e).lower()
-        if "not modified" in err: return
-        if "message_id_invalid" in err or "message to edit not found" in err or "deleted" in err:
+        if "not modified" in err:
+            _panel_last_text = txt
+            _panel_last_edit_time = now
+            return
+        if ("message_id_invalid" in err or "message to edit not found" in err
+                or "deleted" in err):
             _panel = None
 
 @app.on_callback_query(filters.regex(r"^b:"))
 async def btn(client, cq):
-    global _panel, _panel_mode
+    global _panel, _panel_mode, _panel_last_edit_time, _panel_last_text
     if not is_owner(cq.message.chat.id):
         await cq.answer("Private bot!", show_alert=True); return
     parts = cq.data[2:].split(":"); a = parts[0]; v = parts[1] if len(parts) > 1 else ""
@@ -638,6 +671,8 @@ async def btn(client, cq):
             if _panel: await _panel.delete()
         except Exception: pass
         _panel = None
+        _panel_last_text = ""
+        _panel_last_edit_time = 0.0
         await send_panel(cq.message.chat.id)
         await cq.answer("🧹 Clean"); return
     else:
@@ -649,15 +684,24 @@ async def btn(client, cq):
 
     if kb is not None:
         try:
+            txt = panel_text()
             if _panel and cq.message.id == _panel.id:
-                await _panel.edit_text(panel_text(), reply_markup=kb)
+                await _panel.edit_text(txt, reply_markup=kb)
+                _panel_last_text = txt
+                _panel_last_edit_time = time.time()
             else:
-                await cq.message.edit_text(panel_text(), reply_markup=kb)
+                await cq.message.edit_text(txt, reply_markup=kb)
                 _panel = cq.message
+                _panel_last_text = txt
+                _panel_last_edit_time = time.time()
         except Exception as e:
-            log.warning("Callback edit fail: %s", str(e)[:120])
-            try: await send_panel(cq.message.chat.id)
-            except Exception: pass
+            err = str(e).lower()
+            if "not modified" in err:
+                pass  # silent
+            else:
+                log.warning("Callback edit fail: %s", str(e)[:120])
+                try: await send_panel(cq.message.chat.id)
+                except Exception: pass
 
 def _stats_text() -> str:
     m = MODELS.get(settings["model"], MODELS["anime_video"])
@@ -685,13 +729,13 @@ def probe_video(path: Path) -> Dict:
     fs = vid.get("avg_frame_rate") or vid.get("r_frame_rate") or "30/1"
     n, d = fs.split("/"); fps = float(n) / float(d) if float(d) else 30.0
     dur = float(vid.get("duration") or data.get("format", {}).get("duration") or 0)
-    
+
     raw_frames = vid.get("nb_frames")
     frames = 0
     if raw_frames not in (None, "", "N/A"):
         try: frames = int(float(raw_frames))
         except (TypeError, ValueError): pass
-    
+
     if frames <= 0 and dur > 0 and fps > 0:
         frames = max(1, int(round(dur * fps)))
     frames = max(0, frames)
@@ -737,10 +781,6 @@ def read_exact(pipe, size):
 def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups_queue: queue.Queue,
                  inst_count: int, gov: Governor, cancel: threading.Event, is_gif: bool,
                  colorize_mode: str, colorize_ref: int, cfg_snapshot: Dict[str, Any], job_dir: Path):
-    """
-    v11.0: Safe bounding, detached stderr logging to prevent deadlock, EMA ETA, 
-    strict future ordering by index, and robust cancellation.
-    """
     w, h, fps = info["width"], info["height"], info["fps"]
     rot = info.get("rotation", 0.0)
     ow, oh = job["ow"], job["oh"]
@@ -754,20 +794,19 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups_queue: queu
                 MAX_GIF_FRAMES if is_gif else MAX_FRAMES)
     total = max(1, total)
     job["total"] = total
-    
+
     stats_lock = threading.Lock()
     encoded = [0]
     encoded_lock = threading.Lock()
-    
-    # ETA smoothing trackers
+
     eta_tracker = {"last_time": time.time(), "last_done": 0, "ema_fps": 0.0}
-    
+
     dec = enc = None
     in_q = queue.Queue(maxsize=max(2, inst_count))
-    
-    pending_futs = {}  # Index-based strict ordering dict
+
+    pending_futs = {}
     futs_cond = threading.Condition()
-    
+
     t_start = time.time()
     err_flags = {"reader": None, "encoder": None}
 
@@ -799,23 +838,22 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups_queue: queu
                     raw = read_exact(dec.stdout, fb)
                     if not raw or len(raw) != fb: break
                     if is_gif and n >= MAX_GIF_FRAMES: break
-                    
+
                     frame = np.frombuffer(raw, np.uint8).reshape(h, w, 3).copy()
                     if not safe_put(frame):
                         del frame; break
                     n += 1
-                    
+
                 if dec.poll() is None:
                     try: dec.wait(timeout=2)
                     except subprocess.TimeoutExpired:
                         dec.kill(); dec.wait(timeout=1)
-                
+
                 if dec.returncode not in (0, None) and not cancel.is_set():
                     err_out.seek(0)
                     err_txt = err_out.read()
                     err_flags["reader"] = f"Decoder failed ({dec.returncode}): {err_txt[-300:]}"
-                    
-                # Fix progress stuck at 99% if original estimate was too high
+
                 if not cancel.is_set():
                     job["total"] = n
         except Exception as e:
@@ -855,14 +893,9 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups_queue: queu
         if cancel.is_set():
             return None
         if out is None:
-            # IMPORTANT: previously a single failed frame was swallowed here and
-            # upscale_one returned None. The encoder treated that None as "end of
-            # stream" and quietly stopped writing frames -> ffmpeg produced a
-            # truncated video and the job still reported SUCCESS to the user.
-            # Now we fail loudly instead of silently shipping a broken video.
             log.error("Upscale frame %d fail (after retry): %s", idx, fail_err)
             raise RuntimeError(f"Frame {idx} upscale failed: {fail_err}")
-            
+
         if colorize_mode != "off":
             out = colorize_frame(out, colorize_mode, colorize_ref)
         if len(out.shape) == 3 and out.shape[2] == 4:
@@ -873,7 +906,7 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups_queue: queu
             out = cv2.resize(out, (ow, oh), interpolation=cv2.INTER_LINEAR)
         if out.dtype != np.uint8:
             out = np.clip(out, 0, 255).astype(np.uint8)
-        
+
         dt = time.time() - t0
         with stats_lock:
             job["processed"] = job.get("processed", 0) + 1
@@ -896,16 +929,16 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups_queue: queu
                         if audio_mode == "keep": cmd += ["-map", "1:a?", "-c:a", "copy"]
                         elif audio_mode == "compress": cmd += ["-map", "1:a?", "-c:a", "aac", "-b:a", "128k"]
                     cmd += ["-map_metadata", "-1"]
-                
+
                 cmd += ["-c:v", "libx264", "-preset", ff["preset"], "-crf", ff["crf"],
                         "-threads", str(enc_threads), "-pix_fmt", "yuv420p"]
-                
+
                 if not is_gif and info["has_audio"] and audio_mode != "remove":
                     cmd += ["-shortest"]
-                    
+
                 cmd += ["-movflags", "+faststart", str(out_path)]
                 enc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=err_out)
-                
+
                 i = 0
                 while not cancel.is_set():
                     f = None
@@ -914,10 +947,10 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups_queue: queu
                             futs_cond.wait(0.2)
                         if cancel.is_set(): break
                         f = pending_futs.pop(i)
-                        
-                    if f is None: # Sentinel
+
+                    if f is None:
                         break
-                        
+
                     arr = None
                     while not cancel.is_set():
                         try:
@@ -925,19 +958,18 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups_queue: queu
                             break
                         except concurrent.futures.TimeoutError:
                             continue
-                            
+
                     if cancel.is_set() or arr is None: break
-                    
+
                     enc.stdin.write(arr.tobytes())
                     del arr
-                    
+
                     with encoded_lock:
                         encoded[0] += 1
                         enc_count = encoded[0]
-                    
+
                     job["encoded"] = enc_count
-                    
-                    # Update Smoothed ETA
+
                     now = time.time()
                     dt = now - eta_tracker["last_time"]
                     if dt >= 1.0:
@@ -947,7 +979,7 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups_queue: queu
                         eta_tracker["ema_fps"] = inst_fps if ema == 0 else (ema * 0.8 + inst_fps * 0.2)
                         eta_tracker["last_time"] = now
                         eta_tracker["last_done"] = enc_count
-                        
+
                     tp = eta_tracker["ema_fps"]
                     job["throughput"] = tp
                     tot = job.get("total", total)
@@ -960,7 +992,7 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups_queue: queu
                     err_out.seek(0)
                     err_txt = err_out.read()
                     err_flags["encoder"] = f"FFmpeg encode failed ({rc}): {err_txt[-300:]}"
-                    
+
         except Exception as e:
             err_flags["encoder"] = str(e)
             cancel.set()
@@ -971,32 +1003,31 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups_queue: queu
     th_read.start()
     th_enc = threading.Thread(target=encoder, name="encoder", daemon=True)
     th_enc.start()
-    
+
     try:
         job["stage"] = "🎨"
         i = 0
         while not cancel.is_set():
             if time.time() - t_start > MAX_JOB_SEC:
                 raise RuntimeError("Job time-limit exceeded")
-                
+
             try: img = in_q.get(timeout=0.2)
             except queue.Empty:
                 if not th_read.is_alive() and in_q.empty(): break
                 continue
-                
+
             if img is None: break
-            
-            # RAM Guard: Restrict un-encoded frame accumulation
+
             while not cancel.is_set():
                 with encoded_lock: enc_now = encoded[0]
                 gate = max(1, min(inst_count, gov.current[0]))
                 if (i - enc_now) < (gate + 1):
                     break
                 time.sleep(0.01)
-                
+
             if cancel.is_set():
                 del img; break
-                
+
             cfg = tuple(gov.current)
             f = POOL.submit(upscale_one, img, cfg, i)
             with futs_cond:
@@ -1010,19 +1041,19 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups_queue: queu
 
         th_enc.join(timeout=7200)
         if th_enc.is_alive(): raise RuntimeError("Encoder timeout/hung")
-        
+
         th_read.join(timeout=30)
         if th_read.is_alive(): raise RuntimeError("Decoder hung")
 
         if err_flags["reader"]: raise RuntimeError(err_flags["reader"])
         if err_flags["encoder"]: raise RuntimeError(err_flags["encoder"])
         if cancel.is_set(): raise RuntimeError("Job Cancelled")
-        
+
         job["frames_done"] = encoded[0]
         job["done"] = encoded[0]
         job["seconds"] = time.time() - t_start
         job["eta"] = 0
-        
+
     finally:
         cancel.set()
         with futs_cond: futs_cond.notify_all()
@@ -1034,12 +1065,10 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups_queue: queu
             try:
                 if th and th.is_alive(): th.join(timeout=2)
             except Exception: pass
+        gc.collect()   # NEW: release frame buffers immediately
 
 def loop_short_clip_if_needed(job: Dict[str, Any], out_path: Path, is_gif: bool,
                               fps_hint: float, job_dir: Optional[Path]) -> Path:
-    """For short GIFs, loop the already-encoded output file up to GIF_MIN_SEC.
-    Uses ffmpeg -stream_loop + -c copy on the finished file (no frame buffering,
-    no re-encode) so this stays RAM-safe even for high-res/long GIFs."""
     if not is_gif:
         return out_path
     frames_done = job.get("frames_done", job.get("done", 0))
@@ -1080,31 +1109,61 @@ async def send_with_retry(fn, desc: str):
             if attempt == 3: raise
             await asyncio.sleep(5 * attempt)
 
-# ================= LIVE STATUS LOOP =================
+# ================= LIVE STATUS LOOP (milestone-based) =================
 async def _job_status_loop(status_msg: Message, stop_evt: asyncio.Event):
+    """Milestone-only: 5% → 15% → 25% → … → 100%. No per-second spam."""
+    last_milestone = -1
+    last_edit_time = 0.0
+    last_text      = ""
+
     while not stop_evt.is_set():
         try:
             j = current_job
             if j and j.get("total"):
-                done = j.get("encoded", j.get("done", 0))
-                pct = done * 100 / j["total"] if j["total"] > 0 else 0
-                txt = (f"{j.get('stage', '🎨')} **{j['filename'][:20]}**\n"
-                       f"{bar(pct)} {pct:.0f}%\n"
-                       f"🎞 {done}/{j['total']} fr • ⏱ ETA {fmt_time(j.get('eta', 0))}\n"
-                       f"⚙️ processed {j.get('processed', j.get('done', 0))} • {j.get('throughput', 0):.2f} fr/s\n"
-                       f"{j.get('ai', '')}")
+                done  = j.get("encoded", j.get("done", 0))
+                total = j["total"]
+                pct   = done * 100 / total if total > 0 else 0.0
+
+                crossed = None
+                for m in STATUS_MILESTONES:
+                    if last_milestone < m <= pct:
+                        crossed = m
+
+                should_edit = False
+                if crossed is not None:
+                    last_milestone = crossed
+                    should_edit = True
+                elif (time.time() - last_edit_time) > STATUS_STUCK_SEC and pct < 100:
+                    should_edit = True
+
+                if should_edit:
+                    txt = (f"{j.get('stage', '🎨')} **{j['filename'][:20]}**\n"
+                           f"{bar(pct)} {pct:.0f}%\n"
+                           f"🎞 {done}/{total} fr • ⏱ ETA {fmt_time(j.get('eta', 0))}\n"
+                           f"⚙️ {j.get('throughput', 0):.2f} fr/s")
+                    if txt != last_text:
+                        await status_msg.edit_text(txt)
+                        last_text = txt
+                        last_edit_time = time.time()
+
             elif j:
                 txt = f"{j.get('stage', '📥')} **{j.get('filename', '')[:20]}** …"
-            else:
-                txt = "⏳ ..."
-            await status_msg.edit_text(txt)
+                if txt != last_text and (time.time() - last_edit_time) > 8.0:
+                    await status_msg.edit_text(txt)
+                    last_text = txt
+                    last_edit_time = time.time()
+
         except FloodWait as e:
-            try: await asyncio.wait_for(stop_evt.wait(), timeout=e.value)
+            log.warning("⏳ status FloodWait %ss", e.value)
+            try: await asyncio.wait_for(stop_evt.wait(), timeout=e.value + 2)
             except asyncio.TimeoutError: pass
             continue
-        except Exception:
-            pass
-        try: await asyncio.wait_for(stop_evt.wait(), timeout=STATUS_EVERY)
+        except Exception as e:
+            err = str(e).lower()
+            if ("not modified" in err or "message_id_invalid" in err
+                    or "not found" in err or "message to edit" in err):
+                pass  # silent
+        try: await asyncio.wait_for(stop_evt.wait(), timeout=STATUS_POLL_EVERY)
         except asyncio.TimeoutError: pass
 
 # ================= PANEL REFRESH LOOP =================
@@ -1131,14 +1190,16 @@ async def _refresh_loop():
             elif _panel_mode in ("main", "job"):
                 await refresh_panel()
             hb += 1
-            if hb % 24 == 0 and job_state.get("active") and current_job:
-                log.info("💓 %s fr | RAM %.1fGB | load %.1f",
-                         current_job.get("done", 0), mem_avail_gb(), load1())
+            if hb % 20 == 0 and job_state.get("active") and current_job:
+                log.info("💓 %s/%s fr | RAM %.1fGB | load %.1f",
+                         current_job.get("encoded", 0),
+                         current_job.get("total", 0),
+                         mem_avail_gb(), load1())
         except Exception as e:
             log.warning("refresh_loop err: %s", e)
         await asyncio.sleep(PANEL_EVERY)
 
-# ================= INTAKE (tick message + queue) =================
+# ================= INTAKE =================
 @app.on_message((filters.video | filters.document | filters.animation) & filters.private)
 async def media_handler(client, message: Message):
     if not is_owner(message.chat.id):
@@ -1169,7 +1230,7 @@ async def _queue_loop():
     global current_job, cancel_event, _panel_mode
     while JOB_QUEUE:
         job = JOB_QUEUE.pop(0)
-        job_cfg = dict(settings) 
+        job_cfg = dict(settings)
         message = job["message"]; filename = job["filename"]
         is_gif = job["is_gif"]; status_msg = job["status_msg"]
         job_state["active"] = True
@@ -1235,7 +1296,7 @@ async def _queue_loop():
             if notes:
                 try: await status_msg.edit_text("⚙️ " + " • ".join(notes))
                 except Exception: pass
-                
+
             await asyncio.to_thread(run_pipeline, current_job, in_path, out_path, info,
                                     ups_queue, inst_count, gov, cancel_event, is_gif,
                                     colorize_mode, colorize_ref, job_cfg, job_dir)
