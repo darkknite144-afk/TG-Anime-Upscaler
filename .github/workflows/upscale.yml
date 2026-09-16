@@ -1,114 +1,176 @@
-name: Telegram Anime Upscaler v10
+name: Telegram Anime Upscaler 20W
+run-name: ${{ inputs.job_id && format('TG-UPSCALE-{0}', inputs.job_id) || 'Telegram Bot' }}
 on:
   workflow_dispatch:
+    inputs:
+      job_id: {required: false, type: string, default: ''}
+      tg_file_id: {required: false, type: string, default: ''}
+      filename: {required: false, type: string, default: 'input.mp4'}
+      model: {required: false, type: string, default: 'anime_video'}
+      scale: {required: false, type: string, default: '2'}
+      preset: {required: false, type: string, default: 'balanced'}
+      audio: {required: false, type: string, default: 'keep'}
+      colorize: {required: false, type: string, default: 'off'}
+      workers: {required: false, type: string, default: '20'}
+      start_window: {required: false, type: string, default: '420'}
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: '1'
+  MAX_FRAMES: '3600'
+  START_WINDOW_SEC: '420'
+
 jobs:
-  run-bot:
+  bot:
+    if: ${{ inputs.tg_file_id == '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-          cache: 'pip'
-
-      - name: Cache weights + DDColor
-        uses: actions/cache@v4
-        with:
-          path: weights
-          key: weights-v10
-
-      - name: Install FFmpeg
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.10', cache: pip}
+      - name: Install system + Python
         run: |
-          sudo apt-get update
+          sudo apt-get update -y
           sudo apt-get install -y ffmpeg
-
-      - name: Install Python dependencies
-        run: |
           python -m pip install --upgrade pip setuptools wheel
           pip install --index-url https://download.pytorch.org/whl/cpu torch==2.1.2 torchvision==0.16.2
           pip install -r requirements.txt
-
-      - name: Install Real-ESRGAN
+      - name: Download models for photo mode
         run: |
-          git clone --depth 1 https://github.com/xinntao/Real-ESRGAN.git realesrgan-src
-          cd realesrgan-src
-          pip install -e . --no-deps
-          cd ..
-
-      - name: Install DDColor
-        run: |
-          git clone --depth 1 https://github.com/piddnad/DDColor.git ddcolor-src || \
-          git clone --depth 1 https://github.com/ai-anchorite/DDColor.git ddcolor-src
-          cd ddcolor-src
-          pip install -e . --no-deps || echo "⚠️ DDColor pip install failed (non-critical)"
-          cd ..
-
-      - name: Download upscale models
-        shell: bash
-        run: |
-          mkdir -p weights && cd weights
-
-          dl() {
-            local url="$1" out="$2"
-            if [ -s "$out" ]; then echo "✓ $out cached"; return 0; fi
-            echo "⬇️  $out"
-            wget -q --show-progress --timeout=90 -O "$out" "$url"
-          }
-
-          dl "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-animevideov3.pth" \
-             "realesr-animevideov3.pth"
-          dl "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth" \
-             "RealESRGAN_x4plus_anime_6B.pth"
-          dl "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth" \
-             "realesr-general-x4v3.pth"
-          dl "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth" \
-             "RealESRGAN_x4plus.pth"
-
-          for f in realesr-animevideov3.pth RealESRGAN_x4plus_anime_6B.pth \
-                   realesr-general-x4v3.pth RealESRGAN_x4plus.pth; do
-            [ -s "$f" ] || { echo "❌ Missing: $f"; exit 1; }
-          done
-          echo "✅ All 4 upscale models present"
-          ls -lh
-
-      - name: Download DDColor models (both Fast + High)
-        shell: bash
-        run: |
-          cd weights
-
-          # --- DDColor Fast (tiny, ~215MB) ---
-          if [ ! -s ddcolor_tiny.pth ]; then
-            echo "⬇️  DDColor Fast (tiny)..."
-            wget -q --show-progress --timeout=120 \
-              "https://huggingface.co/piddnad/ddcolor_paper_tiny/resolve/main/pytorch_model.bin" \
-              -O ddcolor_tiny.pth || echo "⚠️ tiny fail"
-          fi
-
-          # --- DDColor High (modelscope, ~870MB) ---
-          if [ ! -s ddcolor_high.pth ]; then
-            echo "⬇️  DDColor High (modelscope, this takes a few minutes)..."
-            wget -q --show-progress --timeout=300 \
-              "https://huggingface.co/piddnad/ddcolor_modelscope/resolve/main/pytorch_model.bin" \
-              -O ddcolor_high.pth || echo "⚠️ high fail"
-          fi
-
-          echo "=== weights/ ==="
-          ls -lh
-          for f in ddcolor_tiny.pth ddcolor_high.pth; do
-            if [ -s "$f" ]; then echo "✅ $f OK"
-            else echo "⚠️  $f missing (colorize limited)"; fi
-          done
-
-      - name: Run Telegram bot
+          mkdir -p weights
+          wget -q -O weights/realesr-animevideov3.pth https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-animevideov3.pth
+          wget -q -O weights/RealESRGAN_x4plus_anime_6B.pth https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth
+          wget -q -O weights/realesr-general-x4v3.pth https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth
+          wget -q -O weights/RealESRGAN_x4plus.pth https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth
+      - name: Start Telegram bot
         env:
-          PYTHONUNBUFFERED: '1'
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           OWNER_CHAT_ID: ${{ secrets.OWNER_CHAT_ID }}
           ARCHIVE_CHANNEL_ID: ${{ secrets.ARCHIVE_CHANNEL_ID }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GH_REPO: ${{ github.repository }}
+          DISTRIBUTED_WORKFLOW: upscale.yml
+          MAX_WORKERS: '20'
         run: python -u bot.py
+
+  worker:
+    if: ${{ inputs.tg_file_id != '' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        index: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.10', cache: pip}
+      - name: Install FFmpeg + Python
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ffmpeg
+          python -m pip install --upgrade pip setuptools wheel
+          pip install --index-url https://download.pytorch.org/whl/cpu torch==2.1.2 torchvision==0.16.2
+          pip install -r requirements.txt
+      - name: Install Real-ESRGAN
+        run: |
+          git clone --depth 1 https://github.com/xinntao/Real-ESRGAN.git realesrgan-src
+          cd realesrgan-src && pip install -e . --no-deps
+      - name: Download models
+        run: |
+          mkdir -p weights
+          wget -q --show-progress -O weights/realesr-animevideov3.pth https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-animevideov3.pth
+          wget -q --show-progress -O weights/RealESRGAN_x4plus_anime_6B.pth https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth
+          wget -q --show-progress -O weights/realesr-general-x4v3.pth https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth
+          wget -q --show-progress -O weights/RealESRGAN_x4plus.pth https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth
+      - name: Full throttle worker
+        env:
+          WORKER_INDEX: ${{ matrix.index }}
+          TOTAL_WORKERS: ${{ inputs.workers }}
+          TG_FILE_ID: ${{ inputs.tg_file_id }}
+          TG_BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          FILENAME: ${{ inputs.filename }}
+          MODEL_KEY: ${{ inputs.model }}
+          SCALE: ${{ inputs.scale }}
+          PRESET: ${{ inputs.preset }}
+          AUDIO_MODE: ${{ inputs.audio }}
+          COLORIZE_MODE: ${{ inputs.colorize }}
+          JOB_ID: ${{ inputs.job_id }}
+          START_WINDOW_SEC: ${{ inputs.start_window }}
+        run: python -u distributed_worker.py
+      - name: Upload worker chunk
+        if: ${{ success() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: worker-${{ matrix.index }}-${{ inputs.job_id }}
+          path: worker_output/*
+          if-no-files-found: error
+          retention-days: 1
+
+  collect:
+    if: ${{ always() && inputs.tg_file_id != '' }}
+    needs: worker
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.10'}
+      - name: Install FFmpeg
+        run: sudo apt-get update -y && sudo apt-get install -y ffmpeg
+      - name: Download worker chunks
+        uses: actions/download-artifact@v4
+        with:
+          pattern: worker-*-${{ inputs.job_id }}
+          path: chunks
+          merge-multiple: true
+      - name: Verify and assemble
+        env:
+          TG_FILE_ID: ${{ inputs.tg_file_id }}
+          TG_BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          FILENAME: ${{ inputs.filename }}
+          JOB_ID: ${{ inputs.job_id }}
+          SCALE: ${{ inputs.scale }}
+          PRESET: ${{ inputs.preset }}
+          AUDIO_MODE: ${{ inputs.audio }}
+        run: |
+          set -euo pipefail
+          test "$(find chunks -name 'worker_*.mp4' | wc -l)" -eq 20
+          mkdir -p final source
+          python - <<'PY'
+          import json,glob,os,sys
+          ms=[]
+          for p in glob.glob('chunks/worker_*.json'):
+              ms.append(json.load(open(p)))
+          ms.sort(key=lambda x:x['worker'])
+          if len(ms)!=20 or any(m['worker']!=i for i,m in enumerate(ms)): raise SystemExit('missing worker manifest')
+          last=-1
+          for m in ms:
+              if m['start']!=last+1 or m['end']<m['start'] or m['frames']!=m['end']-m['start']+1: raise SystemExit('invalid frame partition')
+              last=m['end']
+          open('final/concat.txt','w').write('\n'.join("file '"+os.path.abspath(f"chunks/worker_{i:02d}.mp4")+"'" for i in range(20))+'\n')
+          PY
+          curl -fsS "https://api.telegram.org/bot${TG_BOT_TOKEN}/getFile?file_id=${TG_FILE_ID}" -o source/meta.json
+          FP=$(python -c "import json;print(json.load(open('source/meta.json'))['result']['file_path'])")
+          curl -fsSL "https://api.telegram.org/file/bot${TG_BOT_TOKEN}/${FP}" -o source/input
+          ffmpeg -y -v error -f concat -safe 0 -i final/concat.txt -c copy final/video.mp4
+          if ffprobe -v error -select_streams a:0 -show_entries stream=index -of csv=p=0 source/input >/dev/null 2>&1; then
+            ffmpeg -y -v error -i final/video.mp4 -i source/input -map 0:v:0 -map 1:a? -c:v copy -c:a copy -shortest -movflags +faststart "final/${FILENAME%.*}_upscaled.mp4"
+          else
+            cp final/video.mp4 "final/${FILENAME%.*}_upscaled.mp4"
+          fi
+          rm -f final/concat.txt final/video.mp4
+          ls -lh final
+      - name: Upload final
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-${{ inputs.job_id }}
+          path: final/*
+          if-no-files-found: error
+          retention-days: 1
