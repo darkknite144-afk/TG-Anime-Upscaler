@@ -3,8 +3,32 @@ name: Telegram Anime Upscaler 20W
 on:
   workflow_dispatch:
     inputs:
-      video_url:
-        description: "Direct video URL for manual test"
+      job_id:
+        description: "Unique Job ID from Bot"
+        required: true
+        type: string
+      filename:
+        description: "Original Filename"
+        required: true
+        type: string
+      model:
+        description: "Model key (anime_video / anime_image / game / real)"
+        required: true
+        type: string
+      scale:
+        description: "Upscale scale (2 or 4)"
+        required: true
+        type: string
+      preset:
+        description: "Preset (fast / balanced / best)"
+        required: true
+        type: string
+      audio:
+        description: "Audio mode (keep / compress / remove)"
+        required: true
+        type: string
+      colorize:
+        description: "Colorize mode (off / fast / high)"
         required: true
         type: string
       workers:
@@ -12,15 +36,10 @@ on:
         required: false
         default: "20"
         type: string
-      scale:
-        description: "Upscale 2 or 4"
+      start_window:
+        description: "Startup window in seconds"
         required: false
-        default: "2"
-        type: string
-      model:
-        description: "Model: anime_video / anime_image / game / real"
-        required: false
-        default: "anime_video"
+        default: "420"
         type: string
 
 permissions:
@@ -29,132 +48,13 @@ permissions:
 
 env:
   MAX_WORKERS: 20
-  START_WINDOW_SECONDS: 420
   PYTHONUNBUFFERED: "1"
   OMP_NUM_THREADS: "4"
   MKL_NUM_THREADS: "4"
 
 jobs:
-
-  prepare:
-    name: Prepare
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    outputs:
-      total_frames: ${{ steps.info.outputs.total_frames }}
-      fps: ${{ steps.info.outputs.fps }}
-      width: ${{ steps.info.outputs.width }}
-      height: ${{ steps.info.outputs.height }}
-      duration: ${{ steps.info.outputs.duration }}
-      filename: ${{ steps.info.outputs.filename }}
-      workers: ${{ steps.cfg.outputs.workers }}
-      chunk_size: ${{ steps.cfg.outputs.chunk_size }}
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install FFmpeg
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y ffmpeg
-
-      - name: Download input
-        env:
-          VIDEO_URL: ${{ inputs.video_url }}
-        run: |
-          set -e
-          mkdir -p input
-          python - <<'PY'
-          import os,sys,urllib.request
-          url=os.environ["VIDEO_URL"].strip()
-          if not url.startswith(("http://","https://")):
-              raise SystemExit("video_url must be a direct http/https URL")
-          urllib.request.urlretrieve(url,"input/source_video")
-          size=os.path.getsize("input/source_video")
-          if size < 1024:
-              raise SystemExit("Downloaded file is too small")
-          print("Downloaded:",size,"bytes")
-          PY
-          file input/source_video
-          ffprobe -v error -show_format -show_streams -of json input/source_video > input/info.json
-
-      - name: Read video information
-        id: info
-        run: |
-          python - <<'PY'
-          import json,os,subprocess
-          data=json.load(open("input/info.json"))
-          vs=next((x for x in data["streams"] if x.get("codec_type")=="video"),None)
-          if not vs:
-              raise SystemExit("No video stream found")
-          num=int(vs.get("nb_frames") or 0)
-          if num<=0:
-              dur=float(data["format"].get("duration") or 0)
-              rate=vs.get("r_frame_rate","0/1").split("/")
-              fps=float(rate[0])/float(rate[1]) if float(rate[1]) else 0
-              num=round(dur*fps)
-          fps_text=vs.get("r_frame_rate","0/1")
-          a,b=fps_text.split("/")
-          fps=float(a)/float(b) if float(b) else 0
-          dur=float(data["format"].get("duration") or 0)
-          w=int(vs.get("width") or 0)
-          h=int(vs.get("height") or 0)
-          if num<=0 or fps<=0 or w<=0 or h<=0:
-              raise SystemExit("Could not determine valid video metadata")
-          print("frames =",num)
-          print("fps    =",fps)
-          print("size   =",w,"x",h)
-          print("duration =",dur)
-          print(f"total_frames={num}",file=open(os.environ["GITHUB_OUTPUT"],"a"))
-          print(f"fps={fps}",file=open(os.environ["GITHUB_OUTPUT"],"a"))
-          print(f"width={w}",file=open(os.environ["GITHUB_OUTPUT"],"a"))
-          print(f"height={h}",file=open(os.environ["GITHUB_OUTPUT"],"a"))
-          print(f"duration={dur}",file=open(os.environ["GITHUB_OUTPUT"],"a"))
-          print("filename=upscaled_video.mp4",file=open(os.environ["GITHUB_OUTPUT"],"a"))
-          PY
-
-      - name: Calculate workers and chunks
-        id: cfg
-        env:
-          REQUESTED_WORKERS: ${{ inputs.workers }}
-          TOTAL_FRAMES: ${{ steps.info.outputs.total_frames }}
-        run: |
-          python - <<'PY'
-          import os,math
-          requested=max(1,min(20,int(os.environ["REQUESTED_WORKERS"] or "20")))
-          frames=int(os.environ["TOTAL_FRAMES"])
-          workers=min(requested,frames)
-          chunk=math.ceil(frames/workers)
-          print("Requested workers:",requested)
-          print("Actual chunks:",workers)
-          print("Frames:",frames)
-          print("Chunk size:",chunk)
-          out=open(os.environ["GITHUB_OUTPUT"],"a")
-          print(f"workers={workers}",file=out)
-          print(f"chunk_size={chunk}",file=out)
-          out.close()
-          PY
-
-      - name: Upload source
-        uses: actions/upload-artifact@v4
-        with:
-          name: source-video
-          path: input/source_video
-          retention-days: 1
-
-      - name: Upload metadata
-        uses: actions/upload-artifact@v4
-        with:
-          name: source-metadata
-          path: input/info.json
-          retention-days: 1
-
-
   worker:
     name: Worker ${{ matrix.worker }}
-    needs: prepare
-    if: ${{ needs.prepare.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 420
     strategy:
@@ -164,13 +64,14 @@ jobs:
         worker: ${{ fromJSON(format('[{0}]', join(',', range(0, 20)))) }}
 
     env:
-      WORKER_ID: ${{ matrix.worker }}
-      TOTAL_WORKERS: ${{ needs.prepare.outputs.workers }}
-      TOTAL_FRAMES: ${{ needs.prepare.outputs.total_frames }}
-      FPS: ${{ needs.prepare.outputs.fps }}
+      WORKER_INDEX: ${{ matrix.worker }}
+      TOTAL_WORKERS: ${{ inputs.workers }}
+      JOB_ID: ${{ inputs.job_id }}
+      FILENAME: ${{ inputs.filename }}
+      MODEL_KEY: ${{ inputs.model }}
       SCALE: ${{ inputs.scale }}
-      MODEL: ${{ inputs.model }}
-      START_WINDOW_SECONDS: 420
+      PRESET: ${{ inputs.preset }}
+      MAX_FRAMES: "3600"
 
     steps:
       - name: Checkout
@@ -180,29 +81,14 @@ jobs:
         id: assign
         run: |
           python - <<'PY'
-          import os,math
-          wid=int(os.environ["WORKER_ID"])
+          import os
+          wid=int(os.environ["WORKER_INDEX"])
           workers=int(os.environ["TOTAL_WORKERS"])
-          total=int(os.environ["TOTAL_FRAMES"])
           if wid>=workers:
               print("SKIP=true",file=open(os.environ["GITHUB_OUTPUT"],"a"))
-              print(f"Worker {wid} is not required; only {workers} workers needed.")
               raise SystemExit(0)
-          start=(total*wid)//workers
-          end=(total*(wid+1))//workers-1
-          count=end-start+1
-          out=open(os.environ["GITHUB_OUTPUT"],"a")
-          print("SKIP=false",file=out)
-          print(f"FRAME_START={start}",file=out)
-          print(f"FRAME_END={end}",file=out)
-          print(f"FRAME_COUNT={count}",file=out)
-          out.close()
-          print(f"Worker {wid}: frames {start}-{end} ({count} frames)")
+          print("SKIP=false",file=open(os.environ["GITHUB_OUTPUT"],"a"))
           PY
-
-      - name: Stop unused matrix entries
-        if: ${{ steps.assign.outputs.SKIP == 'true' }}
-        run: echo "Unused worker slot"
 
       - name: Install system packages
         if: ${{ steps.assign.outputs.SKIP != 'true' }}
@@ -214,46 +100,61 @@ jobs:
       - name: Install Python packages
         if: ${{ steps.assign.outputs.SKIP != 'true' }}
         run: |
-          pip install numpy==1.26.4 opencv-python-headless==4.9.0.80 Pillow==10.4.0 tqdm==4.66.5
+          pip install numpy==1.26.4 opencv-python-headless==4.9.0.80 Pillow==10.4.0 tqdm==4.66.5 requests
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
           pip install basicsr==1.4.2 realesrgan
 
-      - name: Download source
+      - name: Wait for input video artifact
         if: ${{ steps.assign.outputs.SKIP != 'true' }}
-        uses: actions/download-artifact@v4
-        with:
-          name: source-video
-          path: input
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os, time, requests, sys, zipfile, shutil
+          repo = os.environ["GITHUB_REPOSITORY"]
+          run_id = os.environ["GITHUB_RUN_ID"]
+          token = os.environ["GH_TOKEN"]
+          headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+          url = f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/artifacts"
+          
+          print("⏳ Waiting for input-video artifact...")
+          max_wait = 600
+          start_time = time.time()
+          
+          while True:
+              if time.time() - start_time > max_wait:
+                  print("❌ Timeout waiting for input-video artifact!")
+                  sys.exit(1)
+                  
+              r = requests.get(url, headers=headers, timeout=30)
+              if r.status_code == 200:
+                  arts = r.json().get("artifacts", [])
+                  for a in arts:
+                      if a["name"] == "input-video":
+                          print("✅ Artifact found! Downloading...")
+                          dl_url = a["archive_download_url"]
+                          with requests.get(dl_url, headers=headers, stream=True, timeout=120) as dl:
+                              dl.raise_for_status()
+                              with open("input_video.zip", "wb") as f:
+                                  for chunk in dl.iter_content(1024*1024):
+                                      f.write(chunk)
+                          print("✅ Downloaded. Extracting...")
+                          with zipfile.ZipFile("input_video.zip", "r") as z:
+                              z.extractall("temp_input")
+                          os.makedirs("worker_work", exist_ok=True)
+                          for root, dirs, files in os.walk("temp_input"):
+                              for f in files:
+                                  if f == "source_video" or f.endswith(".mp4"):
+                                      shutil.move(os.path.join(root, f), "worker_work/source")
+                                      break
+                          print("✅ Extracted and placed at worker_work/source")
+                          sys.exit(0)
+              time.sleep(10)
+          PY
 
       - name: Run worker
         if: ${{ steps.assign.outputs.SKIP != 'true' }}
-        run: |
-          mkdir -p worker_output
-          python distributed_worker.py \
-            --input input/source_video \
-            --output worker_output \
-            --worker-id "${WORKER_ID}" \
-            --workers "${TOTAL_WORKERS}" \
-            --total-frames "${TOTAL_FRAMES}" \
-            --fps "${FPS}" \
-            --scale "${SCALE}" \
-            --model "${MODEL}" \
-            --frame-start "${{ steps.assign.outputs.FRAME_START }}" \
-            --frame-end "${{ steps.assign.outputs.FRAME_END }}"
-
-      - name: Validate worker
-        if: ${{ steps.assign.outputs.SKIP != 'true' }}
-        run: |
-          python - <<'PY'
-          import os,glob
-          s=int("${{ steps.assign.outputs.FRAME_START }}")
-          e=int("${{ steps.assign.outputs.FRAME_END }}")
-          files=sorted(glob.glob("worker_output/frame_*.png"))
-          expected=e-s+1
-          if len(files)!=expected:
-              raise SystemExit(f"Worker produced {len(files)} frames, expected {expected}")
-          print("Worker output valid:",len(files))
-          PY
+        run: python distributed_worker.py
 
       - name: Upload worker artifact
         if: ${{ steps.assign.outputs.SKIP != 'true' }}
@@ -264,11 +165,10 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-
   collect:
     name: Collect and Build
-    needs: [prepare,worker]
-    if: ${{ always() && needs.prepare.result == 'success' }}
+    needs: worker
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
@@ -281,10 +181,10 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y ffmpeg
 
-      - name: Download source
+      - name: Download input video
         uses: actions/download-artifact@v4
         with:
-          name: source-video
+          name: input-video
           path: input
 
       - name: Download all worker outputs
@@ -295,65 +195,27 @@ jobs:
           path: workers
           merge-multiple: false
 
-      - name: Validate all workers
+      - name: Merge video chunks using FFmpeg
         env:
-          TOTAL_FRAMES: ${{ needs.prepare.outputs.total_frames }}
-          WORKERS: ${{ needs.prepare.outputs.workers }}
+          WORKERS: ${{ inputs.workers }}
         run: |
-          python - <<'PY'
-          import os,glob
-          total=int(os.environ["TOTAL_FRAMES"])
-          workers=int(os.environ["WORKERS"])
-          found=[]
-          for w in range(workers):
-              p=f"workers/worker-{w}"
-              files=glob.glob(p+"/frame_*.png")
-              found.append((w,len(files)))
-          print("Worker results:",found)
-          if any(n<=0 for _,n in found):
-              raise SystemExit("One or more required workers produced no frames")
-          total_found=sum(n for _,n in found)
-          if total_found!=total:
-              raise SystemExit(f"Frame mismatch: got {total_found}, expected {total}")
-          PY
-
-      - name: Merge frames
-        env:
-          FPS: ${{ needs.prepare.outputs.fps }}
-          TOTAL_FRAMES: ${{ needs.prepare.outputs.total_frames }}
-        run: |
-          mkdir -p final_frames
-          python - <<'PY'
-          import os,glob,shutil
-          total=int(os.environ["TOTAL_FRAMES"])
-          dst="final_frames"
-          n=0
-          for w in range(20):
-              files=sorted(glob.glob(f"workers/worker-{w}/frame_*.png"))
-              for src in files:
-                  out=f"{dst}/frame_{n:08d}.png"
-                  shutil.copy2(src,out)
-                  n+=1
-          if n!=total:
-              raise SystemExit(f"Merge mismatch {n}/{total}")
-          print("Merged",n,"frames")
-          PY
-
-      - name: Encode final video
-        env:
-          FPS: ${{ needs.prepare.outputs.fps }}
-        run: |
-          ffmpeg -y -framerate "$FPS" \
-            -i final_frames/frame_%08d.png \
-            -c:v libx264 -preset veryfast -crf 18 \
-            -pix_fmt yuv420p \
-            output_upscaled.mp4
+          > concat_list.txt
+          for ((i=0; i<$WORKERS; i++)); do
+            echo "file 'workers/worker-$i/worker_$(printf "%02d" $i).mp4'" >> concat_list.txt
+          done
+          cat concat_list.txt
+          ffmpeg -y -f concat -safe 0 -i concat_list.txt -c copy output_no_audio.mp4
 
       - name: Restore original audio
         run: |
+          if [ -f input/source_video ]; then
+            SOURCE=input/source_video
+          else
+            SOURCE=$(find input -name "*.mp4" | head -n 1)
+          fi
           ffmpeg -y \
-            -i output_upscaled.mp4 \
-            -i input/source_video \
+            -i output_no_audio.mp4 \
+            -i "$SOURCE" \
             -map 0:v:0 -map 1:a? \
             -c:v copy -c:a aac -b:a 192k \
             -shortest final_upscaled.mp4
@@ -361,7 +223,7 @@ jobs:
       - name: Upload final
         uses: actions/upload-artifact@v4
         with:
-          name: final-upscaled-video
+          name: final-${{ inputs.job_id }}
           path: final_upscaled.mp4
           retention-days: 7
           if-no-files-found: error
