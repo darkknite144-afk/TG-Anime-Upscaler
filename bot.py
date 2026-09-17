@@ -1256,8 +1256,7 @@ async def _dispatch_distributed(job_id: str, message: Message, filename: str, cf
             "preset": cfg["preset"],
             "audio": cfg["audio"],
             "colorize": normalize_colorize(cfg["colorize_mode"]),
-            "workers": str(DISTRIBUTED_MAX_WORKERS),
-            "start_window": str(DISTRIBUTED_START_WINDOW_SEC)
+            "workers": str(DISTRIBUTED_MAX_WORKERS)
         }
     }
     hdr = {"Authorization": f"Bearer {GH_PAT}", "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
