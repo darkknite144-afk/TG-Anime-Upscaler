@@ -47,6 +47,16 @@ on:
         required: true
         type: string
         default: "20"
+      chat_id:
+        description: "Telegram Chat ID"
+        required: true
+        type: string
+        default: ""
+      message_id:
+        description: "Telegram Message ID"
+        required: true
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -102,7 +112,7 @@ jobs:
           python3 -m venv "$DEPS_DIR/venv"
           source "$DEPS_DIR/venv/bin/activate"
           pip install --upgrade pip
-          pip install numpy==1.26.4 opencv-python-headless==4.9.0.80 Pillow==10.4.0 tqdm==4.66.5 requests
+          pip install numpy==1.26.4 opencv-python-headless==4.9.0.80 Pillow==10.4.0 tqdm==4.66.5 requests pyrogram tgcrypto
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
           pip install basicsr==1.4.2 realesrgan
 
@@ -125,48 +135,38 @@ jobs:
           done
           echo "✅ All 4 models present"
 
-      - name: Wait for input video artifact from bot (ONE TIME)
+      - name: Download video directly from Telegram (Fast)
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          CHAT_ID: ${{ inputs.chat_id }}
+          MESSAGE_ID: ${{ inputs.message_id }}
         run: |
           mkdir -p worker_work
+          source "$DEPS_DIR/venv/bin/activate"
           python - <<'PY'
-          import os, time, requests, sys, zipfile
-          repo = os.environ["GITHUB_REPOSITORY"]
-          run_id = os.environ["GITHUB_RUN_ID"]
-          token = os.environ["GH_TOKEN"]
-          headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
-          url = f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/artifacts"
-
-          print("⏳ Bot ke input-video artifact ka wait...", flush=True)
-          max_wait = 900
-          start_time = time.time()
-
-          while True:
-              if time.time() - start_time > max_wait:
-                  print("❌ Timeout waiting for input-video")
-                  sys.exit(1)
-              r = requests.get(url, headers=headers, timeout=30)
-              if r.status_code == 200:
-                  for a in r.json().get("artifacts", []):
-                      if a["name"] == "input-video":
-                          print("✅ Found! Downloading...")
-                          dl_url = a["archive_download_url"]
-                          with requests.get(dl_url, headers=headers, stream=True, timeout=600) as dl:
-                              dl.raise_for_status()
-                              with open("input.zip", "wb") as f:
-                                  for chunk in dl.iter_content(1024*1024):
-                                      f.write(chunk)
-                          with zipfile.ZipFile("input.zip") as z:
-                              z.extractall("temp_input")
-                          for root, dirs, files in os.walk("temp_input"):
-                              for f in files:
-                                  if f == "source":
-                                      os.rename(os.path.join(root, f), "worker_work/source")
-                                      break
-                          print("✅ worker_work/source ready")
-                          sys.exit(0)
-              time.sleep(10)
+          import os, asyncio
+          from pyrogram import Client
+          
+          bot_token = os.environ.get("BOT_TOKEN")
+          api_id = os.environ.get("API_ID")
+          api_hash = os.environ.get("API_HASH")
+          chat_id = int(os.environ.get("CHAT_ID"))
+          msg_id = int(os.environ.get("MESSAGE_ID"))
+          
+          app = Client("gh_session", bot_token=bot_token, api_id=api_id, api_hash=api_hash, in_memory=True)
+          
+          async def dl():
+              await app.start()
+              print("⬇️ Fetching message from Telegram...", flush=True)
+              msg = await app.get_messages(chat_id, msg_id)
+              print("⬇️ Downloading video...", flush=True)
+              await app.download_media(msg, file_name="worker_work/source")
+              await app.stop()
+              print("✅ Download complete!")
+          
+          asyncio.run(dl())
           PY
 
       - name: Package shared bundle (venv + weights + video)
@@ -294,13 +294,18 @@ jobs:
       - name: Install FFmpeg
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg zstd
 
-      - name: Download input video
+      - name: Download shared bundle (for original audio)
         uses: actions/download-artifact@v4
         with:
-          name: input-video
-          path: input
+          name: shared-bundle-${{ inputs.job_id }}
+          path: bundle
+
+      - name: Extract source video
+        run: |
+          mkdir -p input
+          cp bundle/shared_source_video input/source || true
 
       - name: Download all worker outputs
         continue-on-error: true
@@ -316,7 +321,9 @@ jobs:
         run: |
           > concat_list.txt
           for ((i=0; i<$WORKERS; i++)); do
-            echo "file 'workers/worker-$i/worker_$(printf "%02d" $i).mp4'" >> concat_list.txt
+            if [ -f "workers/worker-$i/worker_$(printf "%02d" $i).mp4" ]; then
+              echo "file 'workers/worker-$i/worker_$(printf "%02d" $i).mp4'" >> concat_list.txt
+            fi
           done
           cat concat_list.txt
           ffmpeg -y -f concat -safe 0 -i concat_list.txt -c copy output_no_audio.mp4
@@ -328,9 +335,13 @@ jobs:
           else
             SOURCE=$(find input -type f | head -n 1)
           fi
-          ffmpeg -y -i output_no_audio.mp4 -i "$SOURCE" \
-            -map 0:v:0 -map 1:a? -c:v copy -c:a aac -b:a 192k \
-            -shortest final_upscaled.mp4
+          if [ -f "$SOURCE" ]; then
+            ffmpeg -y -i output_no_audio.mp4 -i "$SOURCE" \
+              -map 0:v:0 -map 1:a? -c:v copy -c:a aac -b:a 192k \
+              -shortest final_upscaled.mp4
+          else
+            mv output_no_audio.mp4 final_upscaled.mp4
+          fi
 
       - name: Upload final
         uses: actions/upload-artifact@v4
