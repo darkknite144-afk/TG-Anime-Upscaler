@@ -1,147 +1,186 @@
 #!/usr/bin/env python3
-import argparse,glob,math,os,shutil,subprocess,sys,time
+import json, math, os, shutil, subprocess, sys, time
 from pathlib import Path
-
-import cv2
-import numpy as np
-import torch
-
+import cv2, numpy as np, requests, torch
 from realesrgan import RealESRGANer
 from realesrgan.archs.srvgg_arch import SRVGGNetCompact
-
 try:
     from realesrgan.archs.rrdbnet_arch import RRDBNet
-except Exception:
+except ModuleNotFoundError:
     from basicsr.archs.rrdbnet_arch import RRDBNet
 
+# ===== FULL THROTTLE: saare CPU cores use karo =====
+CPU = max(1, os.cpu_count() or 1)
+torch.set_num_threads(CPU)
+torch.set_num_interop_threads(max(1, min(4, CPU)))
 
-MODELS={
-    "anime_video":("realesr-animevideov3.pth","srvgg"),
-    "anime_image":("RealESRGAN_x4plus_anime_6B.pth","rrdb"),
-    "game":("realesr-general-x4v3.pth","srvgg"),
-    "real":("RealESRGAN_x4plus.pth","rrdb")
+ROOT = Path('.')
+W = ROOT / 'weights'
+WORK = ROOT / 'worker_work'
+OUT = ROOT / 'worker_output'
+WORK.mkdir(exist_ok=True)
+OUT.mkdir(exist_ok=True)
+
+MODELS = {
+    'anime_video': ('realesr-animevideov3.pth', 'srvgg'),
+    'anime_image': ('RealESRGAN_x4plus_anime_6B.pth', 'rrdb'),
+    'game':        ('realesr-general-x4v3.pth', 'srvgg'),
+    'real':        ('RealESRGAN_x4plus.pth', 'rrdb')
 }
 
-def args():
-    p=argparse.ArgumentParser()
-    p.add_argument("--input",required=True)
-    p.add_argument("--output",required=True)
-    p.add_argument("--worker-id",type=int,required=True)
-    p.add_argument("--workers",type=int,required=True)
-    p.add_argument("--total-frames",type=int,required=True)
-    p.add_argument("--fps",type=float,required=True)
-    p.add_argument("--scale",type=float,default=2)
-    p.add_argument("--model",default="anime_video")
-    p.add_argument("--frame-start",type=int,required=True)
-    p.add_argument("--frame-end",type=int,required=True)
-    return p.parse_args()
+def run(cmd, **kw):
+    print('+', ' '.join(map(str, cmd)), flush=True)
+    return subprocess.run(cmd, check=True, **kw)
 
-def model_path(name):
-    root=Path("weights")
-    p=root/name
-    if p.exists():
-        return p
-    p=Path(name)
-    if p.exists():
-        return p
-    raise FileNotFoundError(f"Model not found: {name}")
-
-def build_upscaler(model_name,scale):
-    if model_name not in MODELS:
-        raise ValueError(f"Unknown model: {model_name}")
-    filename,arch=MODELS[model_name]
-    path=model_path(filename)
-    tile=256
-    if arch=="srvgg":
-        model=SRVGGNetCompact(
-            num_in_ch=3,num_out_ch=3,num_feat=64,
-            num_conv=32,num_out_ch=3,upscale=4,act_type="prelu"
-        )
-    else:
-        model=RRDBNet(
-            num_in_ch=3,num_out_ch=3,num_feat=64,
-            num_block=6,num_grow_ch=32,scale=4
-        )
-    return RealESRGANer(
-        scale=4,
-        model_path=str(path),
-        model=model,
-        tile=tile,
-        tile_pad=16,
-        pre_pad=0,
-        half=False,
-        device=torch.device("cpu")
-    )
-
-def extract_range(src,start,end,dst,fps):
-    Path(dst).mkdir(parents=True,exist_ok=True)
-    pattern=str(Path(dst)/"input_%08d.png")
-    vf=f"select='between(n\\,{start}\\,{end})'"
-    cmd=[
-        "ffmpeg","-y","-v","error",
-        "-i",src,
-        "-vf",vf,
-        "-vsync","0",
-        pattern
-    ]
-    subprocess.run(cmd,check=True)
-    files=sorted(glob.glob(str(Path(dst)/"input_*.png")))
-    expected=end-start+1
-    if len(files)!=expected:
-        raise RuntimeError(f"Extraction failed: {len(files)}/{expected}")
-    return files
-
-def upscale():
-    a=args()
-    out=Path(a.output)
-    work=out/"_input"
-    out.mkdir(parents=True,exist_ok=True)
-    if out.exists():
-        for p in out.glob("frame_*.png"):
-            p.unlink()
-    files=extract_range(
-        a.input,
-        a.frame_start,
-        a.frame_end,
-        work,
-        a.fps
-    )
-    up=build_upscaler(a.model,a.scale)
-    started=time.time()
-    expected=len(files)
-    for i,src in enumerate(files):
-        frame_no=a.frame_start+i
-        img=cv2.imread(src,cv2.IMREAD_COLOR)
-        if img is None:
-            raise RuntimeError(f"Cannot read frame {src}")
-        result,_=up.enhance(img,outscale=float(a.scale))
-        target=out/f"frame_{frame_no:08d}.png"
-        if not cv2.imwrite(str(target),result):
-            raise RuntimeError(f"Cannot write {target}")
-        done=i+1
-        elapsed=time.time()-started
-        rate=done/elapsed if elapsed else 0
-        eta=(expected-done)/rate if rate else 0
-        print(
-            f"[WORKER {a.worker_id:02d}/{a.workers:02d}] "
-            f"frame {done}/{expected} | "
-            f"global {frame_no+1}/{a.total_frames} | "
-            f"{rate:.2f} fps | ETA {eta:.1f}s",
-           flush=True
-        )
-    produced=sorted(out.glob("frame_*.png"))
-    if len(produced)!=expected:
-        raise RuntimeError(f"Output mismatch {len(produced)}/{expected}")
-    shutil.rmtree(work,ignore_errors=True)
-    print(
-        f"WORKER {a.worker_id} COMPLETE | "
-        f"frames={expected} | time={time.time()-started:.1f}s",
-       flush=True
-    )
-
-if __name__=="__main__":
+def probe(p):
+    d = json.loads(subprocess.check_output(
+        ['ffprobe', '-v', 'error', '-print_format', 'json',
+         '-show_streams', '-show_format', str(p)], text=True))
+    v = next(x for x in d['streams'] if x.get('codec_type') == 'video')
+    r = v.get('avg_frame_rate') or v.get('r_frame_rate') or '30/1'
+    a, b = r.split('/')
+    fps = float(a) / float(b) if float(b) else 30.
+    n = v.get('nb_frames')
+    frames = 0
     try:
-        upscale()
-    except Exception as e:
-        print(f"WORKER FAILED: {e}",file=sys.stderr,flush=True)
-        raise
+        frames = int(float(n)) if n not in (None, '', 'N/A') else 0
+    except Exception:
+        frames = 0
+    if frames <= 0:
+        frames = max(1, round(float(v.get('duration') or
+                                  d.get('format', {}).get('duration') or 0) * fps))
+    return {
+        'w': int(v['width']),
+        'h': int(v['height']),
+        'fps': fps,
+        'frames': int(frames),
+        'audio': any(x.get('codec_type') == 'audio' for x in d['streams'])
+    }
+
+def model(key):
+    f, arch = MODELS[key]
+    path = W / f
+    if not path.is_file():
+        raise RuntimeError('missing model ' + str(path))
+    if arch == 'srvgg':
+        net = SRVGGNetCompact(num_in_ch=3, num_out_ch=3, num_feat=64,
+                              num_conv=32, upscale=4, act_type='prelu')
+    else:
+        net = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64,
+                      num_block=23, num_grow_ch=32, scale=4)
+    return RealESRGANer(scale=4, model_path=str(path), model=net,
+                        tile=int(os.getenv('TILE', '0') or 0),
+                        tile_pad=10, pre_pad=0, half=False)
+
+def tg_download(file_id, token, out):
+    r = requests.get(f'https://api.telegram.org/bot{token}/getFile',
+                     params={'file_id': file_id}, timeout=30)
+    r.raise_for_status()
+    p = r.json()['result']['file_path']
+    u = f'https://api.telegram.org/file/bot{token}/{p}'
+    with requests.get(u, stream=True, timeout=120) as q:
+        q.raise_for_status()
+        with open(out, 'wb') as f:
+            for c in q.iter_content(1024 * 1024):
+                if c:
+                    f.write(c)
+
+def main():
+    idx = int(os.environ['WORKER_INDEX'])
+    workers = int(os.environ.get('TOTAL_WORKERS', '20'))
+    job = os.environ['JOB_ID']
+    src = WORK / 'source'
+    filename = os.environ.get('FILENAME', 'input.mp4')
+    src.parent.mkdir(exist_ok=True)
+
+    print(f'WORKER {idx+1}/{workers} | CPU {CPU} | full throttle', flush=True)
+
+    # ===== NAYA: File already local hai (artifact se aayi), warna Telegram se lo =====
+    if not src.exists():
+        tg_file_id = os.environ.get('TG_FILE_ID', '').strip()
+        tg_token = os.environ.get('TG_BOT_TOKEN', '').strip()
+        if tg_file_id and tg_token:
+            print("File not found locally. Downloading from Telegram...", flush=True)
+            tg_download(tg_file_id, tg_token, src)
+        else:
+            raise RuntimeError("Source file missing and no TG_FILE_ID/TG_BOT_TOKEN")
+    else:
+        print(f"✅ File found locally at {src} ({src.stat().st_size} bytes). Skipping download.", flush=True)
+    # =================================================================================
+
+    info = probe(src)
+    total = min(info['frames'], int(os.environ.get('MAX_FRAMES', '3600')))
+
+    # ===== Frames equally divide among workers =====
+    base = total // workers
+    rem = total % workers
+    start = idx * base + min(idx, rem)
+    count = base + (1 if idx < rem else 0)
+    end = start + count - 1
+
+    if count <= 0:
+        raise RuntimeError(f'empty partition {idx}')
+
+    key = os.environ.get('MODEL_KEY', 'anime_video')
+    scale = float(os.environ.get('SCALE', '2'))
+    outw = int(info['w'] * scale) // 2 * 2
+    outh = int(info['h'] * scale) // 2 * 2
+
+    preset = {'fast': ('23', 'veryfast'),
+              'balanced': ('19', 'veryfast'),
+              'best': ('16', 'slow')}.get(
+                  os.environ.get('PRESET', 'balanced'), ('19', 'veryfast'))
+
+    wd = WORK / f'w{idx:02d}'
+    shutil.rmtree(wd, ignore_errors=True)
+    wd.mkdir(parents=True)
+    frames = wd / 'frames'
+    frames.mkdir()
+    pattern = str(frames / 'f_%08d.png')
+
+    vf = f"select=between(n\\,{start}\\,{end}),setpts=N/FRAME_RATE/TB"
+    run(['ffmpeg', '-y', '-v', 'error', '-i', str(src), '-an', '-vf', vf,
+         '-vsync', '0', pattern])
+
+    imgs = sorted(frames.glob('f_*.png'))
+    expected = count
+    if len(imgs) != expected:
+        raise RuntimeError(f'partition {idx}: expected {expected} frames, got {len(imgs)}')
+
+    up = model(key)
+    t = time.time()
+    for n, p in enumerate(imgs, 1):
+        img = cv2.imread(str(p), cv2.IMREAD_COLOR)
+        if img is None:
+            raise RuntimeError('bad frame ' + str(p))
+        try:
+            arr = up.enhance(img, outscale=scale)[0]
+        except RuntimeError as e:
+            if 'out of memory' not in str(e).lower():
+                raise
+            up.tile = 256
+            arr = up.enhance(img, outscale=scale)[0]
+        if arr.shape[1] != outw or arr.shape[0] != outh:
+            arr = cv2.resize(arr, (outw, outh), interpolation=cv2.INTER_LANCZOS4)
+        cv2.imwrite(str(p), arr)
+        if n == 1 or n % 10 == 0 or n == expected:
+            print(f'W{idx:02d} {n}/{expected} {n/max(0.001, time.time()-t):.2f} fps', flush=True)
+
+    chunk = OUT / f'worker_{idx:02d}.mp4'
+    run(['ffmpeg', '-y', '-v', 'error',
+         '-framerate', f"{info['fps']:.8f}", '-i', pattern,
+         '-c:v', 'libx264', '-preset', preset[1], '-crf', preset[0],
+         '-threads', str(CPU), '-pix_fmt', 'yuv420p',
+         '-movflags', '+faststart', str(chunk)])
+
+    manifest = {
+        'worker': idx, 'workers': workers,
+        'start': start, 'end': end, 'frames': expected,
+        'fps': info['fps'], 'width': outw, 'height': outh,
+        'filename': filename, 'job_id': job
+    }
+    (OUT / f'worker_{idx:02d}.json').write_text(json.dumps(manifest, indent=2))
+    print('DONE', json.dumps(manifest), flush=True)
+
+if __name__ == '__main__':
+    main()
