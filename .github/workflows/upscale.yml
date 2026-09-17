@@ -4,43 +4,79 @@ on:
   workflow_dispatch:
     inputs:
       job_id:
-        description: "Unique Job ID from Bot"
+        description: "Unique Job ID (e.g., manual-test-01)"
         required: true
         type: string
+        default: "manual-test-001"
       filename:
-        description: "Original Filename"
+        description: "Output Filename"
         required: true
         type: string
+        default: "upscaled_output.mp4"
       model:
-        description: "Model key (anime_video / anime_image / game / real)"
+        description: "Model Selection"
         required: true
-        type: string
+        type: choice
+        options:
+          - anime_video
+          - anime_image
+          - game
+          - real
+        default: "anime_video"
       scale:
-        description: "Upscale scale (2 or 4)"
+        description: "Upscale Scale"
         required: true
-        type: string
+        type: choice
+        options:
+          - "2"
+          - "4"
+        default: "2"
       preset:
-        description: "Preset (fast / balanced / best)"
+        description: "Quality Preset (balanced = Medium)"
         required: true
-        type: string
+        type: choice
+        options:
+          - fast
+          - balanced
+          - best
+        default: "balanced"
       audio:
-        description: "Audio mode (keep / compress / remove)"
+        description: "Audio Mode"
         required: true
-        type: string
+        type: choice
+        options:
+          - keep
+          - compress
+          - remove
+        default: "keep"
       colorize:
-        description: "Colorize mode (off / fast / high)"
+        description: "Colorize Mode"
+        required: true
+        type: choice
+        options:
+          - "off"
+          - "fast"
+          - "high"
+        default: "off"
+      workers:
+        description: "Number of Workers"
+        required: true
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "4"
+          - "8"
+          - "10"
+          - "12"
+          - "15"
+          - "20"
+        default: "20"
+      start_window:
+        description: "Startup window (seconds)"
         required: true
         type: string
-      workers:
-        description: "Workers 1-20"
-        required: false
-        default: "20"
-        type: string
-      start_window:
-        description: "Startup window in seconds"
-        required: false
         default: "420"
-        type: string
 
 permissions:
   contents: read
