@@ -7,6 +7,7 @@ Smart Anime/Game/Real Upscaler v11.0 — SERVER STABLE PIPELINE
   - ✅ Smoothed ETA (Exponential Moving Average)
   - ✅ Milestone-based status updates (anti-flood)
   - ✅ GitHub Actions optimized (No global torch thread shifting during jobs)
+  - ✅ MANAGER MODE: File system alag (manager_work/) — workers se separate
 """
 import asyncio, concurrent.futures, gc, json, logging, math, os, queue, random, shutil, subprocess, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor
@@ -65,7 +66,9 @@ if not API_ID or not API_HASH or not BOT_TOKEN or not OWNER_CHAT_ID:
     raise RuntimeError("Missing GitHub Secrets")
 
 MODEL_DIR = Path("weights")
-WORK_DIR = Path("work"); OUTPUT_DIR = Path("output")
+# ===== MANAGER FILE SYSTEM (workers se alag) =====
+WORK_DIR = Path("manager_work")
+OUTPUT_DIR = Path("manager_output")
 WORK_DIR.mkdir(exist_ok=True); OUTPUT_DIR.mkdir(exist_ok=True)
 
 MAX_FRAMES = 3600
@@ -496,7 +499,7 @@ def core_kb() -> InlineKeyboardMarkup:
 SUBMENU_BUTTONS = {"mmenu", "qmenu", "pmenu", "amenu", "colormenu", "cmenu"}
 
 HELP_TEXT = (
-    "🧭 **Help (v11.0)**\n\n"
+    "🧭 **Help (v11.0 Manager)**\n\n"
     "🎥 Video/GIF/Photo bhejo → turant ✅ tick message + live progress\n"
     "📚 Batch: multiple videos queue me, har ek ka apna status\n"
     "🎛 Models → Anime Video / Game = videos • Anime Image / Real = photos\n"
@@ -506,7 +509,7 @@ HELP_TEXT = (
 
 def panel_text() -> str:
     m = MODELS.get(settings["model"], MODELS["anime_video"])
-    lines = [_pad(f"{EMO.face()}  UPSCALER v11.0"), "─" * PW,
+    lines = [_pad(f"{EMO.face()}  UPSCALER v11.0 (Manager)"), "─" * PW,
              _pad(f"🧠 {CPU_THREADS}c • 🛡 {mem_avail_gb():.1f}GB free • load {load1():.1f}"),
              _pad(f"{m['label']} {fmt_scale(settings['scale'])}× "
                   f"{settings['preset'][:4]} 🔊{settings['audio'][:4]}"),
@@ -1231,7 +1234,18 @@ async def _ensure_queue_loop():
 async def _dispatch_distributed(job_id: str, message: Message, filename: str, cfg: Dict[str,Any], status_msg: Message):
     if not GH_PAT or not GH_REPO: raise RuntimeError("GH_PAT/GH_REPO missing")
     
-    # 1. Dispatch workflow (without TG_FILE_ID)
+    # 1. Download Telegram file to manager's own filesystem
+    media = message.video or message.document or message.animation
+    file_id = getattr(media, "file_id", None)
+    if not file_id: raise RuntimeError("Telegram file_id missing")
+    
+    temp_path = WORK_DIR / f"input_{job_id}.mp4"
+    log.info("📥 Downloading video from Telegram to %s", temp_path)
+    current_job["stage"] = "📥 Download"
+    await app.download_media(message, file_name=str(temp_path))
+    log.info("✅ Downloaded: %s bytes", temp_path.stat().st_size)
+    
+    # 2. Dispatch workflow
     payload = {
         "ref": "main",
         "inputs": {
@@ -1253,7 +1267,7 @@ async def _dispatch_distributed(job_id: str, message: Message, filename: str, cf
     r.raise_for_status()
     log.info("Workflow dispatched. Waiting for run ID...")
     
-    # 2. Find run ID
+    # 3. Find run ID
     t0 = time.time()
     run = None
     while time.time() - t0 < 60:
@@ -1269,15 +1283,6 @@ async def _dispatch_distributed(job_id: str, message: Message, filename: str, cf
     rid = run["id"]
     log.info("Run ID: %s", rid)
     
-    # 3. Download Telegram file
-    media = message.video or message.document or message.animation
-    file_id = getattr(media, "file_id", None)
-    if not file_id: raise RuntimeError("Telegram file_id missing")
-    
-    temp_path = WORK_DIR / f"input_{job_id}.mp4"
-    await app.download_media(message, file_name=str(temp_path))
-    log.info("Downloaded to %s", temp_path)
-    
     # 4. Create zip and upload as artifact
     import zipfile
     zip_path = WORK_DIR / f"input_{job_id}.zip"
@@ -1290,10 +1295,12 @@ async def _dispatch_distributed(job_id: str, message: Message, filename: str, cf
         "Accept": "application/vnd.github+json",
         "Content-Type": "application/zip"
     }
+    log.info("⬆️ Uploading artifact...")
+    current_job["stage"] = "⬆️ Upload"
     with open(zip_path, "rb") as f:
         upload_res = await asyncio.to_thread(requests.post, upload_url, headers=upload_hdr, data=f, timeout=300)
     upload_res.raise_for_status()
-    log.info("Artifact uploaded: %s", upload_res.status_code)
+    log.info("✅ Artifact uploaded: %s", upload_res.status_code)
     
     # 5. Monitor run
     current_job["stage"] = "⚡ 20W START"
@@ -1343,6 +1350,8 @@ async def _dispatch_distributed(job_id: str, message: Message, filename: str, cf
             z = WORK_DIR / f"final_{job_id}.zip"
             outdir = WORK_DIR / f"final_{job_id}"
             outdir.mkdir(exist_ok=True)
+            log.info("⬇️ Downloading final artifact...")
+            current_job["stage"] = "⬇️ Download final"
             with requests.get(final["archive_download_url"], headers=hdr, stream=True, timeout=120) as dl:
                 dl.raise_for_status()
                 with open(z, "wb") as f:
@@ -1354,9 +1363,10 @@ async def _dispatch_distributed(job_id: str, message: Message, filename: str, cf
             if not out:
                 raise RuntimeError("Final video missing")
             
-            # Cleanup temp files
+            # Cleanup manager temp files
             temp_path.unlink(missing_ok=True)
             zip_path.unlink(missing_ok=True)
+            z.unlink(missing_ok=True)
             
             return out, time.time() - t0
         await asyncio.sleep(8)
@@ -1380,14 +1390,14 @@ async def _queue_loop():
         }
         try:
             await status_msg.edit_text(
-                f"📤 **20 workers call ho rahe hain...** `{filename}`\n"
-                f"⏳ Available runners ke liye **7 minute startup window**"
+                f"📤 **Manager 20 workers ko call kar raha hai...** `{filename}`\n"
+                f"⏳ Video download + upload hoga, phir workers shuru karenge"
             )
             out, elapsed = await _dispatch_distributed(jid, message, filename, cfg, status_msg)
             size = out.stat().st_size / 1048576
             if size > MAX_SEND_MB:
                 raise RuntimeError(f"Output {size:.0f}MB exceeds limit")
-            current_job["stage"] = "⬆️ upload"
+            current_job["stage"] = "⬆️ upload to TG"
             await send_with_retry(
                 lambda: app.send_video(
                     message.chat.id, str(out),
