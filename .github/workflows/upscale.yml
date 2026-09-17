@@ -116,8 +116,8 @@ jobs:
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
           pip install basicsr==1.4.2 realesrgan
           
-          # FIX FOR basicsr AND torchvision CONFLICT (Monkey Patching)
-          python -c "import basicsr, os; f=os.path.join(os.path.dirname(basicsr.__file__), 'data/degradations.py'); text=open(f).read().replace('torchvision.transforms.functional_tensor', 'torchvision.transforms.functional'); open(f, 'w').write(text)"
+          # FIX FOR basicsr AND torchvision CONFLICT (Bina Python import ke)
+          sed -i 's/torchvision.transforms.functional_tensor/torchvision.transforms.functional/g' $(find "$DEPS_DIR/venv" -path "*/basicsr/data/degradations.py")
 
       - name: Download upscale model weights (ONE TIME)
         shell: bash
