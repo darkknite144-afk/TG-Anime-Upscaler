@@ -1252,7 +1252,7 @@ async def _dispatch_distributed(job_id: str, message: Message, filename: str, cf
             "job_id": job_id,
             "filename": filename,
             "model": normalize_model_key(cfg["model"]),
-            "scale": str(cfg["scale"]),
+            "scale": str(int(float(cfg["scale"]))),
             "preset": cfg["preset"],
             "audio": cfg["audio"],
             "colorize": normalize_colorize(cfg["colorize_mode"]),
