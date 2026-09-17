@@ -81,13 +81,13 @@ DISTRIBUTED_MAX_WORKERS = max(1, min(20, int(os.getenv("MAX_WORKERS", "20"))))
 GIF_MIN_SEC = 2.0
 
 # ===== Status message: sirf milestone par edit =====
-STATUS_POLL_EVERY       = 3.0                              # internal tick (no edit)
+STATUS_POLL_EVERY       = 3.0
 STATUS_MILESTONES       = [5, 15, 25, 35, 45, 55, 65, 75, 85, 95, 100]
-STATUS_STUCK_SEC        = 60.0                             # heartbeat if stuck
+STATUS_STUCK_SEC        = 60.0
 
 # ===== Panel: bahut slow =====
-PANEL_EVERY             = 15.0                             # was 2.5
-PANEL_MIN_EDIT_INTERVAL = 12.0                             # min gap between panel edits
+PANEL_EVERY             = 15.0
+PANEL_MIN_EDIT_INTERVAL = 12.0
 
 CPU_THREADS = os.cpu_count() or 4
 POOL = ThreadPoolExecutor(max_workers=max(4, CPU_THREADS))
@@ -416,8 +416,8 @@ archive = ChannelArchive(app, (os.getenv("ARCHIVE_CHANNEL_ID", "") or "").strip(
 _panel: Optional[Message] = None
 _panel_lock = asyncio.Lock()
 _panel_mode = "main"
-_panel_last_edit_time = 0.0        # NEW: rate-limit tracker
-_panel_last_text      = ""         # NEW: same-text skip
+_panel_last_edit_time = 0.0
+_panel_last_text      = ""
 
 def _core_label() -> str:
     if settings["core"] == "auto": return "🤖 Auto"
@@ -571,11 +571,9 @@ async def refresh_panel():
     global _panel, _panel_last_edit_time, _panel_last_text
     if _panel is None: return
     now = time.time()
-    # Rate-limit: minimum gap between two panel edits
     if (now - _panel_last_edit_time) < PANEL_MIN_EDIT_INTERVAL:
         return
     txt = panel_text()
-    # Same text = skip (prevents MESSAGE_NOT_MODIFIED)
     if txt == _panel_last_text:
         _panel_last_edit_time = now
         return
@@ -702,7 +700,7 @@ async def btn(client, cq):
         except Exception as e:
             err = str(e).lower()
             if "not modified" in err:
-                pass  # silent
+                pass
             else:
                 log.warning("Callback edit fail: %s", str(e)[:120])
                 try: await send_panel(cq.message.chat.id)
@@ -1070,7 +1068,7 @@ def run_pipeline(job, in_path: Path, out_path: Path, info: Dict, ups_queue: queu
             try:
                 if th and th.is_alive(): th.join(timeout=2)
             except Exception: pass
-        gc.collect()   # NEW: release frame buffers immediately
+        gc.collect()
 
 def loop_short_clip_if_needed(job: Dict[str, Any], out_path: Path, is_gif: bool,
                               fps_hint: float, job_dir: Optional[Path]) -> Path:
@@ -1116,7 +1114,6 @@ async def send_with_retry(fn, desc: str):
 
 # ================= LIVE STATUS LOOP (milestone-based) =================
 async def _job_status_loop(status_msg: Message, stop_evt: asyncio.Event):
-    """Milestone-only: 5% → 15% → 25% → … → 100%. No per-second spam."""
     last_milestone = -1
     last_edit_time = 0.0
     last_text      = ""
@@ -1167,7 +1164,7 @@ async def _job_status_loop(status_msg: Message, stop_evt: asyncio.Event):
             err = str(e).lower()
             if ("not modified" in err or "message_id_invalid" in err
                     or "not found" in err or "message to edit" in err):
-                pass  # silent
+                pass
         try: await asyncio.wait_for(stop_evt.wait(), timeout=STATUS_POLL_EVERY)
         except asyncio.TimeoutError: pass
 
@@ -1230,78 +1227,213 @@ async def _ensure_queue_loop():
     if _queue_task is None or _queue_task.done():
         _queue_task = asyncio.create_task(_queue_loop())
 
-# ================= QUEUE PROCESSOR =================
+# ================= QUEUE PROCESSOR (DISTRIBUTED) =================
 async def _dispatch_distributed(job_id: str, message: Message, filename: str, cfg: Dict[str,Any], status_msg: Message):
     if not GH_PAT or not GH_REPO: raise RuntimeError("GH_PAT/GH_REPO missing")
+    
+    # 1. Dispatch workflow (without TG_FILE_ID)
+    payload = {
+        "ref": "main",
+        "inputs": {
+            "job_id": job_id,
+            "filename": filename,
+            "model": normalize_model_key(cfg["model"]),
+            "scale": str(cfg["scale"]),
+            "preset": cfg["preset"],
+            "audio": cfg["audio"],
+            "colorize": normalize_colorize(cfg["colorize_mode"]),
+            "workers": str(DISTRIBUTED_MAX_WORKERS),
+            "start_window": str(DISTRIBUTED_START_WINDOW_SEC)
+        }
+    }
+    hdr = {"Authorization": f"Bearer {GH_PAT}", "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
+    api = f"https://api.github.com/repos/{GH_REPO}"
+    
+    r = await asyncio.to_thread(requests.post, f"{api}/actions/workflows/{DISTRIBUTED_WORKFLOW}/dispatches", headers=hdr, json=payload, timeout=30)
+    r.raise_for_status()
+    log.info("Workflow dispatched. Waiting for run ID...")
+    
+    # 2. Find run ID
+    t0 = time.time()
+    run = None
+    while time.time() - t0 < 60:
+        await asyncio.sleep(3)
+        q = await asyncio.to_thread(requests.get, f"{api}/actions/workflows/{DISTRIBUTED_WORKFLOW}/runs", headers=hdr, params={"event": "workflow_dispatch", "per_page": 20}, timeout=30)
+        q.raise_for_status()
+        for x in q.json().get("workflow_runs", []):
+            if x.get("created_at") >= time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(t0 - 15)) and x.get("status") in ("queued", "in_progress"):
+                run = x
+                break
+        if run: break
+    if not run: raise RuntimeError("GitHub worker run ID nahi mila")
+    rid = run["id"]
+    log.info("Run ID: %s", rid)
+    
+    # 3. Download Telegram file
     media = message.video or message.document or message.animation
     file_id = getattr(media, "file_id", None)
     if not file_id: raise RuntimeError("Telegram file_id missing")
-    payload={"ref":"main","inputs":{"job_id":job_id,"tg_file_id":file_id,"filename":filename,"model":normalize_model_key(cfg["model"]),"scale":str(cfg["scale"]),"preset":cfg["preset"],"audio":cfg["audio"],"colorize":normalize_colorize(cfg["colorize_mode"]),"workers":str(DISTRIBUTED_MAX_WORKERS),"start_window":"420"}}
-    hdr={"Authorization":f"Bearer {GH_PAT}","Accept":"application/vnd.github+json","X-GitHub-Api-Version":"2022-11-28"}
-    api=f"https://api.github.com/repos/{GH_REPO}"
-    t0=time.time(); r=await asyncio.to_thread(requests.post,f"{api}/actions/workflows/{DISTRIBUTED_WORKFLOW}/dispatches",headers=hdr,json=payload,timeout=30); r.raise_for_status()
-    run=None
-    while time.time()-t0<60:
-        await asyncio.sleep(3)
-        q=await asyncio.to_thread(requests.get,f"{api}/actions/workflows/{DISTRIBUTED_WORKFLOW}/runs",headers=hdr,params={"event":"workflow_dispatch","per_page":20},timeout=30); q.raise_for_status()
-        for x in q.json().get("workflow_runs",[]):
-            created=x.get("created_at","");
-            if created and x.get("created_at")>=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime(t0-15)) and x.get("status") in ("queued","in_progress"):
-                run=x; break
-        if run: break
-    if not run: raise RuntimeError("GitHub worker run ID nahi mila")
-    rid=run["id"]; current_job["stage"]="⚡ 20W START"; current_job["total"]=100; current_job["done"]=0
+    
+    temp_path = WORK_DIR / f"input_{job_id}.mp4"
+    await app.download_media(message, file_name=str(temp_path))
+    log.info("Downloaded to %s", temp_path)
+    
+    # 4. Create zip and upload as artifact
+    import zipfile
+    zip_path = WORK_DIR / f"input_{job_id}.zip"
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
+        z.write(temp_path, "source_video.mp4")
+    
+    upload_url = f"{api}/actions/runs/{rid}/artifacts"
+    upload_hdr = {
+        "Authorization": f"Bearer {GH_PAT}",
+        "Accept": "application/vnd.github+json",
+        "Content-Type": "application/zip"
+    }
+    with open(zip_path, "rb") as f:
+        upload_res = await asyncio.to_thread(requests.post, upload_url, headers=upload_hdr, data=f, timeout=300)
+    upload_res.raise_for_status()
+    log.info("Artifact uploaded: %s", upload_res.status_code)
+    
+    # 5. Monitor run
+    current_job["stage"] = "⚡ 20W START"
+    current_job["total"] = 100
+    current_job["done"] = 0
+    start_monitor = time.time()
+    
     while True:
-        if time.time()-t0>MAX_JOB_SEC: raise RuntimeError("Distributed job time-limit exceeded")
-        q=await asyncio.to_thread(requests.get,f"{api}/actions/runs/{rid}/jobs",headers=hdr,params={"per_page":100},timeout=30); q.raise_for_status(); jobs=q.json().get("jobs",[])
-        active=sum(1 for j in jobs if j.get("status") in ("queued","in_progress")); done=sum(1 for j in jobs if j.get("name","").startswith("worker") and j.get("conclusion")=="success")
-        current_job["done"]=done; current_job["processed"]=done; current_job["throughput"]=active; current_job["stage"]=f"⚡ {done}/{DISTRIBUTED_MAX_WORKERS} workers • {active} active"; current_job["spf"]=0.0
-        rr=await asyncio.to_thread(requests.get,f"{api}/actions/runs/{rid}",headers=hdr,timeout=30); rr.raise_for_status(); run=rr.json(); status=run.get("status"); conclusion=run.get("conclusion")
-        try: await status_msg.edit_text(f"⚡ **20-Worker Upscale** `{filename}`\n{current_job['stage']}\n⏱ {fmt_time(time.time()-t0)}\n🚀 Startup window: 7 min")
-        except Exception: pass
-        if status=="completed":
-            if conclusion!="success": raise RuntimeError(f"Distributed workflow {conclusion or 'failed'}")
-            arts=await asyncio.to_thread(requests.get,f"{api}/actions/runs/{rid}/artifacts",headers=hdr,params={"per_page":100},timeout=30); arts.raise_for_status(); final=next((a for a in arts.json().get("artifacts",[]) if a.get("name")==f"final-{job_id}"),None)
-            if not final: raise RuntimeError("Final artifact missing")
-            z=WORK_DIR/f"final_{job_id}.zip"; outdir=WORK_DIR/f"final_{job_id}"; outdir.mkdir(exist_ok=True)
-            with requests.get(final["archive_download_url"],headers=hdr,stream=True,timeout=120) as dl:
-                dl.raise_for_status();
-                with open(z,"wb") as f:
-                    for c in dl.iter_content(1024*1024):
-                        if c:f.write(c)
-            import zipfile
-            with zipfile.ZipFile(z) as zz: zz.extractall(outdir)
-            out=next(outdir.glob("*.mp4"),None)
-            if not out: raise RuntimeError("Final video missing")
-            return out, time.time()-t0
+        if time.time() - start_monitor > MAX_JOB_SEC:
+            raise RuntimeError("Distributed job time-limit exceeded")
+        q = await asyncio.to_thread(requests.get, f"{api}/actions/runs/{rid}/jobs", headers=hdr, params={"per_page": 100}, timeout=30)
+        q.raise_for_status()
+        jobs = q.json().get("jobs", [])
+        active = sum(1 for j in jobs if j.get("status") in ("queued", "in_progress"))
+        done = sum(1 for j in jobs if j.get("name", "").startswith("worker") and j.get("conclusion") == "success")
+        current_job["done"] = done
+        current_job["processed"] = done
+        current_job["throughput"] = active
+        current_job["stage"] = f"⚡ {done}/{DISTRIBUTED_MAX_WORKERS} workers • {active} active"
+        current_job["spf"] = 0.0
+        
+        rr = await asyncio.to_thread(requests.get, f"{api}/actions/runs/{rid}", headers=hdr, timeout=30)
+        rr.raise_for_status()
+        run = rr.json()
+        status = run.get("status")
+        conclusion = run.get("conclusion")
+        
+        try:
+            await status_msg.edit_text(
+                f"⚡ **20-Worker Upscale** `{filename}`\n"
+                f"{current_job['stage']}\n"
+                f"⏱ {fmt_time(time.time() - start_monitor)}\n"
+                f"🚀 Startup window: 7 min"
+            )
+        except Exception:
+            pass
+        
+        if status == "completed":
+            if conclusion != "success":
+                raise RuntimeError(f"Distributed workflow {conclusion or 'failed'}")
+            arts = await asyncio.to_thread(requests.get, f"{api}/actions/runs/{rid}/artifacts", headers=hdr, params={"per_page": 100}, timeout=30)
+            arts.raise_for_status()
+            final = next((a for a in arts.json().get("artifacts", []) if a.get("name") == f"final-{job_id}"), None)
+            if not final:
+                raise RuntimeError("Final artifact missing")
+            
+            z = WORK_DIR / f"final_{job_id}.zip"
+            outdir = WORK_DIR / f"final_{job_id}"
+            outdir.mkdir(exist_ok=True)
+            with requests.get(final["archive_download_url"], headers=hdr, stream=True, timeout=120) as dl:
+                dl.raise_for_status()
+                with open(z, "wb") as f:
+                    for c in dl.iter_content(1024 * 1024):
+                        if c: f.write(c)
+            with zipfile.ZipFile(z) as zz:
+                zz.extractall(outdir)
+            out = next(outdir.glob("*.mp4"), None)
+            if not out:
+                raise RuntimeError("Final video missing")
+            
+            # Cleanup temp files
+            temp_path.unlink(missing_ok=True)
+            zip_path.unlink(missing_ok=True)
+            
+            return out, time.time() - t0
         await asyncio.sleep(8)
 
 async def _queue_loop():
     global current_job, cancel_event, _panel_mode
     while JOB_QUEUE:
-        job=JOB_QUEUE.pop(0); cfg=dict(settings); message=job["message"]; filename=job["filename"]; status_msg=job["status_msg"]; job_state["active"]=True; cancel_event=threading.Event(); _panel_mode="job"; jid=f"tg-{message.id}-{int(time.time())}"; current_job={"filename":filename,"ow":0,"oh":0,"done":0,"total":100,"spf":0.0,"eta":0.0,"throughput":0.0,"processed":0,"encoded":0,"ai":"","stage":"📤 dispatch","loops":1}; t0=time.time()
+        job = JOB_QUEUE.pop(0)
+        cfg = dict(settings)
+        message = job["message"]
+        filename = job["filename"]
+        status_msg = job["status_msg"]
+        job_state["active"] = True
+        cancel_event = threading.Event()
+        _panel_mode = "job"
+        jid = f"tg-{message.id}-{int(time.time())}"
+        current_job = {
+            "filename": filename, "ow": 0, "oh": 0, "done": 0, "total": 100,
+            "spf": 0.0, "eta": 0.0, "throughput": 0.0, "processed": 0,
+            "encoded": 0, "ai": "", "stage": "📤 dispatch", "loops": 1
+        }
         try:
-            await status_msg.edit_text(f"📤 **20 workers call ho rahe hain...** `{filename}`\n⏳ Available runners ke liye **7 minute startup window**")
-            out,elapsed=await _dispatch_distributed(jid,message,filename,cfg,status_msg); size=out.stat().st_size/1048576
-            if size>MAX_SEND_MB: raise RuntimeError(f"Output {size:.0f}MB exceeds limit")
-            current_job["stage"]="⬆️ upload"
-            await send_with_retry(lambda: app.send_video(message.chat.id,str(out),caption=f"✅ **{filename}**\n🎯 {fmt_scale(float(cfg['scale']))}× • {cfg['preset']}\n⚡ 20-worker distributed • ⏱ {fmt_time(elapsed)} • 📦 {size:.1f}MB",supports_streaming=True),"video")
-            try: await status_msg.edit_text(f"✅ **DONE!** `{filename}`\n⚡ 20-worker distributed\n⏱ {fmt_time(elapsed)} • 📦 {size:.1f}MB")
-            except Exception: pass
+            await status_msg.edit_text(
+                f"📤 **20 workers call ho rahe hain...** `{filename}`\n"
+                f"⏳ Available runners ke liye **7 minute startup window**"
+            )
+            out, elapsed = await _dispatch_distributed(jid, message, filename, cfg, status_msg)
+            size = out.stat().st_size / 1048576
+            if size > MAX_SEND_MB:
+                raise RuntimeError(f"Output {size:.0f}MB exceeds limit")
+            current_job["stage"] = "⬆️ upload"
+            await send_with_retry(
+                lambda: app.send_video(
+                    message.chat.id, str(out),
+                    caption=f"✅ **{filename}**\n"
+                            f"🎯 {fmt_scale(float(cfg['scale']))}× • {cfg['preset']}\n"
+                            f"⚡ 20-worker distributed • ⏱ {fmt_time(elapsed)} • 📦 {size:.1f}MB",
+                    supports_streaming=True
+                ),
+                "video"
+            )
+            try:
+                await status_msg.edit_text(
+                    f"✅ **DONE!** `{filename}`\n"
+                    f"⚡ 20-worker distributed\n"
+                    f"⏱ {fmt_time(elapsed)} • 📦 {size:.1f}MB"
+                )
+            except Exception:
+                pass
             if archive:
-                try: archive.record_job(filename,float(cfg["scale"]),elapsed,True,extra=cfg); await archive.save_state()
-                except Exception as e: log.warning("Archive fail: %s",e)
+                try:
+                    archive.record_job(filename, float(cfg["scale"]), elapsed, True, extra=cfg)
+                    await archive.save_state()
+                except Exception as e:
+                    log.warning("Archive fail: %s", e)
         except Exception as e:
             log.exception("Distributed job failed")
-            try: await status_msg.edit_text(f"❌ **FAIL:** `{filename}`\n{str(e)[:220]}")
-            except Exception: pass
+            try:
+                await status_msg.edit_text(f"❌ **FAIL:** `{filename}`\n{str(e)[:220]}")
+            except Exception:
+                pass
         finally:
-            job_state["active"]=False; current_job=None; cancel_event=None; _panel_mode="main"; gc.collect(); EMO.set("idle");
-            try: await refresh_panel()
-            except Exception: pass
+            job_state["active"] = False
+            current_job = None
+            cancel_event = None
+            _panel_mode = "main"
+            gc.collect()
+            EMO.set("idle")
+            try:
+                await refresh_panel()
+            except Exception:
+                pass
             for p in WORK_DIR.glob(f"final_{jid}*"):
-                try: shutil.rmtree(p) if p.is_dir() else p.unlink()
-                except Exception: pass
+                try:
+                    shutil.rmtree(p) if p.is_dir() else p.unlink()
+                except Exception:
+                    pass
 
 # ================= PHOTO =================
 busy_lock = asyncio.Lock()
@@ -1370,7 +1502,6 @@ async def photo_handler(client, message: Message):
         for f in WORK_DIR.glob(f"photo_{message.id}*"):
             try: f.unlink()
             except Exception: pass
-
 
 # ================= COMMANDS =================
 @app.on_message(filters.command("panel") & filters.private)
