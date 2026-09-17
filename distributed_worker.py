@@ -62,12 +62,19 @@ def model(key):
     path = W / f
     if not path.is_file():
         raise RuntimeError('missing model ' + str(path))
+
+    # 🧠 SMART AUTO-DETECT LOGIC (Fixed Size Mismatch)
     if arch == 'srvgg':
+        # Anime video model uses 16 layers, General uses 32
+        nc = 16 if 'anime' in f.lower() else 32
         net = SRVGGNetCompact(num_in_ch=3, num_out_ch=3, num_feat=64,
-                              num_conv=32, upscale=4, act_type='prelu')
+                              num_conv=nc, upscale=4, act_type='prelu')
     else:
+        # Anime image model uses 6 blocks, General RRDB uses 23
+        nb = 6 if '6b' in f.lower() else 23
         net = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64,
-                      num_block=23, num_grow_ch=32, scale=4)
+                      num_block=nb, num_grow_ch=32, scale=4)
+
     return RealESRGANer(scale=4, model_path=str(path), model=net,
                         tile=int(os.getenv('TILE', '0') or 0),
                         tile_pad=10, pre_pad=0, half=False)
