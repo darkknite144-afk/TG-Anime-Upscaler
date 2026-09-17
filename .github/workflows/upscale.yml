@@ -59,10 +59,158 @@ env:
   PYTHONUNBUFFERED: "1"
   OMP_NUM_THREADS: "4"
   MKL_NUM_THREADS: "4"
+  DEPS_DIR: /home/runner/pydeps
 
 jobs:
+  # =====================================================================
+  # SETUP — sirf EK BAAR chalta hai: deps install + model weights +
+  # bot se video receive. Ye "controller" job hai jo pehle sab taiyar
+  # karta hai, phir ek hi shared bundle 20 workers ko de deta hai.
+  # =====================================================================
+  setup:
+    name: "Setup (shared deps + weights + video — 1x for all workers)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: "Telegram: startup message"
+        if: always()
+        continue-on-error: true
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.OWNER_CHAT_ID }}
+        run: |
+          if [ -n "$BOT_TOKEN" ] && [ -n "$CHAT_ID" ]; then
+            MSG="🚀 Job started: ${{ inputs.job_id }}
+          File: ${{ inputs.filename }}
+          Workers: ${{ inputs.workers }}
+          Preparing shared environment (deps + models + video) once for all workers..."
+            curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+              --data-urlencode chat_id="${CHAT_ID}" \
+              --data-urlencode text="${MSG}" > /dev/null || true
+          fi
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg zstd python3-venv
+          python -m pip install --upgrade pip
+
+      - name: Build shared virtualenv (ONE TIME — sab workers isi ko reuse karenge)
+        run: |
+          python3 -m venv "$DEPS_DIR/venv"
+          source "$DEPS_DIR/venv/bin/activate"
+          pip install --upgrade pip
+          pip install numpy==1.26.4 opencv-python-headless==4.9.0.80 Pillow==10.4.0 tqdm==4.66.5 requests
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install basicsr==1.4.2 realesrgan
+
+      - name: Download upscale model weights (ONE TIME)
+        shell: bash
+        run: |
+          mkdir -p weights && cd weights
+          dl() {
+            local url="$1" out="$2"
+            if [ -s "$out" ]; then echo "✓ $out cached"; return 0; fi
+            echo "⬇️  $out"
+            wget -q --timeout=90 -O "$out" "$url"
+          }
+          dl "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-animevideov3.pth" "realesr-animevideov3.pth"
+          dl "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth" "RealESRGAN_x4plus_anime_6B.pth"
+          dl "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth" "realesr-general-x4v3.pth"
+          dl "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth" "RealESRGAN_x4plus.pth"
+          for f in realesr-animevideov3.pth RealESRGAN_x4plus_anime_6B.pth realesr-general-x4v3.pth RealESRGAN_x4plus.pth; do
+            [ -s "$f" ] || { echo "❌ Missing: $f"; exit 1; }
+          done
+          echo "✅ All 4 models present"
+
+      - name: Wait for input video artifact from bot (ONE TIME)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p worker_work
+          python - <<'PY'
+          import os, time, requests, sys, zipfile
+          repo = os.environ["GITHUB_REPOSITORY"]
+          run_id = os.environ["GITHUB_RUN_ID"]
+          token = os.environ["GH_TOKEN"]
+          headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+          url = f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/artifacts"
+
+          print("⏳ Bot ke input-video artifact ka wait...", flush=True)
+          max_wait = 900
+          start_time = time.time()
+
+          while True:
+              if time.time() - start_time > max_wait:
+                  print("❌ Timeout waiting for input-video")
+                  sys.exit(1)
+              r = requests.get(url, headers=headers, timeout=30)
+              if r.status_code == 200:
+                  for a in r.json().get("artifacts", []):
+                      if a["name"] == "input-video":
+                          print("✅ Found! Downloading...")
+                          dl_url = a["archive_download_url"]
+                          with requests.get(dl_url, headers=headers, stream=True, timeout=600) as dl:
+                              dl.raise_for_status()
+                              with open("input.zip", "wb") as f:
+                                  for chunk in dl.iter_content(1024*1024):
+                                      f.write(chunk)
+                          with zipfile.ZipFile("input.zip") as z:
+                              z.extractall("temp_input")
+                          for root, dirs, files in os.walk("temp_input"):
+                              for f in files:
+                                  if f == "source":
+                                      os.rename(os.path.join(root, f), "worker_work/source")
+                                      break
+                          print("✅ worker_work/source ready")
+                          sys.exit(0)
+              time.sleep(10)
+          PY
+
+      - name: Package shared bundle (venv + weights + video)
+        run: |
+          tar -I zstd -cf env.tar.zst -C "$DEPS_DIR" venv
+          tar -I zstd -cf weights.tar.zst weights
+          cp worker_work/source shared_source_video
+          ls -lh env.tar.zst weights.tar.zst shared_source_video
+
+      - name: Upload shared bundle (workers isi ko download karenge)
+        uses: actions/upload-artifact@v4
+        with:
+          name: shared-bundle-${{ inputs.job_id }}
+          path: |
+            env.tar.zst
+            weights.tar.zst
+            shared_source_video
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: "Telegram: env ready, workers ko order de diya"
+        if: success()
+        continue-on-error: true
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.OWNER_CHAT_ID }}
+        run: |
+          if [ -n "$BOT_TOKEN" ] && [ -n "$CHAT_ID" ]; then
+            MSG="✅ Shared environment ready.
+          Starting ${{ inputs.workers }} workers now — sabko same deps+weights+video mil gaya (1 hi baar download hua)."
+            curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+              --data-urlencode chat_id="${CHAT_ID}" \
+              --data-urlencode text="${MSG}" > /dev/null || true
+          fi
+
+  # =====================================================================
+  # WORKERS — ab koi pip install nahi karta. Setup ka bana bundle
+  # seedha download+extract karke turant kaam shuru karte hain.
+  # =====================================================================
   worker:
     name: Worker ${{ matrix.worker }}
+    needs: setup
     runs-on: ubuntu-latest
     timeout-minutes: 420
     strategy:
@@ -97,65 +245,29 @@ jobs:
           print("SKIP=false",file=open(os.environ["GITHUB_OUTPUT"],"a"))
           PY
 
-      - name: Install system packages
+      - name: Install ffmpeg + zstd (lightweight — no pip install here)
         if: ${{ steps.assign.outputs.SKIP != 'true' }}
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y ffmpeg python3-pip
-          python -m pip install --upgrade pip
+          sudo apt-get install -y ffmpeg zstd
 
-      - name: Install Python packages
+      - name: Download shared bundle (deps + weights + video, ek hi baar tayaar hua)
+        if: ${{ steps.assign.outputs.SKIP != 'true' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: shared-bundle-${{ inputs.job_id }}
+          path: bundle
+
+      - name: Extract shared bundle (no pip install, seedha use karo)
         if: ${{ steps.assign.outputs.SKIP != 'true' }}
         run: |
-          pip install numpy==1.26.4 opencv-python-headless==4.9.0.80 Pillow==10.4.0 tqdm==4.66.5 requests
-          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-          pip install basicsr==1.4.2 realesrgan
-
-      # ================== SAARE WORKERS: Bot ke input-video artifact ka wait ==================
-      - name: Wait for input video artifact
-        if: ${{ steps.assign.outputs.SKIP != 'true' }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
+          mkdir -p "$DEPS_DIR"
+          tar -I zstd -xf bundle/env.tar.zst -C "$DEPS_DIR"
+          tar -I zstd -xf bundle/weights.tar.zst -C "$GITHUB_WORKSPACE"
           mkdir -p worker_work
-          python - <<'PY'
-          import os, time, requests, sys, zipfile
-          repo = os.environ["GITHUB_REPOSITORY"]
-          run_id = os.environ["GITHUB_RUN_ID"]
-          token = os.environ["GH_TOKEN"]
-          headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
-          url = f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/artifacts"
-          
-          print("⏳ Bot ke input-video artifact ka wait...", flush=True)
-          max_wait = 900
-          start_time = time.time()
-          
-          while True:
-              if time.time() - start_time > max_wait:
-                  print("❌ Timeout waiting for input-video")
-                  sys.exit(1)
-              r = requests.get(url, headers=headers, timeout=30)
-              if r.status_code == 200:
-                  for a in r.json().get("artifacts", []):
-                      if a["name"] == "input-video":
-                          print("✅ Found! Downloading...")
-                          dl_url = a["archive_download_url"]
-                          with requests.get(dl_url, headers=headers, stream=True, timeout=600) as dl:
-                              dl.raise_for_status()
-                              with open("input.zip", "wb") as f:
-                                  for chunk in dl.iter_content(1024*1024):
-                                      f.write(chunk)
-                          with zipfile.ZipFile("input.zip") as z:
-                              z.extractall("temp_input")
-                          for root, dirs, files in os.walk("temp_input"):
-                              for f in files:
-                                  if f == "source":
-                                      os.rename(os.path.join(root, f), "worker_work/source")
-                                      break
-                          print("✅ worker_work/source ready")
-                          sys.exit(0)
-              time.sleep(10)
-          PY
+          cp bundle/shared_source_video worker_work/source
+          echo "$DEPS_DIR/venv/bin" >> "$GITHUB_PATH"
+          echo "✅ Shared env ready — no install needed"
 
       - name: Run worker
         if: ${{ steps.assign.outputs.SKIP != 'true' }}
@@ -229,3 +341,17 @@ jobs:
           path: final_upscaled.mp4
           retention-days: 7
           if-no-files-found: error
+
+      - name: "Telegram: job complete"
+        if: success()
+        continue-on-error: true
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.OWNER_CHAT_ID }}
+        run: |
+          if [ -n "$BOT_TOKEN" ] && [ -n "$CHAT_ID" ]; then
+            MSG="🏁 Job ${{ inputs.job_id }} complete. Manager bot ab final video Telegram par bhejega."
+            curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+              --data-urlencode chat_id="${CHAT_ID}" \
+              --data-urlencode text="${MSG}" > /dev/null || true
+          fi
