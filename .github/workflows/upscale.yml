@@ -1,176 +1,367 @@
 name: Telegram Anime Upscaler 20W
-run-name: ${{ inputs.job_id && format('TG-UPSCALE-{0}', inputs.job_id) || 'Telegram Bot' }}
+
 on:
   workflow_dispatch:
     inputs:
-      job_id: {required: false, type: string, default: ''}
-      tg_file_id: {required: false, type: string, default: ''}
-      filename: {required: false, type: string, default: 'input.mp4'}
-      model: {required: false, type: string, default: 'anime_video'}
-      scale: {required: false, type: string, default: '2'}
-      preset: {required: false, type: string, default: 'balanced'}
-      audio: {required: false, type: string, default: 'keep'}
-      colorize: {required: false, type: string, default: 'off'}
-      workers: {required: false, type: string, default: '20'}
-      start_window: {required: false, type: string, default: '420'}
+      video_url:
+        description: "Direct video URL for manual test"
+        required: true
+        type: string
+      workers:
+        description: "Workers 1-20"
+        required: false
+        default: "20"
+        type: string
+      scale:
+        description: "Upscale 2 or 4"
+        required: false
+        default: "2"
+        type: string
+      model:
+        description: "Model: anime_video / anime_image / game / real"
+        required: false
+        default: "anime_video"
+        type: string
 
 permissions:
   contents: read
+  actions: read
 
 env:
-  PYTHONUNBUFFERED: '1'
-  MAX_FRAMES: '3600'
-  START_WINDOW_SEC: '420'
+  MAX_WORKERS: 20
+  START_WINDOW_SECONDS: 420
+  PYTHONUNBUFFERED: "1"
+  OMP_NUM_THREADS: "4"
+  MKL_NUM_THREADS: "4"
 
 jobs:
-  bot:
-    if: ${{ inputs.tg_file_id == '' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 360
+
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      total_frames: ${{ steps.info.outputs.total_frames }}
+      fps: ${{ steps.info.outputs.fps }}
+      width: ${{ steps.info.outputs.width }}
+      height: ${{ steps.info.outputs.height }}
+      duration: ${{ steps.info.outputs.duration }}
+      filename: ${{ steps.info.outputs.filename }}
+      workers: ${{ steps.cfg.outputs.workers }}
+      chunk_size: ${{ steps.cfg.outputs.chunk_size }}
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: {python-version: '3.10', cache: pip}
-      - name: Install system + Python
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install FFmpeg
         run: |
-          sudo apt-get update -y
+          sudo apt-get update -qq
           sudo apt-get install -y ffmpeg
-          python -m pip install --upgrade pip setuptools wheel
-          pip install --index-url https://download.pytorch.org/whl/cpu torch==2.1.2 torchvision==0.16.2
-          pip install -r requirements.txt
-      - name: Download models for photo mode
-        run: |
-          mkdir -p weights
-          wget -q -O weights/realesr-animevideov3.pth https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-animevideov3.pth
-          wget -q -O weights/RealESRGAN_x4plus_anime_6B.pth https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth
-          wget -q -O weights/realesr-general-x4v3.pth https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth
-          wget -q -O weights/RealESRGAN_x4plus.pth https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth
-      - name: Start Telegram bot
+
+      - name: Download input
         env:
-          API_ID: ${{ secrets.API_ID }}
-          API_HASH: ${{ secrets.API_HASH }}
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          OWNER_CHAT_ID: ${{ secrets.OWNER_CHAT_ID }}
-          ARCHIVE_CHANNEL_ID: ${{ secrets.ARCHIVE_CHANNEL_ID }}
-          GH_PAT: ${{ secrets.GH_PAT }}
-          GH_REPO: ${{ github.repository }}
-          DISTRIBUTED_WORKFLOW: upscale.yml
-          MAX_WORKERS: '20'
-        run: python -u bot.py
+          VIDEO_URL: ${{ inputs.video_url }}
+        run: |
+          set -e
+          mkdir -p input
+          python - <<'PY'
+          import os,sys,urllib.request
+          url=os.environ["VIDEO_URL"].strip()
+          if not url.startswith(("http://","https://")):
+              raise SystemExit("video_url must be a direct http/https URL")
+          urllib.request.urlretrieve(url,"input/source_video")
+          size=os.path.getsize("input/source_video")
+          if size < 1024:
+              raise SystemExit("Downloaded file is too small")
+          print("Downloaded:",size,"bytes")
+          PY
+          file input/source_video
+          ffprobe -v error -show_format -show_streams -of json input/source_video > input/info.json
+
+      - name: Read video information
+        id: info
+        run: |
+          python - <<'PY'
+          import json,os,subprocess
+          data=json.load(open("input/info.json"))
+          vs=next((x for x in data["streams"] if x.get("codec_type")=="video"),None)
+          if not vs:
+              raise SystemExit("No video stream found")
+          num=int(vs.get("nb_frames") or 0)
+          if num<=0:
+              dur=float(data["format"].get("duration") or 0)
+              rate=vs.get("r_frame_rate","0/1").split("/")
+              fps=float(rate[0])/float(rate[1]) if float(rate[1]) else 0
+              num=round(dur*fps)
+          fps_text=vs.get("r_frame_rate","0/1")
+          a,b=fps_text.split("/")
+          fps=float(a)/float(b) if float(b) else 0
+          dur=float(data["format"].get("duration") or 0)
+          w=int(vs.get("width") or 0)
+          h=int(vs.get("height") or 0)
+          if num<=0 or fps<=0 or w<=0 or h<=0:
+              raise SystemExit("Could not determine valid video metadata")
+          print("frames =",num)
+          print("fps    =",fps)
+          print("size   =",w,"x",h)
+          print("duration =",dur)
+          print(f"total_frames={num}",file=open(os.environ["GITHUB_OUTPUT"],"a"))
+          print(f"fps={fps}",file=open(os.environ["GITHUB_OUTPUT"],"a"))
+          print(f"width={w}",file=open(os.environ["GITHUB_OUTPUT"],"a"))
+          print(f"height={h}",file=open(os.environ["GITHUB_OUTPUT"],"a"))
+          print(f"duration={dur}",file=open(os.environ["GITHUB_OUTPUT"],"a"))
+          print("filename=upscaled_video.mp4",file=open(os.environ["GITHUB_OUTPUT"],"a"))
+          PY
+
+      - name: Calculate workers and chunks
+        id: cfg
+        env:
+          REQUESTED_WORKERS: ${{ inputs.workers }}
+          TOTAL_FRAMES: ${{ steps.info.outputs.total_frames }}
+        run: |
+          python - <<'PY'
+          import os,math
+          requested=max(1,min(20,int(os.environ["REQUESTED_WORKERS"] or "20")))
+          frames=int(os.environ["TOTAL_FRAMES"])
+          workers=min(requested,frames)
+          chunk=math.ceil(frames/workers)
+          print("Requested workers:",requested)
+          print("Actual chunks:",workers)
+          print("Frames:",frames)
+          print("Chunk size:",chunk)
+          out=open(os.environ["GITHUB_OUTPUT"],"a")
+          print(f"workers={workers}",file=out)
+          print(f"chunk_size={chunk}",file=out)
+          out.close()
+          PY
+
+      - name: Upload source
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-video
+          path: input/source_video
+          retention-days: 1
+
+      - name: Upload metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-metadata
+          path: input/info.json
+          retention-days: 1
+
 
   worker:
-    if: ${{ inputs.tg_file_id != '' }}
+    name: Worker ${{ matrix.worker }}
+    needs: prepare
+    if: ${{ needs.prepare.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 420
     strategy:
       fail-fast: false
       max-parallel: 20
       matrix:
-        index: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 330
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: {python-version: '3.10', cache: pip}
-      - name: Install FFmpeg + Python
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y ffmpeg
-          python -m pip install --upgrade pip setuptools wheel
-          pip install --index-url https://download.pytorch.org/whl/cpu torch==2.1.2 torchvision==0.16.2
-          pip install -r requirements.txt
-      - name: Install Real-ESRGAN
-        run: |
-          git clone --depth 1 https://github.com/xinntao/Real-ESRGAN.git realesrgan-src
-          cd realesrgan-src && pip install -e . --no-deps
-      - name: Download models
-        run: |
-          mkdir -p weights
-          wget -q --show-progress -O weights/realesr-animevideov3.pth https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-animevideov3.pth
-          wget -q --show-progress -O weights/RealESRGAN_x4plus_anime_6B.pth https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth
-          wget -q --show-progress -O weights/realesr-general-x4v3.pth https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth
-          wget -q --show-progress -O weights/RealESRGAN_x4plus.pth https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth
-      - name: Full throttle worker
-        env:
-          WORKER_INDEX: ${{ matrix.index }}
-          TOTAL_WORKERS: ${{ inputs.workers }}
-          TG_FILE_ID: ${{ inputs.tg_file_id }}
-          TG_BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          FILENAME: ${{ inputs.filename }}
-          MODEL_KEY: ${{ inputs.model }}
-          SCALE: ${{ inputs.scale }}
-          PRESET: ${{ inputs.preset }}
-          AUDIO_MODE: ${{ inputs.audio }}
-          COLORIZE_MODE: ${{ inputs.colorize }}
-          JOB_ID: ${{ inputs.job_id }}
-          START_WINDOW_SEC: ${{ inputs.start_window }}
-        run: python -u distributed_worker.py
-      - name: Upload worker chunk
-        if: ${{ success() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: worker-${{ matrix.index }}-${{ inputs.job_id }}
-          path: worker_output/*
-          if-no-files-found: error
-          retention-days: 1
+        worker: ${{ fromJSON(format('[{0}]', join(',', range(0, 20)))) }}
 
-  collect:
-    if: ${{ always() && inputs.tg_file_id != '' }}
-    needs: worker
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    env:
+      WORKER_ID: ${{ matrix.worker }}
+      TOTAL_WORKERS: ${{ needs.prepare.outputs.workers }}
+      TOTAL_FRAMES: ${{ needs.prepare.outputs.total_frames }}
+      FPS: ${{ needs.prepare.outputs.fps }}
+      SCALE: ${{ inputs.scale }}
+      MODEL: ${{ inputs.model }}
+      START_WINDOW_SECONDS: 420
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: {python-version: '3.10'}
-      - name: Install FFmpeg
-        run: sudo apt-get update -y && sudo apt-get install -y ffmpeg
-      - name: Download worker chunks
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check worker assignment
+        id: assign
+        run: |
+          python - <<'PY'
+          import os,math
+          wid=int(os.environ["WORKER_ID"])
+          workers=int(os.environ["TOTAL_WORKERS"])
+          total=int(os.environ["TOTAL_FRAMES"])
+          if wid>=workers:
+              print("SKIP=true",file=open(os.environ["GITHUB_OUTPUT"],"a"))
+              print(f"Worker {wid} is not required; only {workers} workers needed.")
+              raise SystemExit(0)
+          start=(total*wid)//workers
+          end=(total*(wid+1))//workers-1
+          count=end-start+1
+          out=open(os.environ["GITHUB_OUTPUT"],"a")
+          print("SKIP=false",file=out)
+          print(f"FRAME_START={start}",file=out)
+          print(f"FRAME_END={end}",file=out)
+          print(f"FRAME_COUNT={count}",file=out)
+          out.close()
+          print(f"Worker {wid}: frames {start}-{end} ({count} frames)")
+          PY
+
+      - name: Stop unused matrix entries
+        if: ${{ steps.assign.outputs.SKIP == 'true' }}
+        run: echo "Unused worker slot"
+
+      - name: Install system packages
+        if: ${{ steps.assign.outputs.SKIP != 'true' }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg python3-pip
+          python -m pip install --upgrade pip
+
+      - name: Install Python packages
+        if: ${{ steps.assign.outputs.SKIP != 'true' }}
+        run: |
+          pip install numpy==1.26.4 opencv-python-headless==4.9.0.80 Pillow==10.4.0 tqdm==4.66.5
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install basicsr==1.4.2 realesrgan
+
+      - name: Download source
+        if: ${{ steps.assign.outputs.SKIP != 'true' }}
         uses: actions/download-artifact@v4
         with:
-          pattern: worker-*-${{ inputs.job_id }}
-          path: chunks
-          merge-multiple: true
-      - name: Verify and assemble
-        env:
-          TG_FILE_ID: ${{ inputs.tg_file_id }}
-          TG_BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          FILENAME: ${{ inputs.filename }}
-          JOB_ID: ${{ inputs.job_id }}
-          SCALE: ${{ inputs.scale }}
-          PRESET: ${{ inputs.preset }}
-          AUDIO_MODE: ${{ inputs.audio }}
+          name: source-video
+          path: input
+
+      - name: Run worker
+        if: ${{ steps.assign.outputs.SKIP != 'true' }}
         run: |
-          set -euo pipefail
-          test "$(find chunks -name 'worker_*.mp4' | wc -l)" -eq 20
-          mkdir -p final source
+          mkdir -p worker_output
+          python distributed_worker.py \
+            --input input/source_video \
+            --output worker_output \
+            --worker-id "${WORKER_ID}" \
+            --workers "${TOTAL_WORKERS}" \
+            --total-frames "${TOTAL_FRAMES}" \
+            --fps "${FPS}" \
+            --scale "${SCALE}" \
+            --model "${MODEL}" \
+            --frame-start "${{ steps.assign.outputs.FRAME_START }}" \
+            --frame-end "${{ steps.assign.outputs.FRAME_END }}"
+
+      - name: Validate worker
+        if: ${{ steps.assign.outputs.SKIP != 'true' }}
+        run: |
           python - <<'PY'
-          import json,glob,os,sys
-          ms=[]
-          for p in glob.glob('chunks/worker_*.json'):
-              ms.append(json.load(open(p)))
-          ms.sort(key=lambda x:x['worker'])
-          if len(ms)!=20 or any(m['worker']!=i for i,m in enumerate(ms)): raise SystemExit('missing worker manifest')
-          last=-1
-          for m in ms:
-              if m['start']!=last+1 or m['end']<m['start'] or m['frames']!=m['end']-m['start']+1: raise SystemExit('invalid frame partition')
-              last=m['end']
-          open('final/concat.txt','w').write('\n'.join("file '"+os.path.abspath(f"chunks/worker_{i:02d}.mp4")+"'" for i in range(20))+'\n')
+          import os,glob
+          s=int("${{ steps.assign.outputs.FRAME_START }}")
+          e=int("${{ steps.assign.outputs.FRAME_END }}")
+          files=sorted(glob.glob("worker_output/frame_*.png"))
+          expected=e-s+1
+          if len(files)!=expected:
+              raise SystemExit(f"Worker produced {len(files)} frames, expected {expected}")
+          print("Worker output valid:",len(files))
           PY
-          curl -fsS "https://api.telegram.org/bot${TG_BOT_TOKEN}/getFile?file_id=${TG_FILE_ID}" -o source/meta.json
-          FP=$(python -c "import json;print(json.load(open('source/meta.json'))['result']['file_path'])")
-          curl -fsSL "https://api.telegram.org/file/bot${TG_BOT_TOKEN}/${FP}" -o source/input
-          ffmpeg -y -v error -f concat -safe 0 -i final/concat.txt -c copy final/video.mp4
-          if ffprobe -v error -select_streams a:0 -show_entries stream=index -of csv=p=0 source/input >/dev/null 2>&1; then
-            ffmpeg -y -v error -i final/video.mp4 -i source/input -map 0:v:0 -map 1:a? -c:v copy -c:a copy -shortest -movflags +faststart "final/${FILENAME%.*}_upscaled.mp4"
-          else
-            cp final/video.mp4 "final/${FILENAME%.*}_upscaled.mp4"
-          fi
-          rm -f final/concat.txt final/video.mp4
-          ls -lh final
+
+      - name: Upload worker artifact
+        if: ${{ steps.assign.outputs.SKIP != 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: worker-${{ matrix.worker }}
+          path: worker_output
+          retention-days: 1
+          if-no-files-found: error
+
+
+  collect:
+    name: Collect and Build
+    needs: [prepare,worker]
+    if: ${{ always() && needs.prepare.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg
+
+      - name: Download source
+        uses: actions/download-artifact@v4
+        with:
+          name: source-video
+          path: input
+
+      - name: Download all worker outputs
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: worker-*
+          path: workers
+          merge-multiple: false
+
+      - name: Validate all workers
+        env:
+          TOTAL_FRAMES: ${{ needs.prepare.outputs.total_frames }}
+          WORKERS: ${{ needs.prepare.outputs.workers }}
+        run: |
+          python - <<'PY'
+          import os,glob
+          total=int(os.environ["TOTAL_FRAMES"])
+          workers=int(os.environ["WORKERS"])
+          found=[]
+          for w in range(workers):
+              p=f"workers/worker-{w}"
+              files=glob.glob(p+"/frame_*.png")
+              found.append((w,len(files)))
+          print("Worker results:",found)
+          if any(n<=0 for _,n in found):
+              raise SystemExit("One or more required workers produced no frames")
+          total_found=sum(n for _,n in found)
+          if total_found!=total:
+              raise SystemExit(f"Frame mismatch: got {total_found}, expected {total}")
+          PY
+
+      - name: Merge frames
+        env:
+          FPS: ${{ needs.prepare.outputs.fps }}
+          TOTAL_FRAMES: ${{ needs.prepare.outputs.total_frames }}
+        run: |
+          mkdir -p final_frames
+          python - <<'PY'
+          import os,glob,shutil
+          total=int(os.environ["TOTAL_FRAMES"])
+          dst="final_frames"
+          n=0
+          for w in range(20):
+              files=sorted(glob.glob(f"workers/worker-{w}/frame_*.png"))
+              for src in files:
+                  out=f"{dst}/frame_{n:08d}.png"
+                  shutil.copy2(src,out)
+                  n+=1
+          if n!=total:
+              raise SystemExit(f"Merge mismatch {n}/{total}")
+          print("Merged",n,"frames")
+          PY
+
+      - name: Encode final video
+        env:
+          FPS: ${{ needs.prepare.outputs.fps }}
+        run: |
+          ffmpeg -y -framerate "$FPS" \
+            -i final_frames/frame_%08d.png \
+            -c:v libx264 -preset veryfast -crf 18 \
+            -pix_fmt yuv420p \
+            output_upscaled.mp4
+
+      - name: Restore original audio
+        run: |
+          ffmpeg -y \
+            -i output_upscaled.mp4 \
+            -i input/source_video \
+            -map 0:v:0 -map 1:a? \
+            -c:v copy -c:a aac -b:a 192k \
+            -shortest final_upscaled.mp4
+
       - name: Upload final
         uses: actions/upload-artifact@v4
         with:
-          name: final-${{ inputs.job_id }}
-          path: final/*
+          name: final-upscaled-video
+          path: final_upscaled.mp4
+          retention-days: 7
           if-no-files-found: error
-          retention-days: 1
