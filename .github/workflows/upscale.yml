@@ -146,27 +146,27 @@ jobs:
           mkdir -p worker_work
           source "$DEPS_DIR/venv/bin/activate"
           python - <<'PY'
-          import os, asyncio
+          import os
           from pyrogram import Client
-          
+
           bot_token = os.environ.get("BOT_TOKEN")
           api_id = os.environ.get("API_ID")
           api_hash = os.environ.get("API_HASH")
           chat_id = int(os.environ.get("CHAT_ID"))
           msg_id = int(os.environ.get("MESSAGE_ID"))
-          
+
           app = Client("gh_session", bot_token=bot_token, api_id=api_id, api_hash=api_hash, in_memory=True)
-          
-          async def dl():
-              await app.start()
-              print("⬇️ Fetching message from Telegram...", flush=True)
-              msg = await app.get_messages(chat_id, msg_id)
-              print("⬇️ Downloading video...", flush=True)
-              await app.download_media(msg, file_name="worker_work/source")
-              await app.stop()
-              print("✅ Download complete!")
-          
-          asyncio.run(dl())
+
+          async def main():
+              async with app:
+                  print("⬇️ Fetching message from Telegram...", flush=True)
+                  msg = await app.get_messages(chat_id, msg_id)
+                  print("⬇️ Downloading video...", flush=True)
+                  await app.download_media(msg, file_name="worker_work/source")
+                  print("✅ Download complete!")
+
+          # Pyrogram ka sabse safe tarika asyncio conflict se bachne ke liye
+          app.run(main())
           PY
 
       - name: Package shared bundle (venv + weights + video)
