@@ -4,83 +4,59 @@ on:
   workflow_dispatch:
     inputs:
       job_id:
-        description: "Unique Job ID (e.g., manual-test-01)"
+        description: "Unique Job ID"
+        required: true
+        default: "manual-001"
+        type: string
+      tg_file_id:
+        description: "Telegram File ID (bot se milega)"
         required: true
         type: string
-        default: "manual-test-001"
       filename:
-        description: "Output Filename"
+        description: "Output filename"
         required: true
+        default: "output.mp4"
         type: string
-        default: "upscaled_output.mp4"
       model:
-        description: "Model Selection"
+        description: "Model"
         required: true
         type: choice
-        options:
-          - anime_video
-          - anime_image
-          - game
-          - real
-        default: "anime_video"
+        options: [anime_video, anime_image, game, real]
+        default: anime_video
       scale:
-        description: "Upscale Scale"
+        description: "Scale"
         required: true
         type: choice
-        options:
-          - "2"
-          - "4"
+        options: ["2", "4"]
         default: "2"
       preset:
-        description: "Quality Preset (balanced = Medium)"
+        description: "Preset (balanced = Medium)"
         required: true
         type: choice
-        options:
-          - fast
-          - balanced
-          - best
-        default: "balanced"
+        options: [fast, balanced, best]
+        default: balanced
       audio:
-        description: "Audio Mode"
+        description: "Audio"
         required: true
         type: choice
-        options:
-          - keep
-          - compress
-          - remove
-        default: "keep"
+        options: [keep, compress, remove]
+        default: keep
       colorize:
-        description: "Colorize Mode"
+        description: "Colorize"
         required: true
         type: choice
-        options:
-          - "off"
-          - "fast"
-          - "high"
+        options: ["off", "fast", "high"]
         default: "off"
       workers:
-        description: "Number of Workers"
+        description: "Workers"
         required: true
         type: choice
-        options:
-          - "1"
-          - "2"
-          - "4"
-          - "8"
-          - "10"
-          - "12"
-          - "15"
-          - "20"
+        options: ["1","2","4","8","10","12","15","20"]
         default: "20"
-      start_window:
-        description: "Startup window (seconds)"
-        required: true
-        type: string
-        default: "420"
 
 permissions:
   contents: read
-  actions: read
+  actions: write
 
 env:
   MAX_WORKERS: 20
@@ -97,10 +73,7 @@ jobs:
       fail-fast: false
       max-parallel: 20
       matrix:
-        # ===== YAHAN FIX KIYA GAYA HAI =====
-        worker: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
-        # ===================================
-
+        worker: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
     env:
       WORKER_INDEX: ${{ matrix.worker }}
       TOTAL_WORKERS: ${{ inputs.workers }}
@@ -110,6 +83,8 @@ jobs:
       SCALE: ${{ inputs.scale }}
       PRESET: ${{ inputs.preset }}
       MAX_FRAMES: "3600"
+      TG_FILE_ID: ${{ inputs.tg_file_id }}
+      TG_BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
 
     steps:
       - name: Checkout
@@ -142,50 +117,78 @@ jobs:
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
           pip install basicsr==1.4.2 realesrgan
 
-      - name: Wait for input video artifact
-        if: ${{ steps.assign.outputs.SKIP != 'true' }}
+      # ================== WORKER 0: Telegram se video lega ==================
+      - name: Worker 0 - Download from Telegram
+        if: ${{ matrix.worker == 0 && steps.assign.outputs.SKIP != 'true' }}
+        run: |
+          mkdir -p worker_work
+          python - <<'PY'
+          import os, requests
+          file_id = os.environ["TG_FILE_ID"]
+          token = os.environ["TG_BOT_TOKEN"]
+          r = requests.get(f"https://api.telegram.org/bot{token}/getFile",
+                           params={"file_id": file_id}, timeout=30)
+          r.raise_for_status()
+          file_path = r.json()["result"]["file_path"]
+          url = f"https://api.telegram.org/file/bot{token}/{file_path}"
+          with requests.get(url, stream=True, timeout=600) as q:
+              q.raise_for_status()
+              with open("worker_work/source", "wb") as f:
+                  for c in q.iter_content(1024*1024):
+                      if c: f.write(c)
+          print("Downloaded", os.path.getsize("worker_work/source"), "bytes")
+          PY
+
+      - name: Worker 0 - Upload input-video artifact (baaki workers ke liye)
+        if: ${{ matrix.worker == 0 && steps.assign.outputs.SKIP != 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: input-video
+          path: worker_work/source
+          retention-days: 1
+
+      # ================== WORKERS 1-19: Worker 0 ka wait ==================
+      - name: Worker 1-19 - Wait for input-video artifact
+        if: ${{ matrix.worker != 0 && steps.assign.outputs.SKIP != 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          mkdir -p worker_work
           python - <<'PY'
-          import os, time, requests, sys, zipfile, shutil
+          import os, time, requests, sys, zipfile
           repo = os.environ["GITHUB_REPOSITORY"]
           run_id = os.environ["GITHUB_RUN_ID"]
           token = os.environ["GH_TOKEN"]
           headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
           url = f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/artifacts"
           
-          print("⏳ Waiting for input-video artifact...")
-          max_wait = 600
+          print("⏳ Worker 0 ke input-video artifact ka wait...", flush=True)
+          max_wait = 900
           start_time = time.time()
           
           while True:
               if time.time() - start_time > max_wait:
-                  print("❌ Timeout waiting for input-video artifact!")
+                  print("❌ Timeout waiting for input-video")
                   sys.exit(1)
-                  
               r = requests.get(url, headers=headers, timeout=30)
               if r.status_code == 200:
-                  arts = r.json().get("artifacts", [])
-                  for a in arts:
+                  for a in r.json().get("artifacts", []):
                       if a["name"] == "input-video":
-                          print("✅ Artifact found! Downloading...")
+                          print("✅ Found! Downloading...")
                           dl_url = a["archive_download_url"]
-                          with requests.get(dl_url, headers=headers, stream=True, timeout=120) as dl:
+                          with requests.get(dl_url, headers=headers, stream=True, timeout=600) as dl:
                               dl.raise_for_status()
-                              with open("input_video.zip", "wb") as f:
+                              with open("input.zip", "wb") as f:
                                   for chunk in dl.iter_content(1024*1024):
                                       f.write(chunk)
-                          print("✅ Downloaded. Extracting...")
-                          with zipfile.ZipFile("input_video.zip", "r") as z:
+                          with zipfile.ZipFile("input.zip") as z:
                               z.extractall("temp_input")
-                          os.makedirs("worker_work", exist_ok=True)
                           for root, dirs, files in os.walk("temp_input"):
                               for f in files:
-                                  if f == "source_video" or f.endswith(".mp4"):
-                                      shutil.move(os.path.join(root, f), "worker_work/source")
+                                  if f == "source":
+                                      os.rename(os.path.join(root, f), "worker_work/source")
                                       break
-                          print("✅ Extracted and placed at worker_work/source")
+                          print("✅ worker_work/source ready")
                           sys.exit(0)
               time.sleep(10)
           PY
@@ -233,7 +236,7 @@ jobs:
           path: workers
           merge-multiple: false
 
-      - name: Merge video chunks using FFmpeg
+      - name: Merge video chunks
         env:
           WORKERS: ${{ inputs.workers }}
         run: |
@@ -246,16 +249,13 @@ jobs:
 
       - name: Restore original audio
         run: |
-          if [ -f input/source_video ]; then
-            SOURCE=input/source_video
+          if [ -f input/source ]; then
+            SOURCE=input/source
           else
-            SOURCE=$(find input -name "*.mp4" | head -n 1)
+            SOURCE=$(find input -type f | head -n 1)
           fi
-          ffmpeg -y \
-            -i output_no_audio.mp4 \
-            -i "$SOURCE" \
-            -map 0:v:0 -map 1:a? \
-            -c:v copy -c:a aac -b:a 192k \
+          ffmpeg -y -i output_no_audio.mp4 -i "$SOURCE" \
+            -map 0:v:0 -map 1:a? -c:v copy -c:a aac -b:a 192k \
             -shortest final_upscaled.mp4
 
       - name: Upload final
