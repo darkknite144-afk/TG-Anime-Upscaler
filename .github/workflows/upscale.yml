@@ -22,9 +22,8 @@ on:
       scale:
         description: "Scale"
         required: true
-        type: choice
-        options: ["2", "4"]
-        default: "2"
+        type: string
+        default: "2.0"
       preset:
         description: "Preset (balanced = Medium)"
         required: true
@@ -46,8 +45,7 @@ on:
       workers:
         description: "Workers"
         required: true
-        type: choice
-        options: ["1","2","4","8","10","12","15","20"]
+        type: string
         default: "20"
 
 permissions:
