@@ -1233,30 +1233,31 @@ async def _ensure_queue_loop():
 # ================= QUEUE PROCESSOR (DISTRIBUTED) =================
 async def _dispatch_distributed(job_id: str, message: Message, filename: str, cfg: Dict[str,Any], status_msg: Message):
     if not GH_PAT or not GH_REPO: raise RuntimeError("GH_PAT/GH_REPO missing")
+    import zipfile
     
-    # 1. Download Telegram file to manager's own filesystem
-    media = message.video or message.document or message.animation
-    file_id = getattr(media, "file_id", None)
-    if not file_id: raise RuntimeError("Telegram file_id missing")
+    # Strict Validation
+    safe_scale = str(int(float(cfg["scale"])))
+    if safe_scale not in ["2", "4"]: safe_scale = "2" 
+        
+    safe_workers = str(DISTRIBUTED_MAX_WORKERS)
+    if safe_workers not in ["1", "2", "4", "8", "10", "12", "15", "20"]: safe_workers = "20"
     
-    temp_path = WORK_DIR / f"input_{job_id}.mp4"
-    log.info("📥 Downloading video from Telegram to %s", temp_path)
-    current_job["stage"] = "📥 Download"
-    await app.download_media(message, file_name=str(temp_path))
-    log.info("✅ Downloaded: %s bytes", temp_path.stat().st_size)
+    current_job["stage"] = "📤 Dispatching GitHub..."
     
-    # 2. Dispatch workflow
+    # 1. Dispatch workflow (Sirf IDs bhej rahe hain, puri video nahi)
     payload = {
-        "ref": "main",
+        "ref": "main", # Ya 'master' agar aapki branch ka naam master hai
         "inputs": {
             "job_id": job_id,
             "filename": filename,
             "model": normalize_model_key(cfg["model"]),
-            "scale": str(int(float(cfg["scale"]))),
+            "scale": safe_scale,
             "preset": cfg["preset"],
             "audio": cfg["audio"],
             "colorize": normalize_colorize(cfg["colorize_mode"]),
-            "workers": str(DISTRIBUTED_MAX_WORKERS)
+            "workers": safe_workers,
+            "chat_id": str(message.chat.id),
+            "message_id": str(message.id)
         }
     }
     hdr = {"Authorization": f"Bearer {GH_PAT}", "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
@@ -1266,7 +1267,7 @@ async def _dispatch_distributed(job_id: str, message: Message, filename: str, cf
     r.raise_for_status()
     log.info("Workflow dispatched. Waiting for run ID...")
     
-    # 3. Find run ID
+    # 2. Find run ID
     t0 = time.time()
     run = None
     while time.time() - t0 < 60:
@@ -1282,26 +1283,7 @@ async def _dispatch_distributed(job_id: str, message: Message, filename: str, cf
     rid = run["id"]
     log.info("Run ID: %s", rid)
     
-    # 4. Create zip and upload as artifact
-    import zipfile
-    zip_path = WORK_DIR / f"input_{job_id}.zip"
-    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
-        z.write(temp_path, "source_video.mp4")
-    
-    upload_url = f"{api}/actions/runs/{rid}/artifacts"
-    upload_hdr = {
-        "Authorization": f"Bearer {GH_PAT}",
-        "Accept": "application/vnd.github+json",
-        "Content-Type": "application/zip"
-    }
-    log.info("⬆️ Uploading artifact...")
-    current_job["stage"] = "⬆️ Upload"
-    with open(zip_path, "rb") as f:
-        upload_res = await asyncio.to_thread(requests.post, upload_url, headers=upload_hdr, data=f, timeout=300)
-    upload_res.raise_for_status()
-    log.info("✅ Artifact uploaded: %s", upload_res.status_code)
-    
-    # 5. Monitor run
+    # 3. Monitor run aur output wapas lana
     current_job["stage"] = "⚡ 20W START"
     current_job["total"] = 100
     current_job["done"] = 0
@@ -1362,11 +1344,8 @@ async def _dispatch_distributed(job_id: str, message: Message, filename: str, cf
             if not out:
                 raise RuntimeError("Final video missing")
             
-            # Cleanup manager temp files
-            temp_path.unlink(missing_ok=True)
-            zip_path.unlink(missing_ok=True)
+            # Cleanup final zip
             z.unlink(missing_ok=True)
-            
             return out, time.time() - t0
         await asyncio.sleep(8)
 
@@ -1390,7 +1369,7 @@ async def _queue_loop():
         try:
             await status_msg.edit_text(
                 f"📤 **Manager 20 workers ko call kar raha hai...** `{filename}`\n"
-                f"⏳ Video download + upload hoga, phir workers shuru karenge"
+                f"⏳ Workers seedha Telegram se video download karenge"
             )
             out, elapsed = await _dispatch_distributed(jid, message, filename, cfg, status_msg)
             size = out.stat().st_size / 1048576
