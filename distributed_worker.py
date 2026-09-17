@@ -63,14 +63,12 @@ def model(key):
     if not path.is_file():
         raise RuntimeError('missing model ' + str(path))
 
-    # 🧠 SMART AUTO-DETECT LOGIC (Fixed Size Mismatch)
+    # 🧠 SMART AUTO-DETECT LOGIC
     if arch == 'srvgg':
-        # Anime video model uses 16 layers, General uses 32
         nc = 16 if 'anime' in f.lower() else 32
         net = SRVGGNetCompact(num_in_ch=3, num_out_ch=3, num_feat=64,
                               num_conv=nc, upscale=4, act_type='prelu')
     else:
-        # Anime image model uses 6 blocks, General RRDB uses 23
         nb = 6 if '6b' in f.lower() else 23
         net = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64,
                       num_block=nb, num_grow_ch=32, scale=4)
@@ -102,7 +100,6 @@ def main():
 
     print(f'WORKER {idx+1}/{workers} | CPU {CPU} | full throttle', flush=True)
 
-    # ===== NAYA: File already local hai (artifact se aayi), warna Telegram se lo =====
     if not src.exists():
         tg_file_id = os.environ.get('TG_FILE_ID', '').strip()
         tg_token = os.environ.get('TG_BOT_TOKEN', '').strip()
@@ -113,7 +110,6 @@ def main():
             raise RuntimeError("Source file missing and no TG_FILE_ID/TG_BOT_TOKEN")
     else:
         print(f"✅ File found locally at {src} ({src.stat().st_size} bytes). Skipping download.", flush=True)
-    # =================================================================================
 
     info = probe(src)
     total = min(info['frames'], int(os.environ.get('MAX_FRAMES', '3600')))
@@ -125,8 +121,18 @@ def main():
     count = base + (1 if idx < rem else 0)
     end = start + count - 1
 
+    # 🛡️ ANTI-CRASH FIX FOR SHORT VIDEOS
     if count <= 0:
-        raise RuntimeError(f'empty partition {idx}')
+        print(f'✅ Worker {idx} got 0 frames (short video). Exiting cleanly without error.', flush=True)
+        manifest = {
+            'worker': idx, 'workers': workers,
+            'start': start, 'end': end, 'frames': 0,
+            'fps': info['fps'], 'width': info['w'], 'height': info['h'],
+            'filename': filename, 'job_id': job,
+            'skipped': True
+        }
+        (OUT / f'worker_{idx:02d}.json').write_text(json.dumps(manifest, indent=2))
+        sys.exit(0)
 
     key = os.environ.get('MODEL_KEY', 'anime_video')
     scale = float(os.environ.get('SCALE', '2'))
