@@ -8,10 +8,6 @@ on:
         required: true
         default: "manual-001"
         type: string
-      tg_file_id:
-        description: "Telegram File ID (bot se milega)"
-        required: true
-        type: string
       filename:
         description: "Output filename"
         required: true
@@ -56,7 +52,7 @@ on:
 
 permissions:
   contents: read
-  actions: write
+  actions: read
 
 env:
   MAX_WORKERS: 20
@@ -83,8 +79,6 @@ jobs:
       SCALE: ${{ inputs.scale }}
       PRESET: ${{ inputs.preset }}
       MAX_FRAMES: "3600"
-      TG_FILE_ID: ${{ inputs.tg_file_id }}
-      TG_BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
 
     steps:
       - name: Checkout
@@ -117,39 +111,9 @@ jobs:
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
           pip install basicsr==1.4.2 realesrgan
 
-      # ================== WORKER 0: Telegram se video lega ==================
-      - name: Worker 0 - Download from Telegram
-        if: ${{ matrix.worker == 0 && steps.assign.outputs.SKIP != 'true' }}
-        run: |
-          mkdir -p worker_work
-          python - <<'PY'
-          import os, requests
-          file_id = os.environ["TG_FILE_ID"]
-          token = os.environ["TG_BOT_TOKEN"]
-          r = requests.get(f"https://api.telegram.org/bot{token}/getFile",
-                           params={"file_id": file_id}, timeout=30)
-          r.raise_for_status()
-          file_path = r.json()["result"]["file_path"]
-          url = f"https://api.telegram.org/file/bot{token}/{file_path}"
-          with requests.get(url, stream=True, timeout=600) as q:
-              q.raise_for_status()
-              with open("worker_work/source", "wb") as f:
-                  for c in q.iter_content(1024*1024):
-                      if c: f.write(c)
-          print("Downloaded", os.path.getsize("worker_work/source"), "bytes")
-          PY
-
-      - name: Worker 0 - Upload input-video artifact (baaki workers ke liye)
-        if: ${{ matrix.worker == 0 && steps.assign.outputs.SKIP != 'true' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: input-video
-          path: worker_work/source
-          retention-days: 1
-
-      # ================== WORKERS 1-19: Worker 0 ka wait ==================
-      - name: Worker 1-19 - Wait for input-video artifact
-        if: ${{ matrix.worker != 0 && steps.assign.outputs.SKIP != 'true' }}
+      # ================== SAARE WORKERS: Bot ke input-video artifact ka wait ==================
+      - name: Wait for input video artifact
+        if: ${{ steps.assign.outputs.SKIP != 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -162,7 +126,7 @@ jobs:
           headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
           url = f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/artifacts"
           
-          print("⏳ Worker 0 ke input-video artifact ka wait...", flush=True)
+          print("⏳ Bot ke input-video artifact ka wait...", flush=True)
           max_wait = 900
           start_time = time.time()
           
