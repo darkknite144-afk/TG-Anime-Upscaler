@@ -341,8 +341,8 @@ jobs:
               cp output_no_audio.mp4 final_4x.mp4
             fi
             
-            # 2. 1080p DOWNSCALE BANAYO (Chat ke liye)
-            ffmpeg -y -i final_4x.mp4 -vf "scale=-2:1080" -c:v libx264 -preset veryfast -crf 22 -c:a copy final_1080p.mp4
+            # 2. 1080p DOWNSCALE BANAYO (Chat ke liye) - EXTREME PREMIUM QUALITY (Lossless Lanczos)
+            ffmpeg -y -i final_4x.mp4 -vf "scale=-2:1080:flags=lanczos" -c:v libx264 -preset slow -crf 12 -c:a copy final_1080p.mp4
             
           else
             # NORMAL 4X ONLY
