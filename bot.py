@@ -8,6 +8,7 @@ Smart Anime/Game/Real Upscaler v11.0 — SERVER STABLE PIPELINE
   - ✅ Milestone-based status updates (anti-flood)
   - ✅ GitHub Actions optimized (No global torch thread shifting during jobs)
   - ✅ MANAGER MODE: File system alag (manager_work/) — workers se separate
+  - 🔥 FPS BOOST (60 FPS) + DUAL DELIVERY (1080p Chat & 4x Archive) INTEGRATED
 """
 import asyncio, concurrent.futures, gc, json, logging, math, os, queue, random, shutil, subprocess, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor
@@ -53,6 +54,11 @@ try:
     OWNER_CHAT_ID_INT = int(_raw_owner)
 except ValueError:
     OWNER_CHAT_ID_INT = 0
+
+try:
+    ARCHIVE_CHAT_ID = int((os.getenv("ARCHIVE_CHANNEL_ID", "") or "").strip())
+except ValueError:
+    ARCHIVE_CHAT_ID = None
 
 def is_owner(chat_id) -> bool:
     return chat_id == OWNER_CHAT_ID_INT or str(chat_id) == OWNER_CHAT_ID
@@ -142,8 +148,10 @@ def _build_core_profiles():
 CORE_PROFILES = _build_core_profiles()
 CORE_MAP = {p[0]: p for p in CORE_PROFILES}
 
+# 🔥 NAYI SETTINGS ADD KI GAYI HAIN (fps_boost aur delivery)
 settings = {"scale": 2.0, "preset": "balanced", "audio": "keep",
-            "model": "anime_video", "core": "auto", "colorize_mode": "off"}
+            "model": "game", "core": "auto", "colorize_mode": "off",
+            "fps_boost": "off", "delivery": "dual"}
 job_state = {"active": False}
 current_job: Optional[Dict[str, Any]] = None
 cancel_event: Optional[threading.Event] = None
@@ -434,6 +442,10 @@ def _color_label() -> str:
     return {"off": "🎨 OFF", "fast": "🎨 Fast", "high": "💎 High"}.get(settings["colorize_mode"], "🎨 OFF")
 
 def panel_kb() -> InlineKeyboardMarkup:
+    # Naye Labels Delivery aur FPS ke liye
+    fps_lbl = "🎞️ 60 FPS ⚡" if settings.get("fps_boost") == "60" else "🎞️ FPS: Orig"
+    del_lbl = "📦 Dual(1080p+4x)" if settings.get("delivery") == "dual" else "📦 4x Only"
+    
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("😊", callback_data="b:mood"),
          InlineKeyboardButton(_model_label(), callback_data="b:mmenu"),
@@ -442,7 +454,9 @@ def panel_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton(f"🔊 {settings['audio'].title()}", callback_data="b:amenu"),
          InlineKeyboardButton(_color_label(), callback_data="b:colormenu")],
         [InlineKeyboardButton(_core_label(), callback_data="b:cmenu"),
-         InlineKeyboardButton("📊 Stats", callback_data="b:stats"),
+         InlineKeyboardButton(fps_lbl, callback_data="b:fps"),
+         InlineKeyboardButton(del_lbl, callback_data="b:delivery")],
+        [InlineKeyboardButton("📊 Stats", callback_data="b:stats"),
          InlineKeyboardButton("🧭 Help", callback_data="b:help")],
         [InlineKeyboardButton("🎥 Video", callback_data="b:sendv"),
          InlineKeyboardButton("🖼 Photo", callback_data="b:sendp"),
@@ -514,6 +528,7 @@ def panel_text() -> str:
              _pad(f"{m['label']} {fmt_scale(settings['scale'])}× "
                   f"{settings['preset'][:4]} 🔊{settings['audio'][:4]}"),
              _pad(f"{_color_label()} • ⚙️ {_core_label()}"),
+             _pad(f"🎞️ FPS: {settings['fps_boost'].upper()} • 📦 Dlvry: {settings['delivery'].upper()}"),
              _pad("")]
     if job_state.get("active") and current_job:
         j = current_job
@@ -615,6 +630,17 @@ async def btn(client, cq):
         elif a == "cmenu": kb = core_kb(); await cq.answer("⚙️ Cores chuno")
     elif a == "back":
         _panel_mode = "main"; kb = panel_kb(); await cq.answer("🔙")
+    
+    # 🔥 FPS aur Delivery ke naye buttons ka logic
+    elif a == "fps":
+        settings["fps_boost"] = "60" if settings.get("fps_boost") == "off" else "off"
+        if archive: archive.state["fps_boost"] = settings["fps_boost"]
+        _panel_mode = "main"; kb = panel_kb(); await cq.answer(f"FPS Boost: {settings['fps_boost']}")
+    elif a == "delivery":
+        settings["delivery"] = "dual" if settings.get("delivery") == "4x" else "4x"
+        if archive: archive.state["delivery"] = settings["delivery"]
+        _panel_mode = "main"; kb = panel_kb(); await cq.answer(f"Delivery: {settings['delivery']}")
+        
     elif a == "m":
         if v in MODELS:
             settings["model"] = v
@@ -1244,9 +1270,9 @@ async def _dispatch_distributed(job_id: str, message: Message, filename: str, cf
     
     current_job["stage"] = "📤 Dispatching GitHub..."
     
-    # 1. Dispatch workflow (Sirf IDs bhej rahe hain, puri video nahi)
+    # 🔥 PAYLOAD: fps_boost aur delivery yahan add kiye gaye hain
     payload = {
-        "ref": "main", # Ya 'master' agar aapki branch ka naam master hai
+        "ref": "main",
         "inputs": {
             "job_id": job_id,
             "filename": filename,
@@ -1257,7 +1283,9 @@ async def _dispatch_distributed(job_id: str, message: Message, filename: str, cf
             "colorize": normalize_colorize(cfg["colorize_mode"]),
             "workers": safe_workers,
             "chat_id": str(message.chat.id),
-            "message_id": str(message.id)
+            "message_id": str(message.id),
+            "fps_boost": cfg.get("fps_boost", "off"),
+            "delivery": cfg.get("delivery", "dual")
         }
     }
     hdr = {"Authorization": f"Bearer {GH_PAT}", "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
@@ -1340,13 +1368,10 @@ async def _dispatch_distributed(job_id: str, message: Message, filename: str, cf
                         if c: f.write(c)
             with zipfile.ZipFile(z) as zz:
                 zz.extractall(outdir)
-            out = next(outdir.glob("*.mp4"), None)
-            if not out:
-                raise RuntimeError("Final video missing")
             
-            # Cleanup final zip
+            # 🔥 Zip directly return karna hoga taaki Dual Files check ki ja sakein
             z.unlink(missing_ok=True)
-            return out, time.time() - t0
+            return outdir, time.time() - t0
         await asyncio.sleep(8)
 
 async def _queue_loop():
@@ -1371,29 +1396,63 @@ async def _queue_loop():
                 f"📤 **Manager 20 workers ko call kar raha hai...** `{filename}`\n"
                 f"⏳ Workers seedha Telegram se video download karenge"
             )
-            out, elapsed = await _dispatch_distributed(jid, message, filename, cfg, status_msg)
-            size = out.stat().st_size / 1048576
-            if size > MAX_SEND_MB:
-                raise RuntimeError(f"Output {size:.0f}MB exceeds limit")
+            outdir, elapsed = await _dispatch_distributed(jid, message, filename, cfg, status_msg)
             current_job["stage"] = "⬆️ upload to TG"
-            await send_with_retry(
-                lambda: app.send_video(
-                    message.chat.id, str(out),
-                    caption=f"✅ **{filename}**\n"
-                            f"🎯 {fmt_scale(float(cfg['scale']))}× • {cfg['preset']}\n"
-                            f"⚡ 20-worker distributed • ⏱ {fmt_time(elapsed)} • 📦 {size:.1f}MB",
-                    supports_streaming=True
-                ),
-                "video"
-            )
-            try:
-                await status_msg.edit_text(
-                    f"✅ **DONE!** `{filename}`\n"
-                    f"⚡ 20-worker distributed\n"
-                    f"⏱ {fmt_time(elapsed)} • 📦 {size:.1f}MB"
+            
+            # 🔥 SMART DUAL DELIVERY LOGIC 
+            file_1080p = outdir / "final_1080p.mp4"
+            file_4x = outdir / "final_4x.mp4"
+            file_upscaled = outdir / "final_upscaled.mp4"
+            
+            base_caption = (f"✅ **{filename}**\n"
+                            f"🎯 {fmt_scale(float(cfg['scale']))}× • {cfg['preset'].title()} • FPS: {cfg.get('fps_boost', 'off').upper()}\n"
+                            f"⚡ 20-worker distributed • ⏱ {fmt_time(elapsed)}")
+            
+            archive_cid = ARCHIVE_CHAT_ID if ARCHIVE_CHAT_ID else message.chat.id
+
+            if file_1080p.exists() and file_4x.exists():
+                s1 = file_1080p.stat().st_size / 1048576
+                s4 = file_4x.stat().st_size / 1048576
+                if max(s1, s4) > MAX_SEND_MB:
+                    raise RuntimeError(f"Output files too large ({s4:.0f}MB)")
+                
+                # Chat mein bhejo 1080p (Super-Sampled)
+                await send_with_retry(
+                    lambda: app.send_video(
+                        message.chat.id, str(file_1080p),
+                        caption=f"✅ **1080p Super-Sampled** (Chat)\n{base_caption} • 📦 {s1:.1f}MB",
+                        supports_streaming=True
+                    ), "video_1080p"
                 )
-            except Exception:
-                pass
+                
+                # Archive mein bhejo 4x (Master)
+                await send_with_retry(
+                    lambda: app.send_video(
+                        archive_cid, str(file_4x),
+                        caption=f"📁 **4x Master Print**\n{base_caption} • 📦 {s4:.1f}MB",
+                        supports_streaming=True
+                    ), "video_4x"
+                )
+                try: await status_msg.edit_text(f"✅ **DONE!** `{filename}`\nDelivered 1080p to Chat, 4x to Archive!")
+                except Exception: pass
+                
+            elif file_upscaled.exists():
+                s = file_upscaled.stat().st_size / 1048576
+                if s > MAX_SEND_MB:
+                    raise RuntimeError(f"Output too large ({s:.0f}MB)")
+                
+                await send_with_retry(
+                    lambda: app.send_video(
+                        message.chat.id, str(file_upscaled),
+                        caption=f"✅ **4x Final Output**\n{base_caption} • 📦 {s:.1f}MB",
+                        supports_streaming=True
+                    ), "video_upscaled"
+                )
+                try: await status_msg.edit_text(f"✅ **DONE!** `{filename}`\n⏱ {fmt_time(elapsed)}")
+                except Exception: pass
+            else:
+                raise RuntimeError("No valid output video found in GitHub artifact.")
+                
             if archive:
                 try:
                     archive.record_job(filename, float(cfg["scale"]), elapsed, True, extra=cfg)
@@ -1502,11 +1561,13 @@ async def panel_cmd(client, message: Message):
 async def reset_cmd(client, message: Message):
     if not is_owner(message.chat.id): return
     settings.update({"scale": 2.0, "preset": "balanced", "audio": "keep",
-                     "model": "anime_video", "core": "auto", "colorize_mode": "off"})
+                     "model": "game", "core": "auto", "colorize_mode": "off",
+                     "fps_boost": "off", "delivery": "dual"})
     if archive:
         try:
             archive.state.update({"scale": 2.0, "preset": "balanced", "audio": "keep",
-                                  "model": "anime_video", "core": "auto", "colorize_mode": "off"})
+                                  "model": "game", "core": "auto", "colorize_mode": "off",
+                                  "fps_boost": "off", "delivery": "dual"})
             await archive.save_state()
         except Exception: pass
     await message.reply_text("🔄 Reset to defaults!")
@@ -1576,7 +1637,7 @@ def notify_owner_startup():
     try:
         r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                           json={"chat_id": OWNER_CHAT_ID_INT or OWNER_CHAT_ID,
-                                "text": "✅ Upscaler v11.0 online!\n✅ tick message + LIVE progress + batch queue."},
+                                "text": "✅ Upscaler v11.0 online!\n✅ Dual Output + 60 FPS Ready."},
                           timeout=15)
         log.info("Startup ping: %s", r.status_code)
     except Exception as e:
@@ -1613,6 +1674,8 @@ async def _boot():
             settings["model"]  = normalize_model_key(st.get("model", settings["model"]))
             settings["core"]   = st.get("core", settings["core"])
             settings["colorize_mode"] = normalize_colorize(st.get("colorize_mode", settings["colorize_mode"]))
+            settings["fps_boost"]  = st.get("fps_boost", settings["fps_boost"])
+            settings["delivery"]  = st.get("delivery", settings["delivery"])
             log.info("📚 Archive settings (normalized): %s", settings)
     except Exception as e:
         log.warning("Archive boot fail: %s", e)
