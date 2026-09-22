@@ -63,7 +63,6 @@ def model(key):
     if not path.is_file():
         raise RuntimeError('missing model ' + str(path))
 
-    # 🧠 SMART AUTO-DETECT LOGIC
     if arch == 'srvgg':
         nc = 16 if 'anime' in f.lower() else 32
         net = SRVGGNetCompact(num_in_ch=3, num_out_ch=3, num_feat=64,
@@ -112,16 +111,14 @@ def main():
         print(f"✅ File found locally at {src} ({src.stat().st_size} bytes). Skipping download.", flush=True)
 
     info = probe(src)
-    total = min(info['frames'], int(os.environ.get('MAX_FRAMES', '3600')))
+    total = min(info['frames'], int(os.environ.get('MAX_FRAMES', '30000')))
 
-    # ===== Frames equally divide among workers =====
     base = total // workers
     rem = total % workers
     start = idx * base + min(idx, rem)
     count = base + (1 if idx < rem else 0)
     end = start + count - 1
 
-    # 🛡️ ANTI-CRASH FIX FOR SHORT VIDEOS
     if count <= 0:
         print(f'✅ Worker {idx} got 0 frames (short video). Exiting cleanly without error.', flush=True)
         manifest = {
@@ -136,6 +133,8 @@ def main():
 
     key = os.environ.get('MODEL_KEY', 'anime_video')
     scale = float(os.environ.get('SCALE', '2'))
+    fps_boost = os.environ.get('FPS_BOOST', 'off')
+    
     outw = int(info['w'] * scale) // 2 * 2
     outh = int(info['h'] * scale) // 2 * 2
 
@@ -180,16 +179,27 @@ def main():
             print(f'W{idx:02d} {n}/{expected} {n/max(0.001, time.time()-t):.2f} fps', flush=True)
 
     chunk = OUT / f'worker_{idx:02d}.mp4'
-    run(['ffmpeg', '-y', '-v', 'error',
-         '-framerate', f"{info['fps']:.8f}", '-i', pattern,
-         '-c:v', 'libx264', '-preset', preset[1], '-crf', preset[0],
+    
+    # ⚡ 60 FPS BOOST LOGIC ⚡
+    vf_flag = []
+    if fps_boost == '60':
+        print(f"⚡ Applying 60 FPS Boost to Worker {idx}...", flush=True)
+        vf_flag = ['-vf', 'minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1']
+        final_fps = 60.0
+    else:
+        final_fps = info['fps']
+
+    cmd = ['ffmpeg', '-y', '-v', 'error', '-framerate', f"{info['fps']:.8f}", '-i', pattern]
+    cmd.extend(vf_flag)
+    cmd.extend(['-c:v', 'libx264', '-preset', preset[1], '-crf', preset[0],
          '-threads', str(CPU), '-pix_fmt', 'yuv420p',
          '-movflags', '+faststart', str(chunk)])
+    run(cmd)
 
     manifest = {
         'worker': idx, 'workers': workers,
         'start': start, 'end': end, 'frames': expected,
-        'fps': info['fps'], 'width': outw, 'height': outh,
+        'fps': final_fps, 'width': outw, 'height': outh,
         'filename': filename, 'job_id': job
     }
     (OUT / f'worker_{idx:02d}.json').write_text(json.dumps(manifest, indent=2))
