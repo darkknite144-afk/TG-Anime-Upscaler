@@ -8,12 +8,15 @@ Smart Anime/Game/Real Upscaler v11.0 — SERVER STABLE PIPELINE
   - ✅ Milestone-based status updates (anti-flood)
   - ✅ GitHub Actions optimized (No global torch thread shifting during jobs)
   - ✅ MANAGER MODE: File system alag (manager_work/) — workers se separate
-  - 🔥 FPS BOOST (60 FPS) + DUAL DELIVERY (1080p Chat & 4x Archive) INTEGRATED
+  - 🔥 FPS BOOST + DUAL DELIVERY INTEGRATED
+  - 🔗 DIRECT LINK DOWNLOADER + SMART SIZE CAPPING
 """
 import asyncio, concurrent.futures, gc, json, logging, math, os, queue, random, shutil, subprocess, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+import re
+import urllib.parse
 
 try:
     sys.stdout.reconfigure(line_buffering=True)
@@ -148,10 +151,10 @@ def _build_core_profiles():
 CORE_PROFILES = _build_core_profiles()
 CORE_MAP = {p[0]: p for p in CORE_PROFILES}
 
-# 🔥 NAYI SETTINGS ADD KI GAYI HAIN (fps_boost aur delivery)
+# 🔥 NAYI SETTINGS ADD KI GAYI HAIN (fps_boost, delivery, aur size_mode)
 settings = {"scale": 2.0, "preset": "balanced", "audio": "keep",
             "model": "game", "core": "auto", "colorize_mode": "off",
-            "fps_boost": "off", "delivery": "dual"}
+            "fps_boost": "off", "delivery": "dual", "size_mode": "smart"}
 job_state = {"active": False}
 current_job: Optional[Dict[str, Any]] = None
 cancel_event: Optional[threading.Event] = None
@@ -442,9 +445,9 @@ def _color_label() -> str:
     return {"off": "🎨 OFF", "fast": "🎨 Fast", "high": "💎 High"}.get(settings["colorize_mode"], "🎨 OFF")
 
 def panel_kb() -> InlineKeyboardMarkup:
-    # Naye Labels Delivery aur FPS ke liye
     fps_lbl = "🎞️ 60 FPS ⚡" if settings.get("fps_boost") == "60" else "🎞️ FPS: Orig"
     del_lbl = "📦 Dual(1080p+4x)" if settings.get("delivery") == "dual" else "📦 4x Only"
+    size_lbl = "🗜️ Size: Smart" if settings.get("size_mode") == "smart" else "🗜️ Size: Max"
     
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("😊", callback_data="b:mood"),
@@ -454,7 +457,8 @@ def panel_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton(f"🔊 {settings['audio'].title()}", callback_data="b:amenu"),
          InlineKeyboardButton(_color_label(), callback_data="b:colormenu")],
         [InlineKeyboardButton(_core_label(), callback_data="b:cmenu"),
-         InlineKeyboardButton(fps_lbl, callback_data="b:fps"),
+         InlineKeyboardButton(fps_lbl, callback_data="b:fps")],
+        [InlineKeyboardButton(size_lbl, callback_data="b:size"),
          InlineKeyboardButton(del_lbl, callback_data="b:delivery")],
         [InlineKeyboardButton("📊 Stats", callback_data="b:stats"),
          InlineKeyboardButton("🧭 Help", callback_data="b:help")],
@@ -515,6 +519,7 @@ SUBMENU_BUTTONS = {"mmenu", "qmenu", "pmenu", "amenu", "colormenu", "cmenu"}
 HELP_TEXT = (
     "🧭 **Help (v11.0 Manager)**\n\n"
     "🎥 Video/GIF/Photo bhejo → turant ✅ tick message + live progress\n"
+    "🔗 Direct Link: Kisi bhi direct .mp4 file ka link do, bot auto download karega!\n"
     "📚 Batch: multiple videos queue me, har ek ka apna status\n"
     "🎛 Models → Anime Video / Game = videos • Anime Image / Real = photos\n"
     "🎨 Color → OFF / Fast / High(photo) • ⚙️ Cores → Auto / Fixed\n"
@@ -528,7 +533,8 @@ def panel_text() -> str:
              _pad(f"{m['label']} {fmt_scale(settings['scale'])}× "
                   f"{settings['preset'][:4]} 🔊{settings['audio'][:4]}"),
              _pad(f"{_color_label()} • ⚙️ {_core_label()}"),
-             _pad(f"🎞️ FPS: {settings['fps_boost'].upper()} • 📦 Dlvry: {settings['delivery'].upper()}"),
+             _pad(f"🎞️ FPS: {settings['fps_boost'].upper()} | 📦 Dlvry: {settings['delivery'].upper()}"),
+             _pad(f"🗜️ Size Engine: {settings['size_mode'].upper()}"),
              _pad("")]
     if job_state.get("active") and current_job:
         j = current_job
@@ -543,7 +549,7 @@ def panel_text() -> str:
             lines += [_pad(f"{j.get('stage', '📥')} {j.get('filename', '')[:18]}")] + [_pad("")] * 2
     else:
         lines += [_pad("😴 Idle — video/photo bhejo"),
-                  _pad("✅ tick + live progress milega"),
+                  _pad("✅ Direct download links supported!"),
                   _pad("📚 batch = queue system")]
     if JOB_QUEUE:
         lines += [_pad(f"📋 Queue me: {len(JOB_QUEUE)} video")]
@@ -631,7 +637,6 @@ async def btn(client, cq):
     elif a == "back":
         _panel_mode = "main"; kb = panel_kb(); await cq.answer("🔙")
     
-    # 🔥 FPS aur Delivery ke naye buttons ka logic
     elif a == "fps":
         settings["fps_boost"] = "60" if settings.get("fps_boost") == "off" else "off"
         if archive: archive.state["fps_boost"] = settings["fps_boost"]
@@ -640,6 +645,10 @@ async def btn(client, cq):
         settings["delivery"] = "dual" if settings.get("delivery") == "4x" else "4x"
         if archive: archive.state["delivery"] = settings["delivery"]
         _panel_mode = "main"; kb = panel_kb(); await cq.answer(f"Delivery: {settings['delivery']}")
+    elif a == "size":
+        settings["size_mode"] = "max" if settings.get("size_mode") == "smart" else "smart"
+        if archive: archive.state["size_mode"] = settings["size_mode"]
+        _panel_mode = "main"; kb = panel_kb(); await cq.answer(f"Size Mode: {settings['size_mode']}")
         
     elif a == "m":
         if v in MODELS:
@@ -1230,6 +1239,58 @@ async def _refresh_loop():
             log.warning("refresh_loop err: %s", e)
         await asyncio.sleep(PANEL_EVERY)
 
+# ================= DIRECT LINK HANDLER =================
+async def handle_direct_download(client, message: Message, url: str):
+    status_msg = await message.reply_text(f"🔗 **Direct Link Detected!**\n⏳ Direct server-to-server download shuru ho gaya hai...")
+    
+    def _dl():
+        parsed = urllib.parse.urlparse(url)
+        ext = os.path.splitext(parsed.path)[1]
+        if not ext: ext = ".mp4"
+        out_path = os.path.join(str(WORK_DIR), f"dl_{int(time.time())}{ext}")
+        
+        with requests.get(url, stream=True, timeout=30) as r:
+            r.raise_for_status()
+            with open(out_path, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+        return out_path
+
+    try:
+        downloaded_file = await asyncio.to_thread(_dl)
+        await status_msg.edit_text(f"✅ **Download Complete!**\n📤 Queue ke liye Telegram par upload ho raha hai...")
+        
+        uploaded_msg = await app.send_video(
+            chat_id=message.chat.id,
+            video=downloaded_file,
+            caption=f"🎥 **Source:** Downloaded via Link\n⏳ Auto-added to Upscale Queue.",
+            supports_streaming=True
+        )
+        
+        filename = os.path.basename(downloaded_file)
+        pos = len(JOB_QUEUE) + (1 if job_state.get("active") else 0) + 1
+        
+        await status_msg.edit_text(
+            f"✅ **Link successfully sent to Upscale Queue!**\n"
+            f"📋 Queue position: {pos}\n"
+            f"⏳ Process start hote hi LIVE progress yahan dikhega..."
+        )
+        
+        JOB_QUEUE.append({
+            "message": uploaded_msg, 
+            "filename": filename,
+            "is_gif": False, 
+            "status_msg": status_msg
+        })
+        
+        os.remove(downloaded_file)
+        await _ensure_queue_loop()
+        await refresh_panel()
+        
+    except Exception as e:
+        log.exception("Direct download error")
+        await status_msg.edit_text(f"❌ **Download Failed:**\n`{str(e)[:200]}`")
+
 # ================= INTAKE =================
 @app.on_message((filters.video | filters.document | filters.animation) & filters.private)
 async def media_handler(client, message: Message):
@@ -1261,7 +1322,6 @@ async def _dispatch_distributed(job_id: str, message: Message, filename: str, cf
     if not GH_PAT or not GH_REPO: raise RuntimeError("GH_PAT/GH_REPO missing")
     import zipfile
     
-    # Strict Validation
     safe_scale = str(int(float(cfg["scale"])))
     if safe_scale not in ["2", "4"]: safe_scale = "2" 
         
@@ -1270,7 +1330,7 @@ async def _dispatch_distributed(job_id: str, message: Message, filename: str, cf
     
     current_job["stage"] = "📤 Dispatching GitHub..."
     
-    # 🔥 PAYLOAD: fps_boost aur delivery yahan add kiye gaye hain
+    # 🔥 PAYLOAD UPDATE: size_mode bheja ja raha hai GitHub ko
     payload = {
         "ref": "main",
         "inputs": {
@@ -1285,7 +1345,8 @@ async def _dispatch_distributed(job_id: str, message: Message, filename: str, cf
             "chat_id": str(message.chat.id),
             "message_id": str(message.id),
             "fps_boost": cfg.get("fps_boost", "off"),
-            "delivery": cfg.get("delivery", "dual")
+            "delivery": cfg.get("delivery", "dual"),
+            "size_mode": cfg.get("size_mode", "smart")
         }
     }
     hdr = {"Authorization": f"Bearer {GH_PAT}", "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
@@ -1295,7 +1356,6 @@ async def _dispatch_distributed(job_id: str, message: Message, filename: str, cf
     r.raise_for_status()
     log.info("Workflow dispatched. Waiting for run ID...")
     
-    # 2. Find run ID
     t0 = time.time()
     run = None
     while time.time() - t0 < 60:
@@ -1309,9 +1369,7 @@ async def _dispatch_distributed(job_id: str, message: Message, filename: str, cf
         if run: break
     if not run: raise RuntimeError("GitHub worker run ID nahi mila")
     rid = run["id"]
-    log.info("Run ID: %s", rid)
     
-    # 3. Monitor run aur output wapas lana
     current_job["stage"] = "⚡ 20W START"
     current_job["total"] = 100
     current_job["done"] = 0
@@ -1359,7 +1417,6 @@ async def _dispatch_distributed(job_id: str, message: Message, filename: str, cf
             z = WORK_DIR / f"final_{job_id}.zip"
             outdir = WORK_DIR / f"final_{job_id}"
             outdir.mkdir(exist_ok=True)
-            log.info("⬇️ Downloading final artifact...")
             current_job["stage"] = "⬇️ Download final"
             with requests.get(final["archive_download_url"], headers=hdr, stream=True, timeout=120) as dl:
                 dl.raise_for_status()
@@ -1369,7 +1426,6 @@ async def _dispatch_distributed(job_id: str, message: Message, filename: str, cf
             with zipfile.ZipFile(z) as zz:
                 zz.extractall(outdir)
             
-            # 🔥 Zip directly return karna hoga taaki Dual Files check ki ja sakein
             z.unlink(missing_ok=True)
             return outdir, time.time() - t0
         await asyncio.sleep(8)
@@ -1399,13 +1455,13 @@ async def _queue_loop():
             outdir, elapsed = await _dispatch_distributed(jid, message, filename, cfg, status_msg)
             current_job["stage"] = "⬆️ upload to TG"
             
-            # 🔥 SMART DUAL DELIVERY LOGIC 
             file_1080p = outdir / "final_1080p.mp4"
             file_4x = outdir / "final_4x.mp4"
             file_upscaled = outdir / "final_upscaled.mp4"
             
             base_caption = (f"✅ **{filename}**\n"
                             f"🎯 {fmt_scale(float(cfg['scale']))}× • {cfg['preset'].title()} • FPS: {cfg.get('fps_boost', 'off').upper()}\n"
+                            f"🗜️ Size: {cfg.get('size_mode', 'smart').upper()}\n"
                             f"⚡ 20-worker distributed • ⏱ {fmt_time(elapsed)}")
             
             archive_cid = ARCHIVE_CHAT_ID if ARCHIVE_CHAT_ID else message.chat.id
@@ -1416,7 +1472,6 @@ async def _queue_loop():
                 if max(s1, s4) > MAX_SEND_MB:
                     raise RuntimeError(f"Output files too large ({s4:.0f}MB)")
                 
-                # Chat mein bhejo 1080p (Super-Sampled)
                 await send_with_retry(
                     lambda: app.send_video(
                         message.chat.id, str(file_1080p),
@@ -1424,8 +1479,6 @@ async def _queue_loop():
                         supports_streaming=True
                     ), "video_1080p"
                 )
-                
-                # Archive mein bhejo 4x (Master)
                 await send_with_retry(
                     lambda: app.send_video(
                         archive_cid, str(file_4x),
@@ -1562,12 +1615,12 @@ async def reset_cmd(client, message: Message):
     if not is_owner(message.chat.id): return
     settings.update({"scale": 2.0, "preset": "balanced", "audio": "keep",
                      "model": "game", "core": "auto", "colorize_mode": "off",
-                     "fps_boost": "off", "delivery": "dual"})
+                     "fps_boost": "off", "delivery": "dual", "size_mode": "smart"})
     if archive:
         try:
             archive.state.update({"scale": 2.0, "preset": "balanced", "audio": "keep",
                                   "model": "game", "core": "auto", "colorize_mode": "off",
-                                  "fps_boost": "off", "delivery": "dual"})
+                                  "fps_boost": "off", "delivery": "dual", "size_mode": "smart"})
             await archive.save_state()
         except Exception: pass
     await message.reply_text("🔄 Reset to defaults!")
@@ -1594,35 +1647,31 @@ async def cancel_cmd(client, message: Message):
     if cancel_event: cancel_event.set()
     await message.reply_text("🛑 Cancel bhej di (current job).")
 
-@app.on_message(filters.forwarded & filters.private)
-async def forward_id_handler(client, message: Message):
-    if not is_owner(message.chat.id): return
-    src = getattr(message, "forward_from_chat", None)
-    if src is not None and getattr(src, "id", None):
-        await message.reply_text(f"📌 Channel ID: `{src.id}`")
-    else:
-        await message.reply_text("❌ Forward se ID nahi mili.")
-
 @app.on_message(filters.text & filters.private & ~filters.command(["start", "panel", "reset", "stats", "cancel", "queue"]))
 async def text_handler(client, message: Message):
     if not is_owner(message.chat.id): return
-    t = (message.text or "").lower()
-    if any(k in t for k in ["hi", "hello", "hey", "namaste"]):
+    t = (message.text or "").strip()
+    
+    # 🔥 LINK DETECTOR LOGIC (Direct Downloader)
+    url_pattern = r"(https?://[^\s]+)"
+    match = re.search(url_pattern, t)
+    if match:
+        url = match.group(1)
+        asyncio.create_task(handle_direct_download(client, message, url))
+        return
+
+    # Normal chat logic fallback
+    t_lower = t.lower()
+    if any(k in t_lower for k in ["hi", "hello", "hey", "namaste"]):
         EMO.set("happy")
-        await message.reply_text(f"{EMO.one('happy')} Namaste boss! Video bhejo → ✅ tick + live progress.")
+        await message.reply_text(f"{EMO.one('happy')} Namaste boss! Video ya Link bhejo → ✅ tick + live progress.")
         if _panel is None: await ensure_panel(message.chat.id)
-    elif any(k in t for k in ["game", "free fire", "pubg", "bgmi"]):
+    elif any(k in t_lower for k in ["game", "free fire", "pubg", "bgmi"]):
         await message.reply_text("🎮 Videos ke liye Game (Fast) model best hai.")
-    elif "anime" in t:
+    elif "anime" in t_lower:
         await message.reply_text("🎌 Video → Anime Video • Photo → Anime Image.")
-    elif any(k in t for k in ["color", "rang"]):
-        await message.reply_text("🎨 Color: Fast = video+photo • High = photo only.")
-    elif any(k in t for k in ["ram", "cpu", "load"]):
-        await message.reply_text(f"🛡 RAM {mem_avail_gb():.1f}GB • {CPU_THREADS}c")
-    elif any(k in t for k in ["thank", "shukriya", "thx"]):
-        await message.reply_text("Apna kaam hai boss!")
     else:
-        await message.reply_text("🤖 v11.0: video bhejo → ✅ tick + LIVE progress; batch = queue.")
+        await message.reply_text("🤖 v11.0: video, photo ya koi 🔗 LINK bhejo → Upscaler auto-start ho jayega!")
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client, message: Message):
@@ -1637,53 +1686,16 @@ def notify_owner_startup():
     try:
         r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                           json={"chat_id": OWNER_CHAT_ID_INT or OWNER_CHAT_ID,
-                                "text": "✅ Upscaler v11.0 online!\n✅ Dual Output + 60 FPS Ready."},
+                                "text": "✅ Upscaler v11.0 online!\n✅ Auto-Link Download + Smart Size + 60 FPS Ready."},
                           timeout=15)
         log.info("Startup ping: %s", r.status_code)
     except Exception as e:
         log.warning("Ping fail: %s", e)
 
-def _prewarm():
-    try:
-        mk = normalize_model_key(settings["model"])
-        if not MODELS[mk]["video_ok"]:
-            mk = VIDEO_FALLBACK.get(mk, "anime_video")
-        init_ups_pool(mk, choose_tile(mk, 2_000_000))
-        log.info("🔥 Pre-warm: %s pool ready", mk)
-    except Exception as e:
-        log.warning("Pre-warm model fail: %s", e)
-    try:
-        cm = normalize_colorize(settings["colorize_mode"])
-        if cm != "off":
-            _load_ddcolor("fast")
-            if cm == "high": _load_ddcolor("high")
-            log.info("🔥 Pre-warm: DDColor ready")
-    except Exception as e:
-        log.warning("Pre-warm ddcolor fail: %s", e)
-
 async def _boot():
     try: await asyncio.to_thread(notify_owner_startup)
     except Exception as e: log.warning("notify fail: %s", e)
-    try:
-        if archive:
-            await archive.load()
-            st = archive.state
-            settings["scale"]  = float(st.get("scale", settings["scale"]))
-            settings["preset"] = st.get("preset", settings["preset"])
-            settings["audio"]  = st.get("audio", settings["audio"])
-            settings["model"]  = normalize_model_key(st.get("model", settings["model"]))
-            settings["core"]   = st.get("core", settings["core"])
-            settings["colorize_mode"] = normalize_colorize(st.get("colorize_mode", settings["colorize_mode"]))
-            settings["fps_boost"]  = st.get("fps_boost", settings["fps_boost"])
-            settings["delivery"]  = st.get("delivery", settings["delivery"])
-            log.info("📚 Archive settings (normalized): %s", settings)
-    except Exception as e:
-        log.warning("Archive boot fail: %s", e)
-        settings["model"] = normalize_model_key(settings["model"])
-        settings["colorize_mode"] = normalize_colorize(settings["colorize_mode"])
-
-    threading.Thread(target=_prewarm, daemon=True).start()
-
+    
     cid = _owner_cid()
     if cid:
         try: await send_panel(cid)
