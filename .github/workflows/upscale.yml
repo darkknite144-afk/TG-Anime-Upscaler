@@ -69,6 +69,12 @@ on:
         type: choice
         options: ["dual", "4x"]
         default: "dual"
+      size_mode:
+        description: "Size Limit Mode"
+        required: true
+        type: choice
+        options: ["smart", "max"]
+        default: "smart"
 
 permissions:
   contents: read
@@ -102,30 +108,46 @@ jobs:
             MSG="🚀 Job started: ${{ inputs.job_id }}
           File: ${{ inputs.filename }}
           Workers: ${{ inputs.workers }}
-          Delivery: ${{ inputs.delivery }} | FPS: ${{ inputs.fps_boost }}
+          Delivery: ${{ inputs.delivery }} | Size: ${{ inputs.size_mode }} | FPS: ${{ inputs.fps_boost }}
           Preparing shared environment once for all workers..."
             curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
               --data-urlencode chat_id="${CHAT_ID}" \
               --data-urlencode text="${MSG}" > /dev/null || true
           fi
 
+      # 🔥 NEW FEATURE: CACHE SYSTEM FOR ULTRA FAST STARTUP
+      - name: Cache AI Models
+        id: cache-models
+        uses: actions/cache@v4
+        with:
+          path: weights
+          key: realesrgan-models-v2
+
+      - name: Cache Python Env
+        id: cache-venv
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/pydeps/venv
+          key: venv-py-v2-${{ runner.os }}
+
       - name: Install system packages
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y ffmpeg zstd python3-venv
-          python -m pip install --upgrade pip
 
       - name: Build shared virtualenv
+        if: steps.cache-venv.outputs.cache-hit != 'true'
         run: |
           python3 -m venv "$DEPS_DIR/venv"
           source "$DEPS_DIR/venv/bin/activate"
-          pip install --upgrade pip
+          python -m pip install --upgrade pip
           pip install numpy==1.26.4 opencv-python-headless==4.9.0.80 Pillow==10.4.0 tqdm==4.66.5 requests pyrogram tgcrypto
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
           pip install basicsr==1.4.2 realesrgan
           sed -i 's/torchvision.transforms.functional_tensor/torchvision.transforms.functional/g' $(find "$DEPS_DIR/venv" -path "*/basicsr/data/degradations.py")
 
       - name: Download upscale model weights
+        if: steps.cache-models.outputs.cache-hit != 'true'
         shell: bash
         run: |
           mkdir -p weights && cd weights
@@ -189,7 +211,10 @@ jobs:
       - name: Package shared bundle
         run: |
           tar -I zstd -cf env.tar.zst -C "$DEPS_DIR" venv
-          tar -I zstd -cf weights.tar.zst weights
+          # Agar pehle se cached the toh error avoid karne ke liye check karte hain
+          if [ -d "weights" ]; then
+            tar -I zstd -cf weights.tar.zst weights
+          fi
           cp worker_work/source shared_source_video
 
       - name: Upload shared bundle
@@ -259,7 +284,9 @@ jobs:
         run: |
           mkdir -p "$DEPS_DIR"
           tar -I zstd -xf bundle/env.tar.zst -C "$DEPS_DIR"
-          tar -I zstd -xf bundle/weights.tar.zst -C "$GITHUB_WORKSPACE"
+          if [ -f "bundle/weights.tar.zst" ]; then
+            tar -I zstd -xf bundle/weights.tar.zst -C "$GITHUB_WORKSPACE"
+          fi
           mkdir -p worker_work
           cp bundle/shared_source_video worker_work/source
           echo "$DEPS_DIR/venv/bin" >> "$GITHUB_PATH"
@@ -341,8 +368,14 @@ jobs:
               cp output_no_audio.mp4 final_4x.mp4
             fi
             
-            # 2. 1080p DOWNSCALE BANAYO (Chat ke liye) - EXTREME PREMIUM QUALITY (Lossless Lanczos)
-            ffmpeg -y -i final_4x.mp4 -vf "scale=-2:1080:flags=lanczos" -c:v libx264 -preset slow -crf 12 -c:a copy final_1080p.mp4
+            # 2. 1080p DOWNSCALE BANAYO (Chat ke liye)
+            if [ "${{ inputs.size_mode }}" == "smart" ]; then
+              # 🌸 ANIME OPTIMIZED SMART MODE: (8 Mbps cap, animation tuning, lanczos sharpness)
+              ffmpeg -y -i final_4x.mp4 -vf "scale=-2:1080:flags=lanczos" -c:v libx264 -preset slow -tune animation -crf 20 -maxrate 8M -bufsize 16M -c:a copy final_1080p.mp4
+            else
+              # 💎 MAX QUALITY: Uncompressed visually lossless (CRF 12 + animation tuning)
+              ffmpeg -y -i final_4x.mp4 -vf "scale=-2:1080:flags=lanczos" -c:v libx264 -preset slow -tune animation -crf 12 -c:a copy final_1080p.mp4
+            fi
             
           else
             # NORMAL 4X ONLY
