@@ -151,7 +151,6 @@ def _build_core_profiles():
 CORE_PROFILES = _build_core_profiles()
 CORE_MAP = {p[0]: p for p in CORE_PROFILES}
 
-# 🔥 NAYI SETTINGS ADD KI GAYI HAIN (fps_boost, delivery, aur size_mode)
 settings = {"scale": 2.0, "preset": "balanced", "audio": "keep",
             "model": "game", "core": "auto", "colorize_mode": "off",
             "fps_boost": "off", "delivery": "dual", "size_mode": "smart"}
@@ -417,7 +416,7 @@ def colorize_frame(img: np.ndarray, mode: str, ref: int = 512) -> np.ndarray:
             out = out.squeeze(0).clamp(0, 1)
             arr = (out.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
         arr = cv2.resize(arr, (ow, oh), interpolation=cv2.INTER_LANCZOS4)
-        return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+        return cv2.cvtColor(arr, COLOR_RGB2BGR)
     except Exception as e:
         log.warning("DDColor frame fail: %s", e)
         return img
@@ -1330,7 +1329,6 @@ async def _dispatch_distributed(job_id: str, message: Message, filename: str, cf
     
     current_job["stage"] = "📤 Dispatching GitHub..."
     
-    # 🔥 PAYLOAD UPDATE: size_mode bheja ja raha hai GitHub ko
     payload = {
         "ref": "main",
         "inputs": {
