@@ -2,9 +2,7 @@ name: Telegram Bot Runner (Manager)
 
 on:
   workflow_dispatch: {}
-  schedule:
-    - cron: "0 */5 * * *"   # har 5 ghante auto-restart (GH ka 6-hour hard limit se pehle)
-
+  
 concurrency:
   group: telegram-bot-manager
   cancel-in-progress: false
