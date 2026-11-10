@@ -123,12 +123,19 @@ jobs:
           path: weights
           key: realesrgan-models-v2
 
+      # ubuntu-latest ab Python 3.14 deta hai -> Pillow 10.4 / numpy 1.26 ke wheels nahi hain.
+      # Isliye Python 3.10 pin kar rahe hain (bot.yml jaisa).
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
       - name: Cache Python Env
         id: cache-venv
         uses: actions/cache@v4
         with:
           path: /home/runner/pydeps/venv
-          key: venv-py-v2-${{ runner.os }}
+          key: venv-py310-v3-${{ runner.os }}
 
       - name: Install system packages
         run: |
@@ -142,8 +149,9 @@ jobs:
           source "$DEPS_DIR/venv/bin/activate"
           python -m pip install --upgrade pip
           pip install numpy==1.26.4 opencv-python-headless==4.9.0.80 Pillow==10.4.0 tqdm==4.66.5 requests pyrogram tgcrypto
-          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install torch==2.1.2 torchvision==0.16.2 --index-url https://download.pytorch.org/whl/cpu
           pip install basicsr==1.4.2 realesrgan
+          python -c "import numpy, cv2, PIL, torch; print('deps OK', numpy.__version__, cv2.__version__, PIL.__version__, torch.__version__)"
           sed -i 's/torchvision.transforms.functional_tensor/torchvision.transforms.functional/g' $(find "$DEPS_DIR/venv" -path "*/basicsr/data/degradations.py")
 
       - name: Download upscale model weights
@@ -265,6 +273,12 @@ jobs:
               raise SystemExit(0)
           print("SKIP=false",file=open(os.environ["GITHUB_OUTPUT"],"a"))
           PY
+
+      - name: Setup Python 3.10 (venv ke liye same interpreter chahiye)
+        if: ${{ steps.assign.outputs.SKIP != 'true' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
 
       - name: Install ffmpeg + zstd
         if: ${{ steps.assign.outputs.SKIP != 'true' }}
