@@ -135,7 +135,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /home/runner/pydeps/venv
-          key: venv-py310-v3-${{ runner.os }}
+          key: venv-py310-v4-${{ runner.os }}
 
       - name: Install system packages
         run: |
@@ -148,11 +148,27 @@ jobs:
           python3 -m venv "$DEPS_DIR/venv"
           source "$DEPS_DIR/venv/bin/activate"
           python -m pip install --upgrade pip
+
+          # Versions lock: basicsr/realesrgan/gfpgan ke deps numpy 2.x / naya opencv kheench lete hain.
+          # Constraints file har pip install pe apply hoti hai, isliye numpy 1.26.4 hi rahega.
+          cat > "$DEPS_DIR/constraints.txt" <<'EOF2'
+          numpy==1.26.4
+          opencv-python==4.9.0.80
+          opencv-python-headless==4.9.0.80
+          Pillow==10.4.0
+          torch==2.1.2
+          torchvision==0.16.2
+          EOF2
+          export PIP_CONSTRAINT="$DEPS_DIR/constraints.txt"
+
           pip install numpy==1.26.4 opencv-python-headless==4.9.0.80 Pillow==10.4.0 tqdm==4.66.5 requests pyrogram tgcrypto
           pip install torch==2.1.2 torchvision==0.16.2 --index-url https://download.pytorch.org/whl/cpu
           pip install basicsr==1.4.2 realesrgan
-          python -c "import numpy, cv2, PIL, torch; print('deps OK', numpy.__version__, cv2.__version__, PIL.__version__, torch.__version__)"
           sed -i 's/torchvision.transforms.functional_tensor/torchvision.transforms.functional/g' $(find "$DEPS_DIR/venv" -path "*/basicsr/data/degradations.py")
+
+          # Final check: yahan fail hua to setup job hi fail ho jayega (workers tak broken venv nahi jayega)
+          python -c "import numpy; assert numpy.__version__.startswith('1.'), 'numpy 2.x aa gaya: '+numpy.__version__"
+          python -c "import numpy, cv2, PIL, torch; from realesrgan import RealESRGANer; print('deps OK', numpy.__version__, cv2.__version__, PIL.__version__, torch.__version__)"
 
       - name: Download upscale model weights
         if: steps.cache-models.outputs.cache-hit != 'true'
